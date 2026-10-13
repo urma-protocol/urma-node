@@ -30,7 +30,6 @@ use urma_node::{
     service::Service,
     source::ChainSource,
 };
-use urma_runtime::multipart::RecoveryLimits;
 
 const TOKEN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const OFFLINE: &str = "node is offline; no chain source configured";
@@ -74,11 +73,8 @@ impl Graph {
         part.payload.len() as u64
     }
 
-    fn limits(&self) -> RecoveryLimits {
-        RecoveryLimits {
-            timeout: Duration::from_secs(2),
-            ..RecoveryLimits::new(self.payload_bytes(), self.pairs.len() as u32)
-        }
+    fn slice(&self) -> Duration {
+        Duration::from_secs(2)
     }
 }
 
@@ -502,7 +498,7 @@ fn maintenance_worker_host() {
         Arc::clone(&engine),
     )
     .unwrap()
-    .with_retention(scratch, graph.limits())
+    .with_retention(scratch, graph.slice())
     .unwrap();
     let address = service.address().unwrap();
     let (sender, receiver) = mpsc::sync_channel(1);

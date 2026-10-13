@@ -50,7 +50,6 @@ use urma_node::{
     service::Service,
     source::ChainSource,
 };
-use urma_runtime::multipart::RecoveryLimits;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -779,14 +778,7 @@ impl Session {
             .unwrap()
             .with_record_sources(vec![peer.clone()])
             .unwrap()
-            .with_retention(
-                scratch,
-                RecoveryLimits {
-                    attempts: 1,
-                    timeout: Duration::from_secs(20),
-                    ..RecoveryLimits::new(1, 3)
-                },
-            )
+            .with_retention(scratch, Duration::from_secs(20))
             .unwrap();
         let address = service.address().unwrap();
         let worker = thread::spawn(move || service.run(synchronize));

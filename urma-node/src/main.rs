@@ -89,11 +89,7 @@ enum Command {
         /// Soft reclaimable cache target (not a SQLite/WAL or total archive quota).
         #[arg(long, default_value_t = urma_node::cache::DEFAULT_CACHE_BYTES, value_parser = clap::value_parser!(u64).range(..=MAX_ARG))]
         cache_bytes: u64,
-        /// Maximum payload per background object attempt (not a protocol limit).
-        #[arg(long, default_value_t = 64 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..))]
-        max_object_bytes: u64,
-        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..))]
-        max_object_nodes: u32,
+        /// Time slice per background object round; an unfinished object resumes next round.
         #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
         object_timeout_seconds: u64,
     },
@@ -160,9 +156,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve {
             listen,
             token_file,
-            max_object_bytes,
             cache_bytes,
-            max_object_nodes,
             object_timeout_seconds,
             peer_key,
             urma_listen,
@@ -189,12 +183,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 private_directory(&scratch)?;
                 service = service.with_retention(
                     scratch,
-                    urma_runtime::multipart::RecoveryLimits {
-                        max_payload_bytes: max_object_bytes,
-                        max_nodes: max_object_nodes,
-                        attempts: 1,
-                        timeout: std::time::Duration::from_secs(object_timeout_seconds),
-                    },
+                    std::time::Duration::from_secs(object_timeout_seconds),
                 )?;
             }
             // Control auth/configuration and archive ownership precede any
@@ -783,13 +772,13 @@ mod peer_config_tests {
             cache.extend(["--cache-bytes", value]);
             assert!(Arguments::try_parse_from(cache).is_err());
         }
-        for option in [
-            "--max-object-bytes",
-            "--max-object-nodes",
-            "--object-timeout-seconds",
+        for (option, value) in [
+            ("--max-object-bytes", "1"),
+            ("--max-object-nodes", "1"),
+            ("--object-timeout-seconds", "0"),
         ] {
             let mut invalid = base.to_vec();
-            invalid.extend([option, "0", "--peer-key", "transport.key"]);
+            invalid.extend([option, value, "--peer-key", "transport.key"]);
             assert!(Arguments::try_parse_from(invalid).is_err());
         }
     }

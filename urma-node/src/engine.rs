@@ -246,18 +246,28 @@ impl Engine {
         archive.maintain_cache(limit_bytes)
     }
 
-    /// One fair, bounded unpruned maintenance step. Scan coverage is never
-    /// advanced by object recovery. Failures advance the cursor, so the next
-    /// round can attempt another root. Pruned mode performs no acquisition.
+    /// One fair unpruned maintenance step: at most `slice` on the next
+    /// incomplete root. Objects are bounded only by the protocol geometry.
+    /// Every record fetched is admitted as it is verified, so a slice that ends
+    /// before completion is progress, not failure: the next visit re-verifies
+    /// the stored records and continues from what is missing. The cursor always
+    /// advances, so rounds stay fair across objects. Scan coverage is never
+    /// advanced by object recovery. Pruned mode performs no acquisition.
     /// Cancellation is cooperative between record acquisitions; in-flight
     /// source I/O may still finish and leave independently verified cache bytes.
     pub fn retain_next_object(
         &self,
         sources: &[&dyn crate::retrieval::RecordSource],
-        limits: urma_runtime::multipart::RecoveryLimits,
+        slice: Duration,
         scratch: &Path,
         cancelled: &AtomicBool,
     ) -> Result<Option<ObjectStatus>, Error> {
+        let limits = urma_runtime::multipart::RecoveryLimits {
+            max_payload_bytes: urma_core::multipart::Geometry::MAX_OBJECT_BYTES,
+            max_nodes: urma_core::multipart::Geometry::MAX_NODES,
+            attempts: 1,
+            timeout: slice,
+        };
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::Busy("object retention cancelled".into()));
         }
@@ -281,10 +291,19 @@ impl Engine {
             {
                 continue;
             }
-            let _object = crate::retrieval::recover_inner(
+            let began = Instant::now();
+            return match crate::retrieval::recover_inner(
                 self, root, sources, limits, scratch, false, cancelled,
-            )?;
-            return self.object_status(root);
+            ) {
+                Ok(_object) => self.object_status(root),
+                // A slice that ran out is the resumable case; a genuine failure
+                // reached again on a later visit surfaces sooner, because the
+                // stored records before it re-verify without any fetch.
+                Err(_) if began.elapsed() >= slice && !cancelled.load(Ordering::Acquire) => {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            };
         }
         Ok(None)
     }

@@ -80,24 +80,27 @@ pub fn fetch_record(
                 continue;
             }
         };
-        if began.elapsed() >= limits.timeout {
-            return Err(Error::Busy("record acquisition deadline".into()));
-        }
+        // A package that arrives after the deadline is still verified and
+        // persisted: acquisition is resumable, so fetched work is never discarded.
+        let late = began.elapsed() >= limits.timeout;
         // Bind the requested identifier before admitting any package. Valid data
         // for an unrelated TXID cannot satisfy this request or pollute its cache.
         match verify_cached(engine, txid, &package) {
+            Err(error) if late => return Err(error),
             Err(error) => {
                 last = Some(error);
                 continue;
             }
-            Ok(verified) => match engine.admit_record_before(package, Some(deadline)) {
-                Ok(_) => return Ok(Some(verified)),
-                Err(error) => {
-                    // A peer's stale block claim must not veto another source.
-                    // Admission still checks tickets; recover checks its epoch.
-                    last = Some(error);
+            Ok(verified) => {
+                match engine.admit_record_before(package, (!late).then_some(deadline)) {
+                    Ok(_) => return Ok(Some(verified)),
+                    Err(error) => {
+                        // A peer's stale block claim must not veto another source.
+                        // Admission still checks tickets; recover checks its epoch.
+                        last = Some(error);
+                    }
                 }
-            },
+            }
         }
     }
     if began.elapsed() >= limits.timeout {

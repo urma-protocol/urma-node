@@ -60,7 +60,7 @@ pub struct Service {
     retention_error: ErrorSlot,
     cache_status: Arc<Mutex<CacheStatus>>,
     cache_bytes: u64,
-    retention: Option<(PathBuf, urma_runtime::multipart::RecoveryLimits)>,
+    retention: Option<(PathBuf, Duration)>,
     sources: Vec<Arc<dyn RecordSource + Send + Sync>>,
     record_peers: Option<SyncPeers>,
     commit_sources: Option<CommitSources>,
@@ -173,20 +173,18 @@ impl Service {
         Ok(self)
     }
 
-    /// Configure bounded background object acquisition. The caller supplies an
-    /// owned scratch directory and explicit limits. Only run(true) schedules it;
+    /// Configure background acquisition of every object, bounded only by the
+    /// protocol geometry. Each round spends at most `slice` on one object; an
+    /// unfinished object resumes from its stored records in a later round. The
+    /// caller supplies an owned scratch directory. Only run(true) schedules it;
     /// pruned archives perform no automatic content acquisition.
-    pub fn with_retention(
-        mut self,
-        scratch: PathBuf,
-        limits: urma_runtime::multipart::RecoveryLimits,
-    ) -> Result<Self, Error> {
-        if limits.max_payload_bytes == 0 || limits.max_nodes == 0 || limits.timeout.is_zero() {
+    pub fn with_retention(mut self, scratch: PathBuf, slice: Duration) -> Result<Self, Error> {
+        if slice.is_zero() {
             return Err(Error::Invalid(
-                "object retention limits must be nonzero".into(),
+                "object retention slice must be nonzero".into(),
             ));
         }
-        self.retention = Some((scratch, limits));
+        self.retention = Some((scratch, slice));
         Ok(self)
     }
 
@@ -242,7 +240,7 @@ impl Service {
         // independent recovery from the last selected view;
         // its error remains separately visible in status.
         if !self.stop.load(Ordering::Acquire) {
-            if let Some((scratch, limits)) = &self.retention {
+            if let Some((scratch, slice)) = &self.retention {
                 let owned = self.record_sources();
                 let sources: Vec<&dyn RecordSource> = owned
                     .iter()
@@ -250,7 +248,7 @@ impl Service {
                     .collect();
                 let result = self
                     .engine
-                    .retain_next_object(&sources, *limits, scratch, &self.stop);
+                    .retain_next_object(&sources, *slice, scratch, &self.stop);
                 record(&self.retention_error, &result);
             }
         }

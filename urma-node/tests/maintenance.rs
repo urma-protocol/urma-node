@@ -20,7 +20,6 @@ use urma_node::{
     model::{API_VERSION, ArchiveStatus, ObjectStatus, RecordPackage, Retention},
     retrieval::RecordSource,
 };
-use urma_runtime::multipart::RecoveryLimits;
 
 // Unchanged signed public fixtures in witness-authenticated mock blocks.
 // No consensus, hard I/O interruption or elapsed deadline claim is made here.
@@ -56,11 +55,8 @@ impl Graph {
     }
 }
 
-fn limits() -> RecoveryLimits {
-    RecoveryLimits {
-        timeout: Duration::from_secs(5),
-        ..RecoveryLimits::new(1, 3)
-    }
+fn slice() -> Duration {
+    Duration::from_secs(5)
 }
 
 fn package(block: &Block, pair: &SignedPair) -> RecordPackage {
@@ -202,7 +198,7 @@ fn pruned_maintenance_is_noop_even_with_selected_unretained_roots() {
 
     assert!(
         engine
-            .retain_next_object(&[&peer], limits(), scratch.path(), &AtomicBool::new(false))
+            .retain_next_object(&[&peer], slice(), scratch.path(), &AtomicBool::new(false))
             .unwrap()
             .is_none()
     );
@@ -236,20 +232,20 @@ fn cached_unpruned_roots_complete_one_per_call_then_skip_without_acquisition() {
     let cancelled = AtomicBool::new(false);
 
     let result = engine
-        .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+        .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
         .unwrap()
         .unwrap();
     assert_complete(&result, &first, before.generation);
     assert!(engine.object_status(second.id(0)).unwrap().is_none()); // Only one attempt.
     let result = engine
-        .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+        .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
         .unwrap()
         .unwrap();
     assert_complete(&result, &second, before.generation);
     for _ in 0..3 {
         assert!(
             engine
-                .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+                .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
                 .unwrap()
                 .is_none()
         );
@@ -308,7 +304,7 @@ fn failed_first_root_advances_cursor_instead_of_starving_the_second() {
     let cancelled = AtomicBool::new(false);
 
     let error = engine
-        .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+        .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
         .unwrap_err();
     assert!(error.to_string().contains("incomplete object"), "{error}");
     assert_eq!(peer.calls(), [first.id(1)]);
@@ -316,7 +312,7 @@ fn failed_first_root_advances_cursor_instead_of_starving_the_second() {
     assert!(engine.object_status(second.id(0)).unwrap().is_none());
     assert_status(&engine, &before);
     let result = engine
-        .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+        .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
         .unwrap()
         .unwrap();
     assert_complete(&result, &second, before.generation);
@@ -346,7 +342,7 @@ fn precancelled_maintenance_does_no_work_or_cursor_advancement() {
     let cancelled = AtomicBool::new(true);
 
     assert!(matches!(
-        engine.retain_next_object(&[&peer], limits(), scratch.path(), &cancelled),
+        engine.retain_next_object(&[&peer], slice(), scratch.path(), &cancelled),
         Err(Error::Busy(_))
     ));
     assert!(peer.calls().is_empty());
@@ -356,7 +352,7 @@ fn precancelled_maintenance_does_no_work_or_cursor_advancement() {
     assert_status(&engine, &before);
     cancelled.store(false, Ordering::Release);
     let result = engine
-        .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+        .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
         .unwrap()
         .unwrap();
     assert_complete(&result, &first, before.generation); // Pre-cancel did not consume first root.
@@ -397,7 +393,7 @@ fn callback_cancellation_skips_further_children_or_finalization_without_publicat
         });
 
         let error = engine
-            .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+            .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
             .unwrap_err();
         assert!(
             error.to_string().contains("object retention cancelled"),
@@ -450,7 +446,7 @@ fn peer_callback_can_read_status_while_reentrant_maintenance_returns_busy() {
         let callback_status = engine.status().unwrap();
         assert_coverage(&callback_status, &before);
         assert!(matches!(
-            engine.retain_next_object(&[], limits(), scratch.path(), &AtomicBool::new(false)),
+            engine.retain_next_object(&[], slice(), scratch.path(), &AtomicBool::new(false)),
             Err(Error::Busy(_))
         ));
         assert_status(&engine, &callback_status);
@@ -459,7 +455,7 @@ fn peer_callback_can_read_status_while_reentrant_maintenance_returns_busy() {
     });
 
     let result = engine
-        .retain_next_object(&[&peer], limits(), scratch.path(), &cancelled)
+        .retain_next_object(&[&peer], slice(), scratch.path(), &cancelled)
         .unwrap()
         .unwrap();
     assert_complete(&result, &graph, before.generation);

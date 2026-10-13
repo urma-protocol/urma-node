@@ -86,17 +86,23 @@ registrations and attempts, not SQL duration; cancellation cannot interrupt an
 entered state/SQL operation. Optional CLI and gateway consumers use the paged
 local-operator view described below; they do not register or step implicitly.
 
-Unpruned background rounds attempt a block scan, then at most one
-incomplete object. Previously verified cached objects can complete even when
-the current synchronization or scan attempt fails; synchronization and retention
-errors are reported separately. A rotating root cursor lets later objects proceed when one
-is unavailable or exceeds configured limits. CLI defaults are 64 MiB payload,
-4,096 records and a cooperative 15-second acquisition budget per object; these
-are resource settings, not protocol limits. Use `--max-object-bytes`,
-`--max-object-nodes` and `--object-timeout-seconds` to configure them. In-flight
-source calls and SQL commits are not forcibly interrupted. Failed acquisitions
-remain incomplete and the local status reports the last retention error.
-Pruned mode does not automatically download complete objects.
+Unpruned keeps everything: every multipart object is acquired completely,
+bounded only by the protocol geometry (8,553,279,476 payload bytes, 32,695
+records), with no node-side size or record limit. Background rounds attempt a
+block scan, then spend at most one time slice on the next incomplete object
+(`--object-timeout-seconds`, default 15). Every leaf and data record is verified
+and stored as it arrives, including one that arrives after the slice ended, and
+the payload is streamed through scratch files, never held in memory. An object
+that does not finish within its slice is in progress, not failed: the rotating
+root cursor moves on so rounds stay fair across objects, and the next visit
+re-verifies the stored records without fetching them and continues from what is
+missing, so a large object completes over many rounds. Such a slice is not
+reported as a retention error. Previously verified cached objects can complete
+even when the current synchronization or scan attempt fails; synchronization
+and retention errors are reported separately. A genuine failure stays visible
+as the last retention error. In-flight source calls and SQL commits are not
+forcibly interrupted. Pruned mode keeps roots and does not automatically
+download leaves or data; they are fetched only when pinned or recovered on demand.
 
 Peer discovery and the soft multipart cache target are described below. The
 daemon targets Linux: `contrib/` holds a user-systemd unit and an operator
