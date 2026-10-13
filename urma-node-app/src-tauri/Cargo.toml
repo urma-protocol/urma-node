@@ -7,7 +7,7 @@ publish = false
 description = "URMA Node desktop UI"
 
 [lib]
-name = "urma_node_app"
+name = "urma_node_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

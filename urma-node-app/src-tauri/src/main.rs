@@ -8,5 +8,5 @@
 )]
 
 fn main() -> Result<(), tauri::Error> {
-    urma_node_app::run()
+    urma_node_app_lib::run()
 }
