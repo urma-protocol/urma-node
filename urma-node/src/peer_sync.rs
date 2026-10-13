@@ -12,12 +12,14 @@
 use crate::{
     DialLimit, Error,
     engine::Engine,
-    model::{OverlayPeerStatus, OverlayStatus, RecordReceipt},
-    peer::PeerSource,
-    peer_protocol::{InventoryPage, Placement},
+    model::{OverlayPeerStatus, OverlayStatus},
+    peer::{PeerSource, SyncPeers},
+    peer_inventory::{placed, selected},
+    peer_protocol::Placement,
     recorded::{RecordedError, unix_seconds},
 };
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
+use range::{Range, accept, open};
 use std::{
     sync::{
         Arc, Mutex,
@@ -26,34 +28,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod range;
+
 pub type ConnectedPeers = Arc<dyn Fn() -> u64 + Send + Sync>;
+pub type Listeners = Arc<dyn Fn() -> Vec<Multiaddr> + Send + Sync>;
 
 /// Public overlay identity facts reported in status; never secrets.
 pub struct OverlayInfo {
     pub peer_id: String,
-    pub listen: Option<String>,
+    pub listen: Listeners,
+    pub announce: Vec<String>,
     pub peer_book: u64,
     pub connected: ConnectedPeers,
 }
 
-/// Configured inventory peers. Each label is the peer's libp2p identity.
+/// Inventory peers, re-read every step: configured ones, then live ones.
 pub struct PeerSync {
-    pub peers: Vec<(String, PeerSource)>,
+    pub peers: SyncPeers,
     pub info: OverlayInfo,
-}
-
-/// One claimed range being walked page by page; lives only in memory.
-struct Range {
-    from: u64,
-    to: u64,
-    after: Option<Placement>,
-    entries: Vec<Placement>,
-    next: usize,
-    more: bool,
-    scanned_through: u64,
-    generation: u64,
-    /// Consecutive Missing answers for records this range advertised.
-    missing: u32,
 }
 
 struct Peer {
@@ -171,8 +163,11 @@ impl Round<'_> {
 }
 
 pub(crate) struct Scheduler {
+    offered: SyncPeers,
     peers: Mutex<Vec<Arc<Peer>>>,
     turn: AtomicUsize,
+    configured_turn: AtomicBool,
+    configured_next: AtomicUsize,
     info: OverlayInfo,
     admitted: AtomicU64,
     rejected: AtomicU64,
@@ -184,8 +179,29 @@ fn poisoned() -> Error {
     Error::Invalid("peer synchronization state poisoned".into())
 }
 
-/// A connected peer that has held its slot for more than one step without
-/// progress for `IDLE_BACKOFF` seconds, or ever.
+/// The next non-omitting, non-backed-off peer after `turn`.
+fn rotate(
+    peers: &[Arc<Peer>],
+    turn: &AtomicUsize,
+    omitting: &[String],
+    now: u64,
+) -> Result<Option<Arc<Peer>>, Error> {
+    for _ in 0..peers.len() {
+        let peer = &peers[turn.fetch_add(1, Ordering::Relaxed) % peers.len()];
+        if !omitting.contains(&peer.id) && peer.backoff_until(now)?.is_none() {
+            return Ok(Some(Arc::clone(peer)));
+        }
+    }
+    Ok(None)
+}
+
+fn configured(peer: &Arc<Peer>) -> bool {
+    peer.source.configured()
+}
+
+/// A peer we dialed that has held its outbound slot for more than one step
+/// without progress for `IDLE_BACKOFF` seconds, or ever. Evicting an inbound
+/// peer would free nothing for our outbound dial.
 fn evictable(peer: &Peer, step: u64, now: u64) -> Result<bool, Error> {
     let settled = peer
         .connected_since
@@ -195,7 +211,7 @@ fn evictable(peer: &Peer, step: u64, now: u64) -> Result<bool, Error> {
     let idle = peer
         .last_progress()?
         .is_none_or(|at| now >= at.saturating_add(Scheduler::IDLE_BACKOFF));
-    Ok(settled && idle && peer.source.connected())
+    Ok(settled && idle && peer.source.outbound())
 }
 
 fn inventory_peer(label: String, source: PeerSource) -> Result<Peer, Error> {
@@ -252,27 +268,22 @@ impl Scheduler {
     pub const EVICT_WAIT: Duration = Duration::from_secs(2);
     const MAX_PEERS: usize = 1024;
 
+    /// Status lists the configured peers before the first step.
     pub(crate) fn new(sync: PeerSync) -> Result<Self, Error> {
-        if sync.peers.len() > Self::MAX_PEERS {
-            return Err(Error::Invalid("too many inventory peers".into()));
-        }
-        let mut peers: Vec<Arc<Peer>> = Vec::new();
-        for (label, source) in sync.peers {
-            let peer = inventory_peer(label, source)?;
-            if peers.iter().any(|known| known.id == peer.id) {
-                return Err(Error::Invalid("duplicate inventory peer".into()));
-            }
-            peers.push(Arc::new(peer));
-        }
-        Ok(Self {
-            peers: Mutex::new(peers),
+        let scheduler = Self {
+            offered: sync.peers,
+            peers: Mutex::new(Vec::new()),
             turn: AtomicUsize::new(0),
+            configured_turn: AtomicBool::new(false),
+            configured_next: AtomicUsize::new(0),
             info: sync.info,
             admitted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             penalized: Mutex::new(Vec::new()),
             steps: AtomicU64::new(0),
-        })
+        };
+        scheduler.refresh(scheduler.offered.sources(&[]), unix_seconds()?)?;
+        Ok(scheduler)
     }
 
     /// One bounded step with the next non-omitting, non-backed-off peer in
@@ -281,6 +292,7 @@ impl Scheduler {
     pub(crate) fn step(&self, engine: &Engine, stop: &AtomicBool) -> Result<(), Error> {
         let omitting = engine.omitting_peers()?;
         let now = unix_seconds()?;
+        self.refresh(self.offered.sources(&omitting), now)?;
         let step = self.steps.fetch_add(1, Ordering::Relaxed);
         self.observe_connections(step)?;
         let Some(peer) = self.next_peer(&omitting, now)? else {
@@ -471,9 +483,11 @@ impl Scheduler {
         Ok(std::mem::take(&mut *penalized))
     }
 
-    /// Reconcile with the peer book: known identities keep their peer state and
-    /// in-flight range, new ones join, ones no longer offered are dropped.
-    pub(crate) fn refresh(&self, offered: Vec<(String, PeerSource)>) -> Result<(), Error> {
+    /// Reconcile with the offered peers: known identities keep their peer
+    /// state and in-flight range, new ones join. One no longer offered stays
+    /// while backed off, so a hold-off survives the disconnect it caused and
+    /// discovery keeps avoiding it; otherwise it is dropped.
+    fn refresh(&self, offered: Vec<(String, PeerSource)>, now: u64) -> Result<(), Error> {
         if offered.len() > Self::MAX_PEERS {
             return Err(Error::Invalid("too many inventory peers".into()));
         }
@@ -481,14 +495,20 @@ impl Scheduler {
         let mut next: Vec<Arc<Peer>> = Vec::with_capacity(offered.len());
         for (label, source) in offered {
             let candidate = inventory_peer(label, source)?;
-            if next.iter().any(|kept| kept.id == candidate.id) {
-                continue;
-            }
             match peers.iter().find(|known| known.id == candidate.id) {
                 Some(known) => next.push(Arc::clone(known)),
                 None => next.push(Arc::new(candidate)),
             }
         }
+        let mut held = Vec::new();
+        for known in peers.iter() {
+            if !next.iter().any(|kept| kept.id == known.id) && known.backoff_until(now)?.is_some() {
+                held.push(Arc::clone(known));
+            }
+        }
+        // Rotating inbound identities must not pile up: the oldest go first.
+        let room = Self::MAX_PEERS.saturating_sub(next.len());
+        next.extend(held.split_off(held.len().saturating_sub(room)));
         *peers = next;
         Ok(())
     }
@@ -497,13 +517,18 @@ impl Scheduler {
         Ok(self.peers.lock().map_err(|_| poisoned())?.clone())
     }
 
+    /// Configured and live-only peers alternate turns, each group rotating on
+    /// its own; a group with nobody ready passes its turn to the other.
     fn next_peer(&self, omitting: &[String], now: u64) -> Result<Option<Arc<Peer>>, Error> {
         let peers = self.snapshot()?;
-        let count = peers.len();
-        for _ in 0..count {
-            let peer = &peers[self.turn.fetch_add(1, Ordering::Relaxed) % count];
-            if !omitting.contains(&peer.id) && peer.backoff_until(now)?.is_none() {
-                return Ok(Some(Arc::clone(peer)));
+        let (configured, live): (Vec<_>, Vec<_>) = peers.into_iter().partition(configured);
+        let mut groups = [(&configured, &self.configured_next), (&live, &self.turn)];
+        if self.configured_turn.fetch_xor(true, Ordering::Relaxed) {
+            groups.reverse();
+        }
+        for (peers, turn) in groups {
+            if let Some(peer) = rotate(peers, turn, omitting, now)? {
+                return Ok(Some(peer));
             }
         }
         Ok(None)
@@ -512,7 +537,7 @@ impl Scheduler {
     fn advance(&self, peer: &Peer, engine: &Engine, round: &mut Round) -> Result<Turn, Error> {
         let mut slot = peer.range.lock().map_err(|_| poisoned())?;
         if slot.is_none() {
-            *slot = open(peer, engine)?;
+            *slot = open(&peer.id, engine)?;
             // Nothing left to ask a fully synced peer: as fresh as progress,
             // so surplus synced peers are not evicted every IDLE_BACKOFF.
             round.progressed |= slot.is_none();
@@ -664,7 +689,11 @@ impl Scheduler {
         }
         Ok(OverlayStatus {
             peer_id: self.info.peer_id.clone(),
-            listen: self.info.listen.clone(),
+            listen: (self.info.listen)()
+                .iter()
+                .map(Multiaddr::to_string)
+                .collect(),
+            announce: self.info.announce.clone(),
             peer_book: self.info.peer_book,
             connected: (self.info.connected)(),
             admitted: self.admitted.load(Ordering::Relaxed),
@@ -692,89 +721,4 @@ fn pace(peer: &Peer, round: &mut Round) -> Result<(), Pause> {
     *last = Some(Instant::now());
     round.contacted = true;
     Ok(())
-}
-
-/// The next unclaimed range for this peer, bounded by the local selected tip.
-/// The range keeps the generation observed here for its whole lifetime, so a
-/// reorg between rounds makes its coverage claim Stale instead of mislabelled.
-fn open(peer: &Peer, engine: &Engine) -> Result<Option<Range>, Error> {
-    let status = engine.status()?;
-    let Some(tip) = status.selected_tip else {
-        return Ok(None);
-    };
-    let from = engine.peer_cursor(&peer.id)?;
-    if from > tip.height {
-        return Ok(None);
-    }
-    let span_end = from
-        .checked_add(Scheduler::RANGE_HEIGHTS - 1)
-        .ok_or_else(|| Error::Invalid("peer cursor overflows the height range".into()))?;
-    Ok(Some(Range {
-        from,
-        to: tip.height.min(span_end),
-        after: None,
-        entries: Vec::new(),
-        next: 0,
-        more: true,
-        scanned_through: 0,
-        generation: status.generation,
-        missing: 0,
-    }))
-}
-
-/// Install a page. Returns false when the peer has not scanned this range yet.
-/// Entries must be strictly ordered after the page cursor and inside the
-/// requested range; anything else is a peer error. Entries above the peer's
-/// own scanned prefix (blocks still waiting on a dependency) are dropped
-/// without blame: they are outside what the page can claim.
-fn accept(range: &mut Range, page: InventoryPage) -> Result<bool, Error> {
-    let Some(scanned_through) = page.scanned_through.filter(|height| *height >= range.from) else {
-        return Ok(false);
-    };
-    let limit = usize::try_from(Scheduler::PAGE_ENTRIES)
-        .map_err(|error| Error::Invalid(format!("page limit: {error}")))?;
-    if page.entries.len() > limit || (page.more && page.entries.is_empty()) {
-        return Err(Error::Invalid("peer inventory page size is invalid".into()));
-    }
-    let mut previous = range.after;
-    for entry in &page.entries {
-        if entry.height < range.from
-            || entry.height > range.to
-            || previous
-                .is_some_and(|last| (entry.height, entry.position) <= (last.height, last.position))
-        {
-            return Err(Error::Invalid(
-                "peer inventory entry is out of range or order".into(),
-            ));
-        }
-        previous = Some(*entry);
-    }
-    range.after = previous;
-    range.entries = page
-        .entries
-        .into_iter()
-        .filter(|entry| entry.height <= scanned_through)
-        .collect();
-    range.next = 0;
-    range.more = page.more;
-    range.scanned_through = scanned_through;
-    Ok(true)
-}
-
-/// A listing whose block differs from our selected header at that height comes
-/// from another view of the chain (a reorg in flight); it is not a peer error.
-fn selected(engine: &Engine, entry: &Placement) -> Result<bool, Error> {
-    match engine.archive()?.ticket(entry.height) {
-        Ok(ticket) => Ok(ticket.point().hash == entry.block_hash),
-        Err(Error::Invalid(_outside_selected_view)) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn placed(receipt: &RecordReceipt, entry: &Placement) -> bool {
-    receipt.block.height == entry.height
-        && receipt.block.hash == entry.block_hash
-        && receipt.position == entry.position
-        && receipt.txid == entry.txid
-        && receipt.wtxid == entry.wtxid
 }

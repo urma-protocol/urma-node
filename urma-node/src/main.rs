@@ -10,11 +10,10 @@ use urma_node::{
     config,
     engine::Engine,
     model::ArchiveConfig,
-    peer::{OverlayCommitSource, PeerNetwork, PeerSource},
+    peer::{OverlayCommitSource, PeerNetwork, SyncPeers},
     peer_discovery::Discovery,
     peer_sync::{OverlayInfo, PeerSync},
     peerbook::{Origin, PeerAddress, PeerBook},
-    retrieval::RecordSource,
     service::{Service, create_token},
     source::{CommitSources, LitecoinSource, LocalRpcCommitSource, PublicCommitSource},
 };
@@ -318,25 +317,24 @@ fn attach_overlay(
         address.push(Protocol::Tcp(socket.port()));
         address
     });
+    let announce: Vec<String> = options.announce.iter().map(Multiaddr::to_string).collect();
     let network = Arc::new(PeerNetwork::start(
         Arc::clone(engine),
         identity,
         listener,
         options.announce,
     )?);
-    let peers = book.sync_addresses(&engine.omitting_peers()?);
     let book_size = book.stats().book;
-    let book = Arc::new(Mutex::new(book));
-    let sources = peers
-        .iter()
-        .cloned()
-        .map(|address| -> Arc<dyn RecordSource + Send + Sync> { Arc::new(network.source(address)) })
-        .collect();
-    let service = service.with_record_sources(sources)?;
+    let manual: Vec<PeerAddress> = options.manual.iter().filter_map(identified).collect();
+    let peers = network.sync_peers(manual.clone());
+    let service = service.with_record_peers(peers.clone());
     let service = match options.commit_parents {
-        true => service
-            .with_peer_sync(peer_sync(&network, &peers, book_size)?)?
-            .with_discovery(Discovery::new(Arc::clone(&network), book, book_path))?,
+        true => {
+            let book = Arc::new(Mutex::new(book));
+            service
+                .with_peer_sync(peer_sync(&network, peers, book_size, announce))?
+                .with_discovery(Discovery::new(Arc::clone(&network), book, book_path))?
+        }
         false => service,
     };
     eprintln!(
@@ -346,35 +344,38 @@ fn attach_overlay(
     );
     let overlay = options
         .commit_parents
-        .then(|| network.commit_source(chain, peers));
+        .then(|| network.commit_source(chain, manual));
     Ok((service, Some(network), overlay))
 }
 
-/// Inventory peers come from the same peer-book entries as record and commit
-/// sources, one per peer identity; the first address of a peer wins.
+/// A `--urma-peer` naming its identity over an IP literal is a configured
+/// sync source from the start; any other form joins once discovery connects.
+fn identified(address: &Multiaddr) -> Option<PeerAddress> {
+    let peer = address.iter().find_map(|part| match part {
+        Protocol::P2p(peer) => Some(peer),
+        _ => None,
+    })?;
+    PeerAddress::new(peer, address.clone()).ok()
+}
+
+/// Inventory peers are re-read every step: configured, then live ones.
 fn peer_sync(
     network: &Arc<PeerNetwork>,
-    peers: &[PeerAddress],
+    peers: SyncPeers,
     book_size: u64,
-) -> Result<PeerSync, Box<dyn std::error::Error>> {
-    let mut entries: Vec<(String, PeerSource)> = Vec::new();
-    for address in peers {
-        let label = address.peer_id().to_string();
-        if entries.iter().any(|(known, _source)| *known == label) {
-            continue;
-        }
-        entries.push((label, network.source(address.clone())));
-    }
-    let shared = Arc::clone(network);
-    Ok(PeerSync {
-        peers: entries,
+    announce: Vec<String>,
+) -> PeerSync {
+    let (connected, listening) = (Arc::clone(network), Arc::clone(network));
+    PeerSync {
+        peers,
         info: OverlayInfo {
             peer_id: network.peer_id().to_string(),
-            listen: network.listen_address().map(|address| address.to_string()),
+            listen: Arc::new(move || listening.listen_addresses()),
+            announce,
             peer_book: book_size,
-            connected: Arc::new(move || shared.connected_peers()),
+            connected: Arc::new(move || connected.connected_peers()),
         },
-    })
+    }
 }
 
 /// The service owned the only other handle; it is released when run returns.

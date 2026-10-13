@@ -19,10 +19,10 @@ use libp2p::{
     swarm::{ConnectionId, DialError, dial_opts::DialOpts},
 };
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     net::{Ipv4Addr, Ipv6Addr},
     sync::{
-        Mutex,
+        Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
@@ -30,13 +30,31 @@ use std::{
 };
 
 /// State shared between the network thread and the owner: the gossip snapshot
-/// the scheduler hands over, and public addresses peers observed for us.
+/// the scheduler hands over, public addresses peers observed for us, the live
+/// connections and our bound listeners.
 pub(crate) struct Shared {
     local: PeerId,
     gossip: Mutex<Vec<GossipPeer>>,
     observed: Mutex<ObservedAddrs>,
-    connected: Mutex<BTreeSet<PeerId>>,
+    connected: Mutex<BTreeMap<PeerId, Links>>,
     identified: Mutex<VecDeque<(PeerId, Vec<Multiaddr>)>>,
+    listening: Mutex<Vec<Multiaddr>>,
+}
+
+/// Established connections of one peer by direction, and whether it has
+/// spoken this protocol version on our chain over any of them.
+#[derive(Default)]
+struct Links {
+    inbound: u32,
+    outbound: u32,
+    on_chain: bool,
+}
+
+fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Public addresses outbound peers reported observing for this node. A
@@ -102,8 +120,9 @@ impl Shared {
             local,
             gossip: Mutex::new(Vec::new()),
             observed: Mutex::new(ObservedAddrs::default()),
-            connected: Mutex::new(BTreeSet::new()),
+            connected: Mutex::new(BTreeMap::new()),
             identified: Mutex::new(VecDeque::new()),
+            listening: Mutex::new(Vec::new()),
         }
     }
 
@@ -150,29 +169,77 @@ impl Shared {
     }
 
     pub(crate) fn is_connected(&self, peer: PeerId) -> bool {
-        match self.connected.lock() {
-            Ok(connected) => connected.contains(&peer),
-            Err(poisoned) => poisoned.into_inner().contains(&peer),
-        }
+        guard(&self.connected).contains_key(&peer)
+    }
+
+    /// Whether the peer holds a connection we dialed.
+    pub(crate) fn is_outbound(&self, peer: PeerId) -> bool {
+        guard(&self.connected)
+            .get(&peer)
+            .is_some_and(|links| links.outbound > 0)
     }
 
     fn connected(&self) -> Vec<PeerId> {
-        match self.connected.lock() {
-            Ok(connected) => connected.iter().copied().collect(),
-            Err(poisoned) => poisoned.into_inner().iter().copied().collect(),
+        guard(&self.connected).keys().copied().collect()
+    }
+
+    /// Connected peers that spoke this protocol version on our chain, those
+    /// we dialed before those that only dialed us.
+    pub(crate) fn live(&self) -> Vec<PeerId> {
+        let connected = guard(&self.connected);
+        let (outbound, inbound): (Vec<_>, Vec<_>) = connected
+            .iter()
+            .filter(|(_, links)| links.on_chain)
+            .partition(|(_, links)| links.outbound > 0);
+        outbound
+            .into_iter()
+            .chain(inbound)
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
+    pub(crate) fn opened(&self, peer: PeerId, outbound: bool) {
+        let mut connected = guard(&self.connected);
+        let links = connected.entry(peer).or_default();
+        match outbound {
+            true => links.outbound += 1,
+            false => links.inbound += 1,
         }
     }
 
-    /// First established connection of a peer, or its last one closing.
-    pub(crate) fn set_connected(&self, peer: PeerId, connected: bool) {
-        let mut set = match self.connected.lock() {
-            Ok(set) => set,
-            Err(poisoned) => poisoned.into_inner(),
+    /// The peer leaves with its last connection, chain proof included.
+    pub(crate) fn closed(&self, peer: PeerId, outbound: bool) {
+        let mut connected = guard(&self.connected);
+        let Some(links) = connected.get_mut(&peer) else {
+            return;
         };
-        match connected {
-            true => set.insert(peer),
-            false => set.remove(&peer),
-        };
+        match outbound {
+            true => links.outbound = links.outbound.saturating_sub(1),
+            false => links.inbound = links.inbound.saturating_sub(1),
+        }
+        if links.inbound == 0 && links.outbound == 0 {
+            connected.remove(&peer);
+        }
+    }
+
+    /// A message carrying this protocol version and our genesis came from or
+    /// was answered by the peer over a live connection.
+    pub(crate) fn on_chain(&self, peer: PeerId) {
+        if let Some(links) = guard(&self.connected).get_mut(&peer) {
+            links.on_chain = true;
+        }
+    }
+
+    pub(crate) fn listening(&self, address: Multiaddr, bound: bool) {
+        let mut listening = guard(&self.listening);
+        listening.retain(|known| *known != address);
+        if bound {
+            listening.push(address);
+        }
+    }
+
+    pub(crate) fn listeners(&self) -> Vec<Multiaddr> {
+        guard(&self.listening).clone()
     }
 
     /// One identify report, counted only from outbound connections. Returns
@@ -487,6 +554,7 @@ fn dial_error(error: &DialError) -> Error {
             Some(LimitDenied(limit)) => Error::DialDenied(*limit),
             None => Error::Invalid(format!("peer dial: {error}")),
         },
+        DialError::LocalPeerId { .. } => Error::LocalPeer,
         DialError::DialPeerConditionFalse(condition) => {
             Error::Busy(format!("peer dial already pending ({condition:?})"))
         }

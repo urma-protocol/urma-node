@@ -14,6 +14,8 @@ pub enum Error {
     Transport(String),
     /// Our own connection admission refused a dial, before reaching the peer.
     DialDenied(DialLimit),
+    /// A dial authenticated this node itself, e.g. a seed resolving to us.
+    LocalPeer,
     Stale,
 }
 
@@ -51,6 +53,7 @@ impl std::fmt::Display for Error {
             Self::PeerBusy => f.write_str("remote peer busy"),
             Self::Transport(e) => write!(f, "peer transport: {e}"),
             Self::DialDenied(limit) => write!(f, "dial denied by local connection limit ({limit})"),
+            Self::LocalPeer => f.write_str("dial reached this node itself"),
             Self::Stale => f.write_str("result belongs to a superseded chain view"),
         }
     }

@@ -7,12 +7,12 @@ use crate::{
     Error,
     engine::Engine,
     model::{BookEntry, DiscoveryStatus},
-    peer::{PeerNetwork, PeerSource},
+    peer::PeerNetwork,
     peer_protocol::GossipPeer,
     peerbook::PeerBook,
     recorded::{RecordedError, read, unix_seconds as now},
 };
-use libp2p::{Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use rand::seq::SliceRandom;
 use std::{
     path::PathBuf,
@@ -31,6 +31,7 @@ pub struct Discovery {
     seed_error: Mutex<Option<RecordedError>>,
     gossip_error: Mutex<Option<RecordedError>>,
     sync_backoff: Mutex<Vec<String>>,
+    own_addresses: Mutex<Vec<Multiaddr>>,
 }
 
 /// Network operations left in this round; stop ends the round early.
@@ -47,6 +48,16 @@ impl Budget<'_> {
         self.left -= 1;
         true
     }
+}
+
+/// An address that can only ever be this node: it names our identity, or is
+/// an IP literal (no name that might also resolve elsewhere).
+fn names_self(address: &Multiaddr, local: &Protocol) -> bool {
+    let literal = matches!(
+        address.iter().next(),
+        Some(Protocol::Ip4(_) | Protocol::Ip6(_))
+    );
+    literal || address.iter().any(|part| part == *local)
 }
 
 fn poisoned() -> Error {
@@ -78,6 +89,7 @@ impl Discovery {
             seed_error: Mutex::new(None),
             gossip_error: Mutex::new(None),
             sync_backoff: Mutex::new(Vec::new()),
+            own_addresses: Mutex::new(Vec::new()),
         }
     }
 
@@ -90,15 +102,6 @@ impl Discovery {
 
     fn lock(&self) -> Result<MutexGuard<'_, PeerBook>, Error> {
         self.book.lock().map_err(|_| poisoned())
-    }
-
-    /// Inventory peers from the book: identified, non-omitting, one per peer.
-    pub fn sync_sources(&self, omitting: &[String]) -> Result<Vec<(String, PeerSource)>, Error> {
-        let addresses = self.lock()?.sync_addresses(omitting);
-        Ok(addresses
-            .into_iter()
-            .map(|address| (address.peer_id().to_string(), self.network.source(address)))
-            .collect())
     }
 
     /// One bounded round: merge peers learned through identify, refresh the
@@ -183,10 +186,17 @@ impl Discovery {
             || (round > 0 && round % Self::SEED_EVERY == 0))
     }
 
-    /// Dial one address outside the book lock and record the outcome.
+    /// Dial one address outside the book lock and record the outcome. An
+    /// address that reached this node itself (a seed resolving to us) is
+    /// remembered and never dialed again by this process; the book keeps it,
+    /// since the same name is a real peer for every other node.
     fn dial(&self, address: &Multiaddr, stop: &AtomicBool) -> Result<Result<PeerId, Error>, Error> {
         let deadline = Instant::now() + Self::OPERATION_TIME;
-        let outcome = self.network.dial(address.clone(), stop, deadline);
+        let local = Protocol::P2p(self.network.peer_id());
+        let outcome = match address.iter().any(|part| part == local) {
+            true => Err(Error::LocalPeer),
+            false => self.network.dial(address.clone(), stop, deadline),
+        };
         if stop.load(Ordering::Acquire) {
             return Ok(outcome);
         }
@@ -194,11 +204,20 @@ impl Discovery {
         let mut book = self.lock()?;
         match &outcome {
             Ok(peer) => book.succeeded(address, *peer, self.network.peer_id(), at),
+            Err(Error::LocalPeer) if names_self(address, &local) => {
+                self.own()?.push(address.clone())
+            }
+            // A name may resolve to other hosts too: skip only this dial.
+            Err(Error::LocalPeer) => (),
             // Our own capacity or a busy peer says nothing about the address.
             Err(Error::DialDenied(_) | Error::Busy(_) | Error::PeerBusy) => (),
             Err(_failure) => book.failed(address, at),
         }
         Ok(outcome)
+    }
+
+    fn own(&self) -> Result<MutexGuard<'_, Vec<Multiaddr>>, Error> {
+        self.own_addresses.lock().map_err(|_| poisoned())
     }
 
     /// The startup pass ignores backoff persisted by an earlier process.
@@ -209,7 +228,9 @@ impl Discovery {
         startup: bool,
     ) -> Result<bool, Error> {
         let backoff_at = if startup { None } else { Some(now()?) };
-        let seeds = self.lock()?.seeds(omitting, backoff_at);
+        let mut seeds = self.lock()?.seeds(omitting, backoff_at);
+        let own = self.own()?.clone();
+        seeds.retain(|seed| !own.contains(seed));
         let mut dialed = false;
         let mut error = None;
         let mut reached = false;
@@ -217,11 +238,12 @@ impl Discovery {
             if !budget.take() {
                 break;
             }
-            dialed = true;
             match self.dial(&seed, budget.stop)? {
                 Ok(_peer) => reached = true,
+                Err(Error::LocalPeer) => continue,
                 Err(failure) => error = Some(format!("{seed}: {failure}")),
             }
+            dialed = true;
         }
         if dialed {
             let recorded = if reached {
@@ -239,9 +261,11 @@ impl Discovery {
         if connected.len() >= Self::TARGET {
             return Ok(false);
         }
-        let candidates =
+        let mut candidates =
             self.lock()?
                 .candidates(now()?, &connected, omitting, Self::DIALS_PER_ROUND);
+        let own = self.own()?.clone();
+        candidates.retain(|candidate| !own.contains(candidate));
         let mut dialed = false;
         for candidate in candidates {
             if !budget.take() {

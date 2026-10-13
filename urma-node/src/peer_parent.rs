@@ -1,7 +1,7 @@
 //! Raw commit parents from configured URMA peers over the overlay.
 use crate::{
     Error,
-    peer::{PeerSource, Pending, bind_response},
+    peer::{CALL_TIMEOUT, Pending, SyncPeers, bind_response},
     peer_limits::ESTABLISHED_PER_DIRECTION,
     peer_protocol::{PARENT_LIMIT, Reply, Response},
     source::{CommitSource, check_cancelled, verify_parent},
@@ -9,7 +9,7 @@ use crate::{
 use bitcoin::{BlockHash, Txid};
 use libp2p::PeerId;
 use std::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
 use urma_chain::observation::Chain;
@@ -44,14 +44,14 @@ pub(crate) fn validate_parent(
     }
 }
 
-/// Tries one window of configured peers per fetch; successive fetches move to
-/// the next window, so every peer is visited. verify_parent binds bytes to the
-/// TXID; a peer whose bytes fail it only lets the next peer be tried and is
-/// disconnected so it keeps no outbound slot. Engine verification is final.
+/// Tries one window of the current overlay peers (configured, then live) per
+/// fetch; successive fetches move to the next window, so every peer is
+/// visited. verify_parent binds bytes to the TXID; a peer whose bytes fail it
+/// only lets the next peer be tried and is disconnected so it keeps no slot.
+/// Engine verification is final.
 pub struct OverlayCommitSource {
     chain: Chain,
-    peers: Vec<PeerSource>,
-    next: AtomicUsize,
+    peers: SyncPeers,
 }
 
 impl OverlayCommitSource {
@@ -59,12 +59,8 @@ impl OverlayCommitSource {
     const PEERS_PER_FETCH: usize = ESTABLISHED_PER_DIRECTION;
     const FETCH_DEADLINE: Duration = Duration::from_secs(20);
 
-    pub(crate) fn new(chain: Chain, peers: Vec<PeerSource>) -> Self {
-        Self {
-            chain,
-            peers,
-            next: AtomicUsize::new(0),
-        }
+    pub(crate) fn new(chain: Chain, peers: SyncPeers) -> Self {
+        Self { chain, peers }
     }
 }
 
@@ -76,26 +72,32 @@ impl CommitSource for OverlayCommitSource {
     /// Busy, local or remote, is no answer. Local Busy from request() also
     /// covers deadline expiry, a dial denied by our connection limits and a
     /// stopped network, so these are silent (Ok(None), nothing in status);
-    /// FETCH_DEADLINE bounds the whole round. Zero answers plus any other peer
-    /// or transport error is an error; otherwise absence. First valid wins.
+    /// FETCH_DEADLINE bounds the whole round. A configured peer, which may
+    /// need a cold dial, gets a full call bound of what is left; the live
+    /// tail splits the rest evenly, so stalling live peers cannot eat a later
+    /// one's turn. Zero answers plus any other peer or transport error is an
+    /// error; otherwise absence. First valid wins.
     fn fetch(&self, txid: Txid, cancelled: &AtomicBool) -> Result<Option<Vec<u8>>, Error> {
         check_cancelled(cancelled)?;
-        let count = self.peers.len();
-        if count == 0 {
-            return Ok(None);
-        }
         let deadline = Instant::now() + Self::FETCH_DEADLINE;
-        let window = count.min(Self::PEERS_PER_FETCH);
-        let start = self.next.fetch_add(window, Ordering::Relaxed) % count;
         let mut answered = false;
         let mut failure = None;
-        for offset in 0..window {
+        let window = self.peers.window(Self::PEERS_PER_FETCH);
+        let mut live_left = window.iter().filter(|peer| !peer.configured()).count();
+        for peer in &window {
             check_cancelled(cancelled)?;
-            if Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let share = match peer.configured() {
+                true => Some(left.min(CALL_TIMEOUT)),
+                false => u32::try_from(live_left)
+                    .ok()
+                    .and_then(|peers| left.checked_div(peers)),
+            };
+            let Some(share) = share.filter(|share| !share.is_zero()) else {
                 break;
-            }
-            let peer = &self.peers[(start + offset) % count];
-            match peer.parent(txid, deadline) {
+            };
+            live_left = live_left.saturating_sub(usize::from(!peer.configured()));
+            match peer.parent(txid, Instant::now() + share) {
                 Ok(Parent::Hex(hex)) => match self.decode(&hex, txid) {
                     Ok(raw) => return Ok(Some(raw)),
                     Err(error) => {

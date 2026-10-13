@@ -2,9 +2,9 @@
 //! serving through a real PeerNetwork), client A's archive, and A's running
 //! Service with an authenticated loopback status endpoint.
 //! Loaded with #[path]; it is not part of the shared common module.
-use crate::common::{FIRST_HEIGHT, MemorySource, config};
+use crate::common::{FIRST_HEIGHT, MemorySource, config, profile, witness_block};
 use bitcoin::Block;
-use libp2p::{PeerId, identity::Keypair};
+use libp2p::{Multiaddr, PeerId, identity::Keypair};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -15,10 +15,11 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use urma_chain::observation::Chain;
 use urma_node::{
     engine::Engine,
     model::{ArchiveConfig, Retention},
-    peer::PeerNetwork,
+    peer::{OverlayCommitSource, PeerNetwork},
     peer_sync::{OverlayInfo, PeerSync},
     peerbook::PeerAddress,
     service::{Service, ShutdownHandle},
@@ -120,6 +121,25 @@ impl Client {
     }
 }
 
+// An archive whose only block holds profile's reveal: its commit is missing.
+pub fn orphan(root: &Path) -> Engine {
+    let directory = root.join("orphan");
+    fs::create_dir_all(&directory).unwrap();
+    let block = witness_block(std::slice::from_ref(&profile().reveal), None, 50);
+    let source = Arc::new(MemorySource::new(std::slice::from_ref(&block)));
+    let config = config(&block, Retention::Unpruned);
+    let orphan = Engine::open(&directory, config, Some(source)).unwrap();
+    orphan.synchronize_headers().unwrap();
+    assert_eq!(orphan.scan_next().unwrap().unresolved_dependencies, 1);
+    orphan
+}
+
+// A network without a Service: nothing syncs unless the case asks.
+pub fn bare_network(engine: Arc<Engine>, listen: bool) -> PeerNetwork {
+    let listen = listen.then(|| "/ip4/127.0.0.1/tcp/0".parse().unwrap());
+    PeerNetwork::start(engine, Keypair::generate_ed25519(), listen, Vec::new()).unwrap()
+}
+
 fn http_status(address: SocketAddr, path: &str) -> io::Result<Value> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -152,23 +172,32 @@ pub struct Running {
 impl Running {
     // A's Service with its own client network and the given inventory peers.
     pub fn start(engine: Arc<Engine>, peers: Vec<PeerAddress>) -> Self {
+        Self::launch(engine, peers, None)
+    }
+
+    // A's Service listening on loopback with no configured peers: it syncs
+    // from whoever connects.
+    pub fn listening(engine: Arc<Engine>) -> Self {
+        let listen = Some("/ip4/127.0.0.1/tcp/0".parse().unwrap());
+        Self::launch(engine, Vec::new(), listen)
+    }
+
+    fn launch(engine: Arc<Engine>, peers: Vec<PeerAddress>, listen: Option<Multiaddr>) -> Self {
         let network = PeerNetwork::start(
             engine.clone(),
             Keypair::generate_ed25519(),
-            None,
+            listen,
             Vec::new(),
         )
         .unwrap();
-        let peers = peers
-            .into_iter()
-            .map(|address| (address.peer_id().to_string(), network.source(address)))
-            .collect();
         let info = OverlayInfo {
             peer_id: network.peer_id().to_string(),
-            listen: None,
+            listen: Arc::new(Vec::new),
+            announce: Vec::new(),
             peer_book: 0,
             connected: Arc::new(|| 0),
         };
+        let peers = network.sync_peers(peers);
         let service = Service::bind("127.0.0.1:0".parse().unwrap(), TOKEN.into(), engine)
             .unwrap()
             .with_peer_sync(PeerSync { peers, info })
@@ -210,6 +239,18 @@ impl Running {
 
     pub fn connected(&self) -> Vec<PeerId> {
         self.network.as_ref().unwrap().connected_peer_ids()
+    }
+
+    pub fn listen_address(&self) -> Multiaddr {
+        self.network.as_ref().unwrap().listen_address().unwrap()
+    }
+
+    // Parents through whoever A is connected to, with nothing configured.
+    pub fn commit_source(&self, chain: Chain) -> OverlayCommitSource {
+        self.network
+            .as_ref()
+            .unwrap()
+            .commit_source(chain, Vec::new())
     }
 
     // A step checks stop between requests; one in-flight peer call may still

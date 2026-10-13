@@ -17,6 +17,7 @@ pub mod peer_discovery;
 pub mod peer_gossip;
 mod peer_inventory;
 mod peer_limits;
+pub mod peer_live;
 mod peer_parent;
 pub mod peer_protocol;
 mod peer_rate;

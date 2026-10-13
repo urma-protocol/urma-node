@@ -3,7 +3,7 @@
 use crate::{
     Error,
     engine::Engine,
-    model::RecordPackage,
+    model::{RecordPackage, RecordReceipt},
     peer::{Answer, CALL_TIMEOUT, PeerSource, Pending, bind_response},
     peer_protocol::{
         INVENTORY_ENTRIES, INVENTORY_LIMIT, INVENTORY_SPAN, InventoryPage, Kind, PARENT_LIMIT,
@@ -129,6 +129,24 @@ fn check_page(kind: &Kind, page: InventoryPage) -> Result<InventoryPage, Error> 
         previous = Some(at);
     }
     Ok(page)
+}
+
+/// A listing whose block differs from our selected header at that height comes
+/// from another view of the chain (a reorg in flight); it is not a peer error.
+pub(crate) fn selected(engine: &Engine, entry: &Placement) -> Result<bool, Error> {
+    match engine.archive()?.ticket(entry.height) {
+        Ok(ticket) => Ok(ticket.point().hash == entry.block_hash),
+        Err(Error::Invalid(_outside_selected_view)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn placed(receipt: &RecordReceipt, entry: &Placement) -> bool {
+    receipt.block.height == entry.height
+        && receipt.block.hash == entry.block_hash
+        && receipt.position == entry.position
+        && receipt.txid == entry.txid
+        && receipt.wtxid == entry.wtxid
 }
 
 impl PeerSource {

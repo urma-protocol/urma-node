@@ -23,7 +23,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc as async_mpsc;
 use urma_chain::observation::Chain;
@@ -44,6 +44,10 @@ pub enum Rewrite {
     Hide(String),
     OutOfRange,
     Stale,
+    /// Record replies carry a commit that does not decode.
+    Corrupt,
+    /// Every reply is held back this long, unchanged.
+    Slow(Duration),
 }
 
 struct Call {
@@ -67,6 +71,7 @@ struct RawState {
     ready: mpsc::SyncSender<Multiaddr>,
     pending: HashMap<OutboundRequestId, Answer>,
     forwarded: HashMap<OutboundRequestId, ResponseChannel<Response>>,
+    held: Vec<(Instant, ResponseChannel<Response>, Response)>,
 }
 
 fn raw_swarm(key: Keypair) -> Swarm<request_response::Behaviour<Codec>> {
@@ -90,6 +95,9 @@ fn raw_swarm(key: Keypair) -> Swarm<request_response::Behaviour<Codec>> {
 }
 
 fn rewrite(mut response: Response, rewrite: &Rewrite) -> Response {
+    if let (Reply::Record(package), Rewrite::Corrupt) = (&mut response.result, rewrite) {
+        package.commit = vec![0];
+    }
     if let Reply::Inventory(page) = &mut response.result {
         match rewrite {
             Rewrite::Hide(hide) => page.entries.retain(|entry| entry.txid.to_string() != *hide),
@@ -103,6 +111,7 @@ fn rewrite(mut response: Response, rewrite: &Rewrite) -> Response {
                     entry.block_hash = BlockHash::all_zeros();
                 }
             }
+            Rewrite::Corrupt | Rewrite::Slow(_) => (),
         }
     }
     response
@@ -141,8 +150,15 @@ fn raw_message(
             response,
         } => {
             if let Some(channel) = state.forwarded.remove(&request_id) {
-                let response = rewrite(response, &state.upstream.as_ref().unwrap().1);
-                let _ = swarm.behaviour_mut().send_response(channel, response);
+                let how = &state.upstream.as_ref().unwrap().1;
+                let response = rewrite(response, how);
+                if let Rewrite::Slow(delay) = how {
+                    state
+                        .held
+                        .push((Instant::now() + *delay, channel, response));
+                } else {
+                    let _ = swarm.behaviour_mut().send_response(channel, response);
+                }
             } else if let Some(answer) = state.pending.remove(&request_id) {
                 let _ = answer.try_send(Ok(response));
             }
@@ -185,7 +201,14 @@ async fn raw_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     while !stop.load(Ordering::Acquire) {
         tokio::select! {
-            _ = tick.tick() => (),
+            _ = tick.tick() => {
+                let now = Instant::now();
+                let (due, held) = state.held.drain(..).partition(|(at, _, _)| *at <= now);
+                state.held = held;
+                for (_, channel, response) in due {
+                    let _ = swarm.behaviour_mut().send_response(channel, response);
+                }
+            }
             call = calls.recv() => {
                 let Some(call) = call else { return };
                 let id = swarm.behaviour_mut().send_request_with_addresses(
@@ -221,6 +244,7 @@ impl RawPeer {
             ready,
             pending: HashMap::new(),
             forwarded: HashMap::new(),
+            held: Vec::new(),
         };
         let flag = stop.clone();
         let worker = thread::spawn(move || {

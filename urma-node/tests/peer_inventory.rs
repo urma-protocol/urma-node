@@ -25,7 +25,7 @@ use bitcoin::{
     transaction::Version,
 };
 use common::{FIRST_HEIGHT, SignedPair, profile, witness_block};
-use inventory_node::{Client, Running, height, server, tip};
+use inventory_node::{Client, Running, bare_network, height, orphan, server, tip};
 use inventory_peer::{RawPeer, Rewrite};
 use libp2p::PeerId;
 use serde_json::{Value, json};
@@ -34,15 +34,17 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
+use urma_chain::observation::Chain;
 use urma_core::{envelope, format::PublicRecord, multipart::VerifiedRecord, topics::Topics};
 use urma_node::{
     engine::Engine,
     peer_protocol::{INVENTORY_ENTRIES, INVENTORY_SPAN, Kind, Reply, VERSION},
     peerbook::PeerAddress,
+    retrieval::{FetchLimits, RecordSource, fetch_record},
 };
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(150);
@@ -215,6 +217,132 @@ fn omission(root: &Path) -> Value {
     assert_eq!(liar.asked(), asked, "scheduler still asks an omitting peer");
     assert_record(&a.offline(), &extra);
     json!({"omission":hidden.to_string(),"liar_skipped":true})
+}
+
+fn listed<'a>(status: &'a Value, id: &PeerId) -> Option<&'a Value> {
+    let label = id.to_string();
+    status["overlay"]["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|peer| peer["label"].as_str() == Some(label.as_str()))
+}
+
+/// A starts with nothing configured and only listens; B dials A. A syncs
+/// inventory over B's inbound connection, resolves a parent through it with
+/// an overlay commit source that names no peer, and drops B once B leaves.
+fn inbound(root: &Path) -> Value {
+    let pairs = vectors();
+    let blocks = chain(&pairs, 4, 1);
+    let b = server(root, &blocks, 4);
+    let b_id = b.address.peer_id();
+    let a = Client::new(root, &blocks);
+    let running = Running::listening(a.offline());
+    assert_eq!(running.status()["overlay"]["peers"], json!([]));
+    stage(root, "B dials A; A syncs from its inbound peer");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let cancelled = AtomicBool::new(false);
+    b.network
+        .dial(running.listen_address(), &cancelled, deadline)
+        .unwrap();
+    running.until(|s| {
+        listed(s, &b_id).is_some_and(|b| height(&b["synced_through"]) == Some(tip(&blocks)))
+    });
+    stage(
+        root,
+        "A resolves a parent through B with no configured peer",
+    );
+    let orphan = orphan(root);
+    let overlay = running.commit_source(Chain::BitcoinRegtest);
+    let resolved = orphan.resolve_next_dependency(&overlay, &cancelled);
+    assert_eq!(resolved.unwrap(), 1);
+    assert_eq!(orphan.status().unwrap().unresolved_dependencies, 0);
+    stage(root, "B leaves; A drops it from the sync set");
+    b.network.shutdown().unwrap();
+    running.until(|s| listed(s, &b_id).is_none());
+    running.stop();
+    let engine = a.offline();
+    for pair in &pairs {
+        assert_record(&engine, pair);
+    }
+    json!({"synced":true,"parent_resolved":true,"left":true})
+}
+
+/// Retrieval gets each overlay peer as its own source: a corrupt package from
+/// the first is rejected by verification and the next peer supplies it.
+fn retrieval(root: &Path) -> Value {
+    let pairs = vectors();
+    let blocks = chain(&pairs, 4, 1);
+    let b = server(root, &blocks, 4);
+    let liar = RawPeer::start(Some((b.address.clone(), Rewrite::Corrupt)));
+    let a = Client::new(root, &blocks);
+    let engine = a.offline();
+    let network = bare_network(engine.clone(), false);
+    stage(root, "a corrupt package first, the honest peer second");
+    let sources = network
+        .sync_peers(vec![liar.address(), b.address.clone()])
+        .record_sources();
+    assert_eq!(sources.len(), 2);
+    let sources: Vec<&dyn RecordSource> = sources.iter().map(|s| s as &dyn RecordSource).collect();
+    let txid = pairs[0].reveal.compute_txid();
+    let record = fetch_record(&engine, txid, &sources, FetchLimits::default()).unwrap();
+    assert_eq!(record.map(|record| record.txid()), Some(txid));
+    assert_eq!(liar.asked(), 1, "the corrupt peer was asked first");
+    assert_record(&engine, &pairs[0]);
+    json!({"fetched":true,"liar_asked":liar.asked()})
+}
+
+/// Seven inbound peers that never answer fill the window behind one cold
+/// configured peer that answers only after 4 s. The configured peer gets a
+/// full call bound (an even split would leave it 2.5 s), resolves the parent,
+/// and the stalling peers are never asked.
+fn stalling(root: &Path) -> Value {
+    let pairs = vectors();
+    let blocks = chain(&pairs, 4, 1);
+    let b = server(root, &blocks, 4);
+    let slow = RawPeer::start(Some((
+        b.address.clone(),
+        Rewrite::Slow(Duration::from_secs(4)),
+    )));
+    let a = Client::new(root, &blocks);
+    let network = bare_network(a.offline(), true);
+    let to = PeerAddress::new(network.peer_id(), network.listen_address().unwrap()).unwrap();
+    let stalls: Vec<RawPeer> = (0..7).map(|_| RawPeer::gossiping(Vec::new())).collect();
+    for stall in &stalls {
+        let reply = stall.call(&to, VERSION, Kind::Peers { limit: 0 });
+        assert!(matches!(reply, Reply::Peers(_)), "{reply:?}");
+    }
+    let live = network.sync_peers(Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live.sources(&[]).len() < stalls.len() {
+        assert!(
+            Instant::now() < deadline,
+            "stalling peers never became live"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    stage(
+        root,
+        "seven stalling inbound peers and one slow configured peer",
+    );
+    let orphan = orphan(root);
+    let overlay = network.commit_source(Chain::BitcoinRegtest, vec![slow.address()]);
+    let began = Instant::now();
+    let resolved = orphan.resolve_next_dependency(&overlay, &AtomicBool::new(false));
+    assert_eq!(resolved.unwrap(), 1);
+    let took = began.elapsed();
+    assert!(
+        took >= Duration::from_secs(4) && took < Duration::from_secs(10),
+        "{took:?}"
+    );
+    for stall in &stalls {
+        let asked = stall.requests();
+        assert!(
+            asked.iter().all(|r| matches!(r.kind, Kind::Peers { .. })),
+            "{asked:?}"
+        );
+    }
+    json!({"resolved":true,"stalls_asked":0})
 }
 
 fn peer_status<'a>(status: &'a Value, id: &PeerId) -> &'a Value {
@@ -484,6 +612,9 @@ fn peer_inventory_host() {
     let scenario = std::env::var("PEER_INVENTORY_SCENARIO").unwrap();
     let checks = match scenario.as_str() {
         "honest" => honest(&root),
+        "inbound" => inbound(&root),
+        "retrieval" => retrieval(&root),
+        "stalling" => stalling(&root),
         "omission" => omission(&root),
         "rejecting" => rejecting(&root),
         "stale" => stale_crowd(&root),
@@ -583,6 +714,27 @@ fn fresh_node_admits_every_record_from_inventory_before_its_own_scan() {
     let checks = run("honest");
     assert_eq!(checks["synced"], true);
     assert_eq!(checks["omissions"], 0);
+}
+
+#[test]
+fn a_node_with_an_empty_book_syncs_and_resolves_parents_through_an_inbound_peer() {
+    let checks = run("inbound");
+    assert_eq!(checks["synced"], true);
+    assert_eq!(checks["parent_resolved"], true);
+    assert_eq!(checks["left"], true);
+}
+
+#[test]
+fn a_corrupt_package_from_one_peer_falls_through_to_the_next_peer() {
+    let checks = run("retrieval");
+    assert_eq!(checks["fetched"], true);
+    assert_eq!(checks["liar_asked"], 1);
+}
+
+#[test]
+fn stalling_inbound_peers_cannot_delay_a_configured_parent_peer() {
+    let checks = run("stalling");
+    assert_eq!(checks["resolved"], true);
 }
 
 #[test]

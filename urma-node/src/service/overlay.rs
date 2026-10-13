@@ -4,13 +4,38 @@ use super::Service;
 use crate::{
     Error,
     model::{BookEntry, OverlayStatus},
+    peer::SyncPeers,
     peer_discovery::Discovery,
     peer_sync::{PeerSync, Scheduler},
     recorded::{record, unix_seconds},
+    retrieval::RecordSource,
 };
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 impl Service {
+    /// Overlay peers as record sources: every retrieval call takes the
+    /// current window as separate sources, so each package is verified on
+    /// its own and a bad one only moves retrieval on to the next peer.
+    pub fn with_record_peers(mut self, peers: SyncPeers) -> Self {
+        self.record_peers = Some(peers);
+        self
+    }
+
+    pub(super) fn record_sources(&self) -> Vec<Arc<dyn RecordSource + Send + Sync>> {
+        let mut sources = self.sources.clone();
+        let peers = self.record_peers.iter().flat_map(SyncPeers::record_sources);
+        sources.extend(peers.map(|peer| -> Arc<dyn RecordSource + Send + Sync> { Arc::new(peer) }));
+        sources
+    }
+
+    pub(super) fn record_source_count(&self) -> usize {
+        let peers = self
+            .record_peers
+            .as_ref()
+            .map_or(0, SyncPeers::record_count);
+        self.sources.len() + peers
+    }
+
     /// Fast inventory synchronization from configured overlay peers. Only
     /// run(true) schedules it; configuring peers does not dial or fetch.
     pub fn with_peer_sync(mut self, sync: PeerSync) -> Result<Self, Error> {
@@ -57,9 +82,8 @@ impl Service {
         if self.stop.load(Ordering::Acquire) {
             return;
         }
-        let result = self
-            .refresh_sync_peers(scheduler)
-            .and_then(|()| scheduler.step(&self.engine, &self.stop))
+        let result = scheduler
+            .step(&self.engine, &self.stop)
             .and_then(|()| self.penalize_in_book(scheduler));
         if self.stop.load(Ordering::Acquire) {
             return;
@@ -75,15 +99,6 @@ impl Service {
             Some(discovery) => discovery.penalize(&penalized),
             None => Ok(()),
         }
-    }
-
-    /// With discovery, the inventory peers follow the book every step.
-    fn refresh_sync_peers(&self, scheduler: &Scheduler) -> Result<(), Error> {
-        let Some(discovery) = &self.discovery else {
-            return Ok(());
-        };
-        let omitting = self.engine.omitting_peers()?;
-        scheduler.refresh(discovery.sync_sources(&omitting)?)
     }
 
     /// The sync view with discovery counters attached when both run.

@@ -66,7 +66,8 @@ export type BookEntry = {
 
 export type OverlayStatus = {
   peer_id: string;
-  listen: string | null;
+  listen: string[];
+  announce: string[];
   peer_book: number;
   connected: number;
   admitted: number;

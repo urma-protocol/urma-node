@@ -4,6 +4,7 @@ use crate::{
     Error,
     engine::Engine,
     model::{CacheReceipt, ServiceStatus},
+    peer::SyncPeers,
     peer_discovery::Discovery,
     peer_sync::Scheduler,
     recorded::{RecordedError, read, record},
@@ -61,6 +62,7 @@ pub struct Service {
     cache_bytes: u64,
     retention: Option<(PathBuf, urma_runtime::multipart::RecoveryLimits)>,
     sources: Vec<Arc<dyn RecordSource + Send + Sync>>,
+    record_peers: Option<SyncPeers>,
     commit_sources: Option<CommitSources>,
     dependency_error: ErrorSlot,
     peer_sync: Option<Scheduler>,
@@ -105,6 +107,7 @@ impl Service {
             cache_bytes: crate::cache::DEFAULT_CACHE_BYTES,
             retention: None,
             sources: Vec::new(),
+            record_peers: None,
             commit_sources: None,
             dependency_error: Arc::new(Mutex::new(None)),
             peer_sync: None,
@@ -240,8 +243,8 @@ impl Service {
         // its error remains separately visible in status.
         if !self.stop.load(Ordering::Acquire) {
             if let Some((scratch, limits)) = &self.retention {
-                let sources: Vec<&dyn RecordSource> = self
-                    .sources
+                let owned = self.record_sources();
+                let sources: Vec<&dyn RecordSource> = owned
                     .iter()
                     .map(|source| -> &dyn RecordSource { source.as_ref() })
                     .collect();
@@ -329,7 +332,7 @@ impl Service {
             overlay,
             chain_peers: self.engine.chain_peers()?,
             retention_configured: self.retention.is_some(),
-            record_sources_configured: u64::try_from(self.sources.len())
+            record_sources_configured: u64::try_from(self.record_source_count())
                 .map_err(|error| Error::Invalid(format!("record source count: {error}")))?,
             capabilities: Self::CAPABILITIES.map(String::from).to_vec(),
         })

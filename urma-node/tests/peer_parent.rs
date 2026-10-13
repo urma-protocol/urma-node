@@ -525,7 +525,35 @@ fn missing(root: &Path) -> Value {
     let before = status(&a.engine);
     let parent = pair.commit.compute_txid();
     let chain = Chain::BitcoinRegtest;
-    stage(root, "Missing, dead and empty overlay peer lists");
+    // Every source also reads A's live peers, so the cases without an
+    // answering peer run before A connects to anyone that answers.
+    stage(root, "Dead, busy, missing and empty overlay peer lists");
+    let dead = a
+        .network
+        .commit_source(chain, vec![dead_address(), dead_address()]);
+    let error = timed(|| dead.fetch(parent, &AtomicBool::new(false))).unwrap_err();
+    assert!(
+        matches!(&error, Error::CommitSource(m) if m.starts_with("overlay")),
+        "{error}"
+    );
+    assert!(error.to_string().contains("overlay"));
+    // Busy is capacity, not an answer: beside a transport failure the
+    // failure is reported, alone it is absence.
+    let busy = RawPeer::start(Some(Reply::Busy));
+    let busy_dead = a
+        .network
+        .commit_source(chain, vec![dead_address(), busy.address()]);
+    let failed = timed(|| busy_dead.fetch(parent, &AtomicBool::new(false))).unwrap_err();
+    assert!(
+        matches!(&failed, Error::CommitSource(m) if m.starts_with("overlay")),
+        "{failed}"
+    );
+    let only_busy = a.network.commit_source(chain, vec![busy.address()]);
+    assert_eq!(
+        timed(|| only_busy.fetch(parent, &AtomicBool::new(false))).unwrap(),
+        None
+    );
+    assert_eq!(busy.seen().len(), 2);
     let live = a.network.commit_source(chain, vec![b.address.clone()]);
     assert_eq!(
         timed(|| live.fetch(parent, &AtomicBool::new(false))).unwrap(),
@@ -539,32 +567,6 @@ fn missing(root: &Path) -> Value {
         None
     );
     assert_eq!(resolve(&a.engine, &mixed).unwrap(), 0);
-    let dead = a
-        .network
-        .commit_source(chain, vec![dead_address(), dead_address()]);
-    let error = timed(|| dead.fetch(parent, &AtomicBool::new(false))).unwrap_err();
-    assert!(
-        matches!(&error, Error::CommitSource(m) if m.starts_with("overlay")),
-        "{error}"
-    );
-    assert!(error.to_string().contains("overlay"));
-    // Busy is capacity, not an answer: alone it is absence, beside a
-    // transport failure the failure is reported.
-    let busy = RawPeer::start(Some(Reply::Busy));
-    let only_busy = a.network.commit_source(chain, vec![busy.address()]);
-    assert_eq!(
-        timed(|| only_busy.fetch(parent, &AtomicBool::new(false))).unwrap(),
-        None
-    );
-    let busy_dead = a
-        .network
-        .commit_source(chain, vec![dead_address(), busy.address()]);
-    let failed = timed(|| busy_dead.fetch(parent, &AtomicBool::new(false))).unwrap_err();
-    assert!(
-        matches!(&failed, Error::CommitSource(m) if m.starts_with("overlay")),
-        "{failed}"
-    );
-    assert_eq!(busy.seen().len(), 2);
     let empty = a.network.commit_source(chain, vec![]);
     assert_eq!(empty.fetch(parent, &AtomicBool::new(false)).unwrap(), None);
     assert_eq!(status(&a.engine), before);

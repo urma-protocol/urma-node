@@ -2,7 +2,6 @@
 //! transport identity; packages still need independent Engine admission.
 //! There are no built-in seeds, wallet keys or implicit listeners. Names in
 //! explicitly dialed `/dns*` addresses resolve through the system resolver.
-pub use crate::peer_parent::OverlayCommitSource;
 use crate::{
     DialLimit, Error,
     engine::Engine,
@@ -11,11 +10,15 @@ use crate::{
     peer_gossip::{Dial, Dials, Shared, is_loopback, validate_announce, validate_peers},
     peer_inventory::{lookup, validate_inventory},
     peer_limits::{LimitDenied, Limits},
+    peer_live::Link,
     peer_parent::{Parent, validate_parent},
     peer_protocol::{GossipPeer, InventoryPage, Kind, PROTOCOL, Reply, Request, Response, VERSION},
     peer_rate::{Bucket, Count, peer_rate},
     peerbook::PeerAddress,
-    retrieval::RecordSource,
+};
+pub use crate::{
+    peer_live::{PeerSource, SyncPeers},
+    peer_parent::OverlayCommitSource,
 };
 use bitcoin::{BlockHash, Txid};
 use libp2p::{
@@ -67,17 +70,6 @@ pub struct PeerNetwork {
     connected: Arc<AtomicU64>,
     pub(crate) shared: Arc<Shared>,
     worker: Option<JoinHandle<Result<(), Error>>>,
-}
-
-/// A configured untrusted package source. Metadata is matched to the request;
-/// proof verification and independent chain selection belong to the caller.
-/// Cloning a source never dials; fetch performs the bounded request.
-#[derive(Clone)]
-pub struct PeerSource {
-    address: PeerAddress,
-    commands: async_mpsc::Sender<Command>,
-    stop: Arc<AtomicBool>,
-    shared: Arc<Shared>,
 }
 
 pub(crate) enum Command {
@@ -236,23 +228,31 @@ impl PeerNetwork {
         self.listen.clone()
     }
 
-    pub fn source(&self, address: PeerAddress) -> PeerSource {
-        PeerSource {
-            address,
+    /// Every address the listener is bound to now, with `/p2p`.
+    pub fn listen_addresses(&self) -> Vec<Multiaddr> {
+        self.shared.listeners()
+    }
+
+    fn link(&self) -> Link {
+        Link {
             commands: self.commands.clone(),
             stop: self.stop.clone(),
             shared: Arc::clone(&self.shared),
         }
     }
 
-    pub fn commit_source(&self, chain: Chain, peers: Vec<PeerAddress>) -> OverlayCommitSource {
-        OverlayCommitSource::new(
-            chain,
-            peers
-                .into_iter()
-                .map(|address| self.source(address))
-                .collect(),
-        )
+    pub fn source(&self, address: PeerAddress) -> PeerSource {
+        self.link()
+            .source(address.peer_id(), vec![address.address().clone()])
+    }
+
+    /// `manual` peers first, then whoever is connected and on our chain.
+    pub fn sync_peers(&self, manual: Vec<PeerAddress>) -> SyncPeers {
+        SyncPeers::new(self.link(), manual)
+    }
+
+    pub fn commit_source(&self, chain: Chain, manual: Vec<PeerAddress>) -> OverlayCommitSource {
+        OverlayCommitSource::new(chain, self.sync_peers(manual))
     }
 
     pub fn shutdown(mut self) -> Result<(), Error> {
@@ -303,37 +303,8 @@ pub(crate) fn request<T>(
 }
 
 impl PeerSource {
-    pub(crate) fn request<T>(
-        &self,
-        kind: Kind,
-        limit: Instant,
-        answer: fn(mpsc::SyncSender<Result<T, Error>>) -> Answer,
-    ) -> Result<T, Error> {
-        let target = (self.address.peer_id(), vec![self.address.address().clone()]);
-        request(&self.commands, &self.stop, target, kind, limit, answer)
-    }
-
     pub(crate) fn parent(&self, txid: Txid, deadline: Instant) -> Result<Parent, Error> {
         self.request(Kind::Parent { txid }, deadline, Answer::Parent)
-    }
-
-    /// Whether this peer has an established connection right now.
-    pub(crate) fn connected(&self) -> bool {
-        self.shared.is_connected(self.address.peer_id())
-    }
-
-    /// Fire and forget; a full queue only delays the idle-connection timeout.
-    pub(crate) fn disconnect(&self) {
-        let _ = self
-            .commands
-            .try_send(Command::Disconnect(self.address.peer_id()));
-    }
-}
-
-impl RecordSource for PeerSource {
-    fn fetch(&self, txid: Txid) -> Result<Option<RecordPackage>, Error> {
-        let kind = Kind::Record { txid };
-        self.request(kind, Instant::now() + CALL_TIMEOUT, Answer::Record)
     }
 }
 
@@ -523,22 +494,25 @@ async fn run(
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { mut address, .. } => {
                     address.push(Protocol::P2p(*swarm.local_peer_id()));
+                    shared.listening(address.clone(), true);
                     if let Some(ready) = ready.take() { let _ = ready.send(Ok(Some(address))); }
                 }
+                SwarmEvent::ExpiredListenAddr { address, .. } => shared.listening(address.with(Protocol::P2p(*swarm.local_peer_id())), false),
+                SwarmEvent::ListenerClosed { addresses, .. } => for address in addresses { shared.listening(address.with(Protocol::P2p(*swarm.local_peer_id())), false) },
                 SwarmEvent::ListenerError { error, .. } if ready.is_some() => break Err(Error::Io(error)),
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
                     remotes.0.insert(connection_id, (endpoint.get_remote_address().clone(), endpoint.is_dialer()));
                     dials.established(connection_id, peer_id);
+                    shared.opened(peer_id, endpoint.is_dialer());
                     if num_established.get() == 1 {
                         connected.fetch_add(1, Ordering::Relaxed);
-                        shared.set_connected(peer_id, true);
                     }
                 }
-                SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, num_established, .. } => {
                     remotes.0.remove(&connection_id);
+                    shared.closed(peer_id, endpoint.is_dialer());
                     if num_established == 0 {
                         connected.fetch_sub(1, Ordering::Relaxed);
-                        shared.set_connected(peer_id, false);
                     }
                 }
                 SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
@@ -560,6 +534,7 @@ async fn run(
                         // Every request, including refusals, consumes rate and
                         // response allowance. Over-rate requests get an explicit
                         // Busy; only an exhausted byte allowance drops the channel.
+                        if request.version == VERSION && request.chain_genesis == genesis { shared.on_chain(peer); }
                         let over_rate = !requests.take(1) || !peer_rate(&mut rates, peer);
                         if !bytes.take(256) {
                             continue;
@@ -584,6 +559,7 @@ async fn run(
                         }
                     }
                     request_response::Event::Message { peer, message: Message::Response { request_id, response }, .. } => {
+                        if response.version == VERSION && response.chain_genesis == genesis { shared.on_chain(peer); }
                         if let Some(value) = pending.remove(&request_id) {
                             value.answer.deliver(genesis, peer, &value, response);
                         }

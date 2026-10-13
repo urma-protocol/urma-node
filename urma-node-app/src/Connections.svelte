@@ -93,7 +93,21 @@
       {/if}
       <dl class="identity">
         <dt>listen</dt>
-        <dd>{overlay.listen ?? "outbound only"}</dd>
+        <dd>
+          {#each overlay.listen as address}
+            <code>{address}</code>
+          {:else}
+            outbound only
+          {/each}
+        </dd>
+        {#if overlay.announce.length}
+          <dt>announced</dt>
+          <dd>
+            {#each overlay.announce as address}
+              <code>{address}</code>
+            {/each}
+          </dd>
+        {/if}
         <dt>peer id</dt>
         <dd><code>{overlay.peer_id}</code></dd>
       </dl>

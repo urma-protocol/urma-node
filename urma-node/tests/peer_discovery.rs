@@ -328,9 +328,10 @@ fn omitting(root: &Path) -> Value {
     assert!(a.connected().contains(&honest.id));
     assert!(!a.connected().contains(&liar.id) && liar.connected().is_empty());
     let omitting = a.engine.omitting_peers().unwrap();
-    let synced: Vec<String> = discovery
-        .sync_sources(&omitting)
-        .unwrap()
+    let synced: Vec<String> = a
+        .network
+        .sync_peers(Vec::new())
+        .sources(&omitting)
         .into_iter()
         .map(|(label, _)| label)
         .collect();
@@ -455,16 +456,17 @@ fn http(address: SocketAddr, path: &str) -> io::Result<Value> {
     serde_json::from_slice(&raw[split + 4..]).map_err(io::Error::other)
 }
 
-// Overlay status needs the inventory scheduler; discovery refreshes its peers.
+// Overlay status needs the inventory scheduler; it follows the live overlay.
 fn overlay_service(a: &Node, discovery: Discovery) -> Service {
     let info = OverlayInfo {
         peer_id: a.id.to_string(),
-        listen: None,
+        listen: Arc::new(Vec::new),
+        announce: Vec::new(),
         peer_book: 1,
         connected: Arc::new(|| 0),
     };
     let sync = PeerSync {
-        peers: Vec::new(),
+        peers: a.network.sync_peers(Vec::new()),
         info,
     };
     Service::bind(
@@ -526,6 +528,23 @@ fn service(root: &Path) -> Value {
     json!({"book":entries.len()})
 }
 
+/// A seed node's own seed name resolves to itself: the dial is skipped
+/// silently, with no seed round error and the book left as it was.
+fn own_seed(root: &Path) -> Value {
+    let a = node(root, "a", Some("127.0.0.1"));
+    let mut book = PeerBook::empty(a.genesis());
+    book.add(a.listening(), Origin::Seed).unwrap();
+    let (discovery, _, shared) = discovery_host::discover_shared(root, "a", &a, book);
+    stage(root, "an isolated seed node never reports dialing itself");
+    rounds(&discovery, &a, 3);
+    let status = discovery.status().unwrap();
+    assert!(status.last_seed_round_error.is_none(), "{status:?}");
+    assert_eq!(status.seeds, 1);
+    assert!(a.connected().is_empty());
+    let entries = shared.lock().unwrap().entries().len();
+    json!({"seed_error":false,"book":entries})
+}
+
 #[test]
 #[ignore = "owned namespaced subprocess host, invoked only by the discovery cases"]
 fn peer_discovery_host() {
@@ -539,6 +558,7 @@ fn peer_discovery_host() {
         "connected_seeds" => connected_seeds(&root),
         "budget" => budget(&root),
         "service" => service(&root),
+        "own_seed" => own_seed(&root),
         _ => panic!("unknown owned scenario"),
     };
     report(&root, &scenario, checks);
@@ -586,6 +606,13 @@ fn a_connected_node_under_target_queries_seeds_every_600_rounds() {
 fn one_round_spends_at_most_three_operations_and_two_dials() {
     let checks = run(HOST, "budget");
     assert_eq!(checks["first_round"], 3);
+}
+
+#[test]
+fn a_seed_resolving_to_this_node_is_skipped_without_an_error() {
+    let checks = run(HOST, "own_seed");
+    assert_eq!(checks["seed_error"], false);
+    assert_eq!(checks["book"], 1);
 }
 
 #[test]
