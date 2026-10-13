@@ -28,10 +28,16 @@ struct HeaderBootstrapFile {
 }
 
 pub fn read_archive_config(path: &Path) -> Result<ArchiveConfig, Error> {
-    let bytes = match urma_io::read_bounded(path, Limits::CONFIG) {
+    let bytes = match urma_io::read_admin(path, Limits::CONFIG) {
         Ok(bytes) => bytes,
         Err(urma_io::Error::TooLarge { .. }) => {
             return Err(Error::Invalid("config exceeds 64 KiB".into()));
+        }
+        Err(urma_io::Error::PrivatePermissions) => {
+            return Err(Error::Invalid(format!(
+                "{} must be owned by and writable only by administrators",
+                path.display()
+            )));
         }
         Err(error) => return Err(io::Error::other(error).into()),
     };

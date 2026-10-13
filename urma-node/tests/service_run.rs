@@ -43,7 +43,9 @@ fn layout(root: &Path) -> Paths {
 
 fn http(address: SocketAddr, line: &str, token: &str) -> String {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     write!(
         stream,
         "{line} HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\nContent-Length: 0\r\nAuthorization: Bearer {token}\r\n\r\n"
@@ -98,7 +100,10 @@ fn start() -> Running {
         }
     };
     assert!(address.ip().is_loopback());
-    let token = std::fs::read_to_string(&paths.token).unwrap().trim().to_string();
+    let token = std::fs::read_to_string(&paths.token)
+        .unwrap()
+        .trim()
+        .to_string();
     let response = http(address, "GET /v1/status", &token);
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("\"application_start\""), "{response}");

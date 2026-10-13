@@ -50,7 +50,16 @@ impl ServiceSettings {
     }
 
     pub fn read(path: &Path) -> Result<Self, Error> {
-        let bytes = urma_io::read_regular(path, Self::LIMIT).map_err(std::io::Error::other)?;
+        let bytes = match urma_io::read_admin(path, Self::LIMIT) {
+            Ok(bytes) => bytes,
+            Err(urma_io::Error::PrivatePermissions) => {
+                return Err(Error::Invalid(format!(
+                    "{} must be owned by and writable only by administrators",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(std::io::Error::other(error).into()),
+        };
         Ok(serde_json::from_slice(&bytes)?)
     }
 }

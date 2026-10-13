@@ -1,5 +1,6 @@
 //! First-install state (URMA_NODE_INSTALL.md §3): every item is created only
-//! when absent and nothing existing is rewritten.
+//! when absent, nothing existing is rewritten, and nothing existing is adopted
+//! unless an administrator owns it and only administrators can write it.
 use super::{Exposure, Paths, ServiceSettings, os};
 use crate::{Error, config, service};
 use std::{
@@ -11,35 +12,68 @@ use std::{
 type Writer<'a> = &'a dyn Fn(&mut File) -> Result<(), Error>;
 type Create = fn(&Path) -> Result<(), io::Error>;
 
+/// Whether an existing item must pass `urma_io::check_admin` before it is
+/// adopted. The Linux state directory and everything below it belong to the
+/// service account after install, so only Windows guards the token there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Adopt {
+    AdminOnly,
+    Owned,
+}
+
+impl Adopt {
+    const STATE: Self = match cfg!(windows) {
+        true => Self::AdminOnly,
+        false => Self::Owned,
+    };
+}
+
 /// Creates what is missing below `paths` and returns what it created. The
 /// caller (install) owns the account and, on Linux, the chown to it.
 pub fn ensure_defaults(paths: &Paths) -> Result<Vec<PathBuf>, Error> {
     let mut created = Vec::new();
-    let directories: [(&Path, Create); 3] = [
-        (&paths.settings_dir, os::create_settings_directory),
-        (&paths.state_dir, os::create_state_directory),
-        (&paths.data, os::create_data_directory),
+    let directories: [(&Path, Create, Adopt); 3] = [
+        (
+            &paths.settings_dir,
+            os::create_settings_directory,
+            Adopt::AdminOnly,
+        ),
+        (&paths.state_dir, os::create_state_directory, Adopt::STATE),
+        (&paths.data, os::create_data_directory, Adopt::Owned),
     ];
-    for (path, create) in directories {
-        if absent_directory(path)? {
+    for (path, create, adopt) in directories {
+        if absent_directory(path, adopt)? {
             create(path)?;
             created.push(path.to_path_buf());
         }
     }
     let config = serde_json::to_vec_pretty(&config::service_archive_config()?)?;
     let settings = serde_json::to_vec_pretty(&ServiceSettings::defaults(paths))?;
-    let files: [(&Path, Exposure, Writer); 4] = [
-        (&paths.config, Exposure::Public, &|file| {
+    let files: [(&Path, Exposure, Adopt, Writer); 4] = [
+        (&paths.config, Exposure::Public, Adopt::AdminOnly, &|file| {
             Ok(file.write_all(&config)?)
         }),
-        (&paths.settings, Exposure::Public, &|file| {
-            Ok(file.write_all(&settings)?)
-        }),
-        (&paths.peer_key, Exposure::Private, &write_peer_key),
-        (&paths.token, Exposure::Readers, &service::write_token),
+        (
+            &paths.settings,
+            Exposure::Public,
+            Adopt::AdminOnly,
+            &|file| Ok(file.write_all(&settings)?),
+        ),
+        (
+            &paths.peer_key,
+            Exposure::Private,
+            Adopt::Owned,
+            &write_peer_key,
+        ),
+        (
+            &paths.token,
+            Exposure::Readers,
+            Adopt::STATE,
+            &service::write_token,
+        ),
     ];
-    for (path, exposure, write) in files {
-        if fill(path, exposure, write)? {
+    for (path, exposure, adopt, write) in files {
+        if fill(path, exposure, adopt, write)? {
             created.push(path.to_path_buf());
         }
     }
@@ -68,9 +102,26 @@ fn peer_key_bytes() -> Result<Vec<u8>, Error> {
         .map_err(|error| Error::Invalid(error.to_string()))
 }
 
-fn absent_directory(path: &Path) -> Result<bool, Error> {
+fn adoptable(path: &Path, adopt: Adopt) -> Result<(), Error> {
+    match adopt {
+        Adopt::Owned => Ok(()),
+        Adopt::AdminOnly => match urma_io::check_admin(path) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(Error::Invalid(format!(
+                "refusing to adopt {}: it must be owned by and writable only by administrators \
+                 ({error}); remove it or let `urma-node service install` reset it",
+                path.display()
+            ))),
+        },
+    }
+}
+
+fn absent_directory(path: &Path, adopt: Adopt) -> Result<bool, Error> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => Ok(false),
+        Ok(metadata) if metadata.is_dir() => {
+            adoptable(path, adopt)?;
+            Ok(false)
+        }
         Ok(metadata) => Err(Error::Invalid(format!(
             "{} exists but is a {:?}, not a directory",
             path.display(),
@@ -81,17 +132,18 @@ fn absent_directory(path: &Path) -> Result<bool, Error> {
     }
 }
 
-fn fill(path: &Path, exposure: Exposure, write: Writer) -> Result<bool, Error> {
+fn fill(path: &Path, exposure: Exposure, adopt: Adopt, write: Writer) -> Result<bool, Error> {
     let mut file = match os::create_file(path, exposure) {
         Ok(file) => file,
         Err(cause) if cause.kind() == io::ErrorKind::AlreadyExists => {
-            return match std::fs::symlink_metadata(path)?.is_file() {
-                true => Ok(false),
-                false => Err(Error::Invalid(format!(
+            if !std::fs::symlink_metadata(path)?.is_file() {
+                return Err(Error::Invalid(format!(
                     "{} exists but is not a regular file: {cause}",
                     path.display()
-                ))),
-            };
+                )));
+            }
+            adoptable(path, adopt)?;
+            return Ok(false);
         }
         Err(cause) => return Err(cause.into()),
     };

@@ -106,6 +106,33 @@ fn linux_modes_follow_the_install_contract() {
     assert_eq!(mode(&paths.config) & 0o022, 0);
     assert_eq!(mode(&paths.config) & 0o004, 0o004);
 
+    let squatted = tempfile::tempdir().unwrap();
+    let paths = Paths::linux_under(squatted.path());
+    fs::create_dir_all(&paths.settings_dir).unwrap();
+    fs::set_permissions(&paths.settings_dir, fs::Permissions::from_mode(0o777)).unwrap();
+    let error = ensure_defaults(&paths).unwrap_err().to_string();
+    assert!(error.contains("refusing to adopt"), "{error}");
+    assert!(!paths.config.exists() && !paths.token.exists());
+    fs::set_permissions(&paths.settings_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&paths.config, b"{}").unwrap();
+    fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o664)).unwrap();
+    let error = ensure_defaults(&paths).unwrap_err().to_string();
+    assert!(error.contains("refusing to adopt"), "{error}");
+    fs::remove_file(&paths.config).unwrap();
+    ensure_defaults(&paths).unwrap();
+    fs::set_permissions(&paths.settings, fs::Permissions::from_mode(0o666)).unwrap();
+    let error = ServiceSettings::read(&paths.settings)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("writable only by administrators"), "{error}");
+    let error = urma_node::daemon::read_archive_config(&paths.config);
+    assert!(error.is_ok());
+    fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o646)).unwrap();
+    let error = urma_node::daemon::read_archive_config(&paths.config)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("writable only by administrators"), "{error}");
+
     let planted = tempfile::tempdir().unwrap();
     let paths = Paths::linux_under(planted.path());
     fs::create_dir_all(&paths.state_dir).unwrap();
