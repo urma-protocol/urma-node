@@ -42,7 +42,9 @@ impl std::fmt::Display for Error {
         match self {
             #[cfg(windows)]
             Self::ProgramData => f.write_str("ProgramData is unset"),
-            Self::NotInstalled(path) => write!(f, "URMA Node is not installed: no {}", path.display()),
+            Self::NotInstalled(path) => {
+                write!(f, "URMA Node is not installed: no {}", path.display())
+            }
             #[cfg(not(windows))]
             Self::Access(path) => write!(
                 f,
@@ -50,7 +52,11 @@ impl std::fmt::Display for Error {
                 path.display()
             ),
             #[cfg(windows)]
-            Self::Access(path) => write!(f, "No access to {}: run the URMA Node installer again", path.display()),
+            Self::Access(path) => write!(
+                f,
+                "No access to {}: run the URMA Node installer again",
+                path.display()
+            ),
             Self::Config(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Token(path, error) => write!(f, "token {}: {error}", path.display()),
             Self::Offline(endpoint, error) => write!(f, "no node at {endpoint}: {error}"),
