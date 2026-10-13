@@ -19,7 +19,7 @@ use crate::{
     recorded::{RecordedError, unix_seconds},
 };
 use libp2p::{Multiaddr, PeerId};
-use range::{Accepted, Range, accept, open};
+use range::{Accepted, Opened, Range, accept, open};
 use std::{
     sync::{
         Arc, Mutex,
@@ -541,10 +541,14 @@ impl Scheduler {
     fn advance(&self, peer: &Peer, engine: &Engine, round: &mut Round) -> Result<Turn, Error> {
         let mut slot = peer.range.lock().map_err(|_| poisoned())?;
         if slot.is_none() {
-            *slot = open(&peer.id, engine, peer.floor.load(Ordering::Relaxed))?;
-            // Nothing left to ask a fully synced peer: as fresh as progress,
-            // so surplus synced peers are not evicted every IDLE_BACKOFF.
-            round.progressed |= slot.is_none();
+            match open(&peer.id, engine, peer.floor.load(Ordering::Relaxed))? {
+                Opened::Range(range) => *slot = Some(range),
+                // Nothing left to ask a fully synced peer: as fresh as progress,
+                // so surplus synced peers are not evicted every IDLE_BACKOFF.
+                Opened::Synced => round.progressed = true,
+                // Starting above our tip it serves nothing: idle, evictable.
+                Opened::AboveTip => (),
+            }
         }
         // A peer error or our own failure abandons the range; it is requested
         // again from the persisted cursor on this peer's next turn.
@@ -619,7 +623,7 @@ impl Scheduler {
                     Accepted::Unscanned => *slot = None,
                     Accepted::Floor(floor) => {
                         peer.floor.store(floor, Ordering::Relaxed);
-                        *slot = open(&peer.id, engine, floor)?;
+                        *slot = open(&peer.id, engine, floor)?.range();
                     }
                 }
             } else {

@@ -97,3 +97,36 @@ fn a_later_starting_peer_never_covers_heights_below_its_own_start() {
     let engine = client.offline();
     assert!(pairs.iter().all(|pair| held(&engine, pair)));
 }
+
+#[test]
+fn a_peer_starting_above_our_tip_never_counts_as_progress() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let pairs = pairs();
+    let blocks = blocks(&pairs);
+    let late = server_from(
+        &root.join("late"),
+        &blocks,
+        LATE_START,
+        blocks.len() - LATE_START,
+    );
+    // Our selected tip ends just below the peer's archive start.
+    let client = Client::new(root, &blocks[..LATE_START]);
+    let label = late.address.peer_id().to_string();
+    let running = Running::start(client.offline(), vec![late.address.clone()]);
+    let listed = |status: &Value| {
+        let peers = status["overlay"]["peers"].as_array().unwrap();
+        peers.iter().any(|peer| peer["label"] == label)
+    };
+    running.until(listed);
+    // Several scheduler turns: the peer serves nothing, so it stays idle
+    // (evictable) instead of looking as fresh as a fully synced peer.
+    thread::sleep(Duration::from_secs(5));
+    let status = running.status();
+    running.stop();
+    let late_peer = peer(&status, &label);
+    assert!(late_peer["last_progress_at"].is_null(), "{status}");
+    assert!(late_peer["last_error"].is_null(), "{status}");
+    assert_eq!(synced_through(&status), None);
+    assert_eq!(stored(&status), 0);
+}

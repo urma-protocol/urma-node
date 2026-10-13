@@ -32,23 +32,44 @@ pub(super) enum Accepted {
     Floor(u64),
 }
 
+/// Whether a peer has a range left to walk.
+pub(super) enum Opened {
+    Range(Range),
+    /// Covered through our selected tip (or no selected view yet).
+    Synced,
+    /// The peer's archive starts above our tip: it has nothing to offer.
+    AboveTip,
+}
+
+impl Opened {
+    pub(super) fn range(self) -> Option<Range> {
+        match self {
+            Opened::Range(range) => Some(range),
+            Opened::Synced | Opened::AboveTip => None,
+        }
+    }
+}
+
 /// The next unclaimed range for peer `id` at or above its `floor`, bounded by
 /// the local selected tip. The range keeps the generation observed here for
 /// its whole lifetime, so a reorg between rounds makes its coverage claim
 /// Stale instead of mislabelled.
-pub(super) fn open(id: &str, engine: &Engine, floor: u64) -> Result<Option<Range>, Error> {
+pub(super) fn open(id: &str, engine: &Engine, floor: u64) -> Result<Opened, Error> {
     let status = engine.status()?;
     let Some(tip) = status.selected_tip else {
-        return Ok(None);
+        return Ok(Opened::Synced);
     };
+    if floor > tip.height {
+        return Ok(Opened::AboveTip);
+    }
     let from = engine.peer_cursor_from(id, floor)?;
     if from > tip.height {
-        return Ok(None);
+        return Ok(Opened::Synced);
     }
     let span_end = from
         .checked_add(Scheduler::RANGE_HEIGHTS - 1)
         .ok_or_else(|| Error::Invalid("peer cursor overflows the height range".into()))?;
-    Ok(Some(Range {
+    Ok(Opened::Range(Range {
         from,
         to: tip.height.min(span_end),
         after: None,
