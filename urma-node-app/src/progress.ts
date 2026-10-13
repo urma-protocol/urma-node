@@ -36,15 +36,6 @@ export const bar = (status: ServiceStatus): Bar => {
   return { state: "records", verified, peers };
 };
 
-/** Floored whole percents of a partition; the rounding leftover goes to the last non-empty part, so the
- * shares sum to 100 and no earlier part is ever rounded up (an incomplete "verified" never shows 100). */
-export const shares = (parts: number[]): number[] => {
-  const out = parts.map((p) => Math.floor(p * 100 + 1e-9));
-  const last = parts.reduce((found, p, i) => (p > 0 ? i : found), -1);
-  if (last >= 0) out[last] += 100 - out.reduce((a, b) => a + b, 0);
-  return out;
-};
-
 /** Peers delivered inventory within this many seconds. */
 const RECEIVING = 10;
 

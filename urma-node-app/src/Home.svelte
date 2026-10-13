@@ -1,7 +1,7 @@
 <script lang="ts">
   import Logo from "./Logo.svelte";
   import type { Failure, Overview } from "./status";
-  import { bar, receiving, shares, type Phase } from "./progress";
+  import { bar, receiving, type Phase } from "./progress";
   import { num } from "./format";
 
   let { phase, snapshot, failure }: { phase: Phase; snapshot: Overview | null; failure: Failure | null } = $props();
@@ -27,18 +27,17 @@
 
   const lonely = $derived(overlay !== null && overlay !== undefined && !overlay.connected && line !== "Up to date");
 
-  const STATES = [
-    { key: "verified", name: "Verified by this node", about: "Records this node found itself by reading every Litecoin block. Final." },
-    { key: "from-peers", name: "Received from URMA peers", about: "Records copied from other URMA nodes, not yet checked by this node." },
-    { key: "pending", name: "Not loaded yet", about: "Part of the chain this node hasn't reached yet." },
-  ];
-
-  const rows = $derived.by(() => {
-    if (progress?.state !== "records") return [];
-    const parts = [progress.verified, progress.peers, Math.max(0, 1 - progress.verified - progress.peers)];
-    const percents = shares(parts);
-    return STATES.map((s, i) => ({ ...s, part: parts[i], percent: percents[i] }));
-  });
+  const LEGEND = {
+    chain: [
+      { key: "chain", name: "Syncing chain" },
+      { key: "pending", name: "Not loaded" },
+    ],
+    records: [
+      { key: "verified", name: "Verified" },
+      { key: "from-peers", name: "From peers" },
+      { key: "pending", name: "Not loaded" },
+    ],
+  };
 </script>
 
 <section class="home">
@@ -66,23 +65,11 @@
         {/if}
       </div>
       <h1>{line}{lonely ? " · no URMA peers" : ""}</h1>
-      <ul class="legend">
-        {#if progress.state === "chain"}
-          <li>
-            <i class="swatch chain"></i>
-            <span><b>Syncing the Litecoin chain</b>Learning where the chain ends before reading it.</span>
-            <em></em>
-          </li>
-        {:else}
-          {#each rows as row (row.key)}
-            <li class:dim={row.part === 0}>
-              <i class="swatch {row.key}"></i>
-              <span><b>{row.name}</b>{row.about}</span>
-              <em>{row.percent}%</em>
-            </li>
-          {/each}
-        {/if}
-      </ul>
+      <p class="legend">
+        {#each LEGEND[progress.state] as item (item.key)}
+          <span><i class="swatch {item.key}"></i>{item.name}</span>
+        {/each}
+      </p>
     </div>
 
     {#if status.archive.peer_omissions}
