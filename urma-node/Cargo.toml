@@ -5,8 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-publish = false
-description = "Optional URMA archive engine and background service"
+homepage.workspace = true
+publish = true
+readme = "README.md"
+description = "Optional URMA archive node: Litecoin follower, record archive, libp2p overlay and loopback service"
+keywords = ["urma", "litecoin", "archive", "libp2p", "node"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
+include = ["Cargo.toml", "src/**", "contrib/**", "README.md", "LICENSE"]
 
 [dependencies]
 bitcoin = { version = "0.32", features = ["serde"] }

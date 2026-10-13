@@ -6,7 +6,7 @@ for a supervised service see [the systemd template](../systemd/README.md).
 
 ```sh
 cargo build --release -p urma-node --locked
-cargo install --locked --git https://github.com/urma-protocol/urma.git --rev 755258425c71e62511f099ddd253d570116aa660 urma-cli
+cargo install --locked urma-cli
 export URMA_NODE=$PWD/target/release/urma-node
 urma-node/contrib/dev/local-node.sh ~/urma-dev offline
 ```

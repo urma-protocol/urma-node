@@ -17,11 +17,16 @@ libraries, and the node never relaxes them.
 ## Build
 
 Requires a Rust stable toolchain. The library crates (`urma-chain`, `urma-core`, `urma-io`,
-`urma-names`, `urma-runtime`, `urma-wire`, `urma-node-client`) are git
-dependencies pinned to one commit of the main repository in `Cargo.toml`.
+`urma-names`, `urma-runtime`, `urma-wire`, `urma-node-client`) come from crates.io.
 
 ```sh
-cargo install --locked --path urma-node      # urma-node, urma-node-control
+cargo install --locked urma-node             # urma-node, urma-node-control
+```
+
+From source:
+
+```sh
+cargo install --locked --path urma-node
 cargo test --locked -p urma-node
 ```
 

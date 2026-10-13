@@ -1,8 +1,8 @@
 # URMA Node
 
-The daemon and the desktop app are published standalone at
-<https://github.com/urma-protocol/urma-node>, synced from this tree until the
-libraries are on crates.io.
+The daemon and the desktop app live at
+<https://github.com/urma-protocol/urma-node>; the URMA libraries come from
+crates.io.
 
 URMA Node is an optional background archive for URMA applications. Its engine
 can also run inside a client. Existing publishing and recovery flows continue
