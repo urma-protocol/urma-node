@@ -5,6 +5,18 @@ use crate::Error;
 use libp2p::Multiaddr;
 use urma_chain::observation::Chain;
 
+/// The product's directory under `%ProgramData%` and `%ProgramFiles%`.
+pub const WINDOWS_PRODUCT_DIR: &str = "URMA Node";
+
+/// `%ProgramData%`, where the Windows service keeps settings and state.
+#[cfg(windows)]
+pub fn program_data() -> std::path::PathBuf {
+    match std::env::var_os("ProgramData") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(r"C:\ProgramData"),
+    }
+}
+
 pub const SEEDS: &[(Chain, &str)] = &[
     (Chain::LitecoinMainnet, "/dnsaddr/ltc-seed.urma.rosint.org"),
     (Chain::LitecoinTestnet, "/dnsaddr/tltc-seed.urma.rosint.org"),
