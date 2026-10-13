@@ -301,22 +301,24 @@ fn failing_source_error_is_reported_while_scanning_progresses_then_cleared() {
     let (engine, _chain) = fixture(directory.path(), &pair, 2);
     let source = Recording::new(Chain::BitcoinRegtest, &pair.raw_commit, 2);
     let running = Running::start(engine, Some(&source), true);
-    for blocks in [1, 2] {
-        let failed = poll(running.address, "stored dependency error", |s| {
-            scanned(s) == blocks && dependency_error(s).is_some()
-        });
-        assert!(
-            dependency_error(&failed).unwrap().contains(FAILURE),
-            "{failed}"
-        );
-        assert_eq!(unresolved(&failed), 1);
-        assert!(field(&failed, "last_sync_error").is_null(), "{failed}");
-        assert_eq!(field(&failed, "commit_sources")[0]["label"], json!(LABEL));
-    }
+    // Scanning catches up on its own thread while parent acquisition keeps
+    // failing and reporting on the maintenance thread.
+    let failed = poll(
+        running.address,
+        "scan done with a stored dependency error",
+        |s| scanned(s) == 3 && dependency_error(s).is_some(),
+    );
+    assert!(
+        dependency_error(&failed).unwrap().contains(FAILURE),
+        "{failed}"
+    );
+    assert_eq!(unresolved(&failed), 1);
+    assert!(field(&failed, "last_sync_error").is_null(), "{failed}");
+    assert_eq!(field(&failed, "commit_sources")[0]["label"], json!(LABEL));
     let done = poll(running.address, "cleared error and resolved parent", |s| {
         unresolved(s) == 0 && dependency_error(s).is_none()
     });
-    assert_eq!(scanned(&done), 3, "dependency resolved before third scan");
+    assert_eq!(scanned(&done), 3);
     assert!(field(&done, "last_sync_error").is_null(), "{done}");
     let engine = running.finish();
     let missing = pair.commit.compute_txid();

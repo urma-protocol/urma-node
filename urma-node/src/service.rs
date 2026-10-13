@@ -7,12 +7,13 @@ use crate::{
     peer::SyncPeers,
     peer_discovery::Discovery,
     peer_sync::Scheduler,
-    recorded::{RecordedError, read, record},
+    recorded::{RecordedError, read},
     retrieval::RecordSource,
     source::{CommitSource, CommitSources},
 };
 
 mod overlay;
+mod worker;
 use rand::RngCore;
 use serde_json::json;
 use std::{
@@ -189,99 +190,18 @@ impl Service {
     }
 
     /// Run foreground. Network acquisition is opt-in; status works offline.
+    /// run(true) adds the sync and maintenance threads (see `worker`); stop
+    /// joins both before this returns.
     pub fn run(self, synchronize: bool) -> Result<(), Error> {
         std::thread::scope(|scope| {
             if synchronize {
-                scope.spawn(|| {
-                    while !self.stop.load(Ordering::Acquire) {
-                        self.worker_round();
-                        for _ in 0..20 {
-                            if self.stop.load(Ordering::Acquire) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-                    }
-                });
+                scope.spawn(|| self.sync_loop());
+                scope.spawn(|| self.maintenance_loop());
             }
             let outcome = self.accept_loop();
             self.stop.store(true, Ordering::Release);
             outcome
         })
-    }
-
-    fn worker_round(&self) {
-        let headers = self.engine.synchronize_headers_until(&self.stop);
-        // Discovery keeps connections and the book fresh before inventory
-        // sync uses them; it is independent of this round's header result.
-        self.discover_peers();
-        // Peer inventory is fast data: it runs before the full-block scan and
-        // independently of this round's header result, with its own status.
-        self.sync_next_inventory();
-        let result = headers
-            .and_then(|_| self.engine.scan_next_until(&self.stop))
-            .and_then(|status| {
-                if !self.stop.load(Ordering::Acquire) {
-                    self.engine.resolve_cached_dependency()?;
-                }
-                Ok(status)
-            });
-        record(&self.sync_error, &result);
-        self.acquire_next_dependency();
-        // Registered projections can use already scanned data
-        // even if this round's acquisition failed. They never
-        // create registrations or acquire missing history.
-        if !self.stop.load(Ordering::Acquire) {
-            let result = self.engine.maintain_next_names(&self.stop);
-            record(&self.names_error, &result);
-        }
-        // Full-block audit always gets its opportunity before
-        // one object attempt. A sync failure does not suppress
-        // independent recovery from the last selected view;
-        // its error remains separately visible in status.
-        if !self.stop.load(Ordering::Acquire) {
-            if let Some((scratch, slice)) = &self.retention {
-                let owned = self.record_sources();
-                let sources: Vec<&dyn RecordSource> = owned
-                    .iter()
-                    .map(|source| -> &dyn RecordSource { source.as_ref() })
-                    .collect();
-                let result = self
-                    .engine
-                    .retain_next_object(&sources, *slice, scratch, &self.stop);
-                record(&self.retention_error, &result);
-            }
-        }
-        // Independent local maintenance also runs after failed
-        // acquisition/projection/retention. It never opens a source.
-        if !self.stop.load(Ordering::Acquire) {
-            let result = self.engine.maintain_cache(self.cache_bytes, &self.stop);
-            if let Ok(mut status) = self.cache_status.lock() {
-                match result {
-                    Ok(receipt) => {
-                        status.receipt = Some(receipt);
-                        status.error = None;
-                    }
-                    Err(cause) => {
-                        status.error = Some(RecordedError::now(cause));
-                    }
-                }
-            }
-        }
-    }
-
-    fn acquire_next_dependency(&self) {
-        let Some(sources) = &self.commit_sources else {
-            return;
-        };
-        if self.stop.load(Ordering::Acquire) {
-            return;
-        }
-        let result = self.engine.resolve_next_dependency(sources, &self.stop);
-        if self.stop.load(Ordering::Acquire) {
-            return;
-        }
-        record(&self.dependency_error, &result);
     }
 
     fn status(&self) -> Result<ServiceStatus, Error> {
