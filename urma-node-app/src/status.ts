@@ -97,6 +97,7 @@ export type ServiceStatus = {
   last_cache_maintenance: CacheReceipt | null;
   overlay: OverlayStatus | null;
   chain_peers: number;
+  chain_target: number | null;
   retention_configured: boolean;
   record_sources_configured: number;
   capabilities: string[];

@@ -17,12 +17,20 @@ export const audit = (status: ServiceStatus): Sync => {
   return { ...audited, complete: audited.complete && status.archive.unresolved_dependencies === 0 };
 };
 
-/** Simple view bar over application_start → selected_tip: verified, then records from peers ahead of it. */
-export type Bar = { state: "chain" } | { state: "records"; verified: number; peers: number };
+/**
+ * Simple view bar. Chain: headers short of chain_target, fill over start → target (null while unknown).
+ * Records: over start → selected_tip, verified then records from peers ahead of it.
+ */
+export type Bar = { state: "chain"; fill: number | null } | { state: "records"; verified: number; peers: number };
 
 export const bar = (status: ServiceStatus): Bar => {
-  const { archive } = status;
-  if (!archive.selected_tip) return { state: "chain" };
+  const { archive, chain_target: target } = status;
+  const tip = archive.selected_tip;
+  if (!tip) return { state: "chain", fill: null };
+  if (target !== null && tip.height < target) {
+    const span = target - archive.application_start.height;
+    return { state: "chain", fill: span > 0 ? Math.max(0, (tip.height - archive.application_start.height) / span) : 0 };
+  }
   const verified = reach(archive, archive.indexed_through).fraction;
   const peers = Math.max(0, reach(archive, archive.peer_synced_through).fraction - verified);
   return { state: "records", verified, peers };
@@ -45,7 +53,8 @@ export const receiving = (status: ServiceStatus, now: number) =>
 
 export const loading = (status: ServiceStatus): Phase => {
   const b = bar(status);
-  return b.state === "chain" ? "connecting" : { fraction: b.verified, complete: b.verified === 1 };
+  if (b.state === "records") return { fraction: b.verified, complete: b.verified === 1 };
+  return b.fill === null ? "connecting" : { fraction: b.fill, complete: false };
 };
 
 export type Issue = { name: string; error: string | null; at: number | null };

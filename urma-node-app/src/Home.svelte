@@ -55,7 +55,11 @@
     <div class="progress">
       <div class="track">
         {#if progress.state === "chain"}
-          <span class="chain sweep"></span>
+          {#if progress.fill === null}
+            <span class="chain sweep"></span>
+          {:else}
+            <span class="chain" style:width="{progress.fill * 100}%"></span>
+          {/if}
         {:else}
           <span class="verified" style:width="{progress.verified * 100}%"></span>
           <span class="from-peers" style:width="{progress.peers * 100}%"></span>
