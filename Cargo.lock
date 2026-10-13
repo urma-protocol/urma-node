@@ -6097,7 +6097,7 @@ dependencies = [
 
 [[package]]
 name = "urma-node-app"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bitcoin",
  "serde",

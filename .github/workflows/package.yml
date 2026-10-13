@@ -26,14 +26,16 @@ jobs:
       - name: Build upgrade deb
         working-directory: urma-node-app
         run: |
+          next=$(grep -m1 '^version' ../Cargo.toml | cut -d'"' -f2 | awk -F. '{print $1"."$2"."$3+1}')
+          echo "upgrade version $next"
           rc=0
-          pnpm tauri build --bundles deb --config src-tauri/tauri.bundle.json --config '{"version":"0.5.1"}' || rc=$?
+          pnpm tauri build --bundles deb --config src-tauri/tauri.bundle.json --config "{\"version\":\"$next\"}" || rc=$?
           echo "tauri build exit $rc"
           df -h / "$GITHUB_WORKSPACE"
           ls -la ../target/release/bundle/deb/
           test "$rc" = 0
           mkdir -p ../dist/second
-          cp ../target/release/bundle/deb/*_0.5.1_*.deb ../dist/second/
+          cp ../target/release/bundle/deb/*_"$next"_*.deb ../dist/second/
       - name: Install, upgrade, remove, purge
         run: bash .github/scripts/deb-test.sh dist/first/*.deb dist/second/*.deb
       - uses: actions/upload-artifact@v7
