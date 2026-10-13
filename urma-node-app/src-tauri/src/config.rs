@@ -5,7 +5,8 @@ use std::path::PathBuf;
 pub const CONFIG_LIMIT: usize = 16_384;
 pub const TOKEN_LIMIT: usize = 256;
 
-pub const SERVICE_ENDPOINT: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 28331));
+pub const SERVICE_ENDPOINT: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 28331));
 
 pub enum Override {
     At(PathBuf),

@@ -48,16 +48,25 @@ impl Settings {
             }
             None => {
                 let path = config::service_token()?;
-                let token = urma_io::read_shared(&path, config::TOKEN_LIMIT).map_err(|error| match &error {
-                    urma_io::Error::Io(io) if io.kind() == ErrorKind::NotFound => Error::NotInstalled(path.clone()),
-                    urma_io::Error::Io(io) if io.kind() == ErrorKind::PermissionDenied => Error::Access(path.clone()),
-                    _ => Error::Token(path.clone(), error.to_string()),
-                })?;
+                let token =
+                    urma_io::read_shared(&path, config::TOKEN_LIMIT).map_err(
+                        |error| match &error {
+                            urma_io::Error::Io(io) if io.kind() == ErrorKind::NotFound => {
+                                Error::NotInstalled(path.clone())
+                            }
+                            urma_io::Error::Io(io) if io.kind() == ErrorKind::PermissionDenied => {
+                                Error::Access(path.clone())
+                            }
+                            _ => Error::Token(path.clone(), error.to_string()),
+                        },
+                    )?;
                 (config::SERVICE_ENDPOINT, path, token)
             }
         };
-        let token = std::str::from_utf8(&token).map_err(|error| Error::Token(path.clone(), error.to_string()))?;
-        let client = Client::new(endpoint, token.trim().to_owned()).map_err(|error| Error::Token(path, error.to_string()))?;
+        let token = std::str::from_utf8(&token)
+            .map_err(|error| Error::Token(path.clone(), error.to_string()))?;
+        let client = Client::new(endpoint, token.trim().to_owned())
+            .map_err(|error| Error::Token(path, error.to_string()))?;
         Ok((client, endpoint))
     }
 }
