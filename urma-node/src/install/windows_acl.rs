@@ -40,6 +40,8 @@ impl Acl {
     const BINARY: &'static str = "urma-node.exe";
     const WRITE_RIGHTS: u32 = 0x0000_0002
         | 0x0000_0004
+        | 0x0000_0010
+        | 0x0000_0100
         | 0x0001_0000
         | 0x0004_0000
         | 0x0008_0000
@@ -323,18 +325,39 @@ pub fn trusted_binary(binary: &Path) -> Result<(), Error> {
     if !same {
         return Err(refusal());
     }
-    let handle = open(binary, READ_CONTROL | FILE_READ_ATTRIBUTES)?;
-    if plain(binary, &information(&handle)?)? {
+    let Some(parent) = binary.parent() else {
         return Err(refusal());
-    }
+    };
     let installer = trusted_installer()?;
+    let file = trusted_object(binary, false, installer.0)?;
+    let directory = trusted_object(parent, true, installer.0)?;
+    match file && directory {
+        true => Ok(()),
+        false => Err(refusal()),
+    }
+}
+
+fn trusted_object(path: &Path, directory: bool, installer: PSID) -> Result<bool, Error> {
+    let handle = open(path, READ_CONTROL | FILE_READ_ATTRIBUTES)?;
+    if plain(path, &information(&handle)?)? != directory {
+        return Ok(false);
+    }
     let (owner, dacl, _descriptor) = security(
         &handle,
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
     )?;
-    let owned = administrative(owner) || unsafe { EqualSid(owner, installer.0) } != 0;
-    match owned && writers_are_trusted(dacl, installer.0)? {
+    let owned = administrative(owner) || unsafe { EqualSid(owner, installer) } != 0;
+    Ok(owned && writers_are_trusted(dacl, installer)?)
+}
+
+pub fn administered(path: &Path) -> Result<(), Error> {
+    let handle = open(path, READ_CONTROL | FILE_READ_ATTRIBUTES)?;
+    if !plain(path, &information(&handle)?)? {
+        return Err(refuse(path, "it is not a directory"));
+    }
+    let (owner, _dacl, _descriptor) = security(&handle, OWNER_SECURITY_INFORMATION)?;
+    match administrative(owner) {
         true => Ok(()),
-        false => Err(refusal()),
+        false => Err(refuse(path, "it is not owned by SYSTEM or Administrators")),
     }
 }

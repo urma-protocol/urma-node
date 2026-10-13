@@ -2,7 +2,7 @@ use crate::{
     config::SERVICE_NAME,
     install::{
         Error, Init, Registration, Runner, Status, System,
-        windows_acl::{reclaim, trusted_binary},
+        windows_acl::{administered, reclaim, trusted_binary},
     },
     platform::ensure_defaults,
 };
@@ -148,6 +148,7 @@ impl<R: Runner> System<R> {
         };
         Scm::recover(&service)?;
         ensure_defaults(&paths)?;
+        administered(&paths.data)?;
         Scm::start(&service)?;
         writeln!(out, "{} is installed and running.", Scm::DISPLAY)?;
         Ok(())
