@@ -37,15 +37,9 @@ fn reclaimable_bytes(db: &Connection) -> Result<u64, Error> {
 impl Archive {
     pub(crate) fn maintain_cache(&mut self, limit_bytes: u64) -> Result<CacheReceipt, Error> {
         let enabled = self.config.retention == Retention::Pruned;
-        let mut receipt = CacheReceipt {
-            enabled,
-            limit_bytes,
-            before_bytes: 0,
-            remaining_bytes: 0,
-            removed_records: 0,
-            removed_transactions: 0,
-            over_budget: false,
-        };
+        let mut receipt = CacheReceipt::default();
+        receipt.enabled = enabled;
+        receipt.limit_bytes = limit_bytes;
         if !enabled {
             return Ok(receipt);
         }

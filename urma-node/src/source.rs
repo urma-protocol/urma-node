@@ -33,6 +33,11 @@ pub trait ChainSource: Send + Sync {
     fn chain_peers(&self) -> Result<u64, Error> {
         Ok(0)
     }
+    /// Absolute header-sync target announced by chain peers; `None` while
+    /// unknown or for sources without a peer network.
+    fn chain_target(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Untrusted auxiliary parent bytes, not a chain verifier. The chain getter
@@ -317,11 +322,11 @@ impl CommitSources {
             .zip(errors.iter())
             .map(|(entry, error)| {
                 let (last_error, last_error_at) = RecordedError::split(error.clone());
-                CommitSourceStatus {
-                    label: entry.0.clone(),
-                    last_error,
-                    last_error_at,
-                }
+                let mut status = CommitSourceStatus::default();
+                status.label = entry.0.clone();
+                status.last_error = last_error;
+                status.last_error_at = last_error_at;
+                status
             })
             .collect())
     }
@@ -478,5 +483,8 @@ impl ChainSource for LitecoinSource {
     fn chain_peers(&self) -> Result<u64, Error> {
         u64::try_from(self.provider.progress().peers_connected)
             .map_err(|error| Error::Invalid(format!("chain peer count: {error}")))
+    }
+    fn chain_target(&self) -> Option<u64> {
+        self.provider.target_height()
     }
 }

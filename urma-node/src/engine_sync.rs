@@ -53,4 +53,11 @@ impl Engine {
             None => Ok(0),
         }
     }
+
+    /// Absolute header-sync target; `None` while unknown or offline.
+    pub fn chain_target(&self) -> Option<u64> {
+        self.source
+            .as_ref()
+            .and_then(|source| source.chain_target())
+    }
 }

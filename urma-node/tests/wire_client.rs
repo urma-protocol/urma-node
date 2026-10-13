@@ -277,30 +277,22 @@ fn record(height: u64, position: u32, payload: PublicRecord) -> WireRecord {
 }
 
 fn page(records: Vec<WireRecord>, next: Option<WireCursor>) -> WirePage {
+    let mut archive = ArchiveStatus::default();
+    archive.chain_genesis = block(0);
+    archive.application_start = ChainPoint {
+        height: 17,
+        hash: block(17),
+    };
+    archive.retention = Retention::Pruned;
+    archive.generation = 3;
+    archive.selected_tip = Some(ChainPoint {
+        height: 19,
+        hash: block(19),
+    });
+    archive.stored_transactions = 2;
     WirePage {
         snapshot: snapshot(),
-        archive: ArchiveStatus {
-            api_version: 1,
-            chain_genesis: block(0),
-            application_start: ChainPoint {
-                height: 17,
-                hash: block(17),
-            },
-            retention: Retention::Pruned,
-            generation: 3,
-            selected_tip: Some(ChainPoint {
-                height: 19,
-                hash: block(19),
-            }),
-            indexed_through: None,
-            scanned_blocks: 0,
-            unresolved_dependencies: 0,
-            stored_transactions: 2,
-            scan_rules_version: 1,
-            peer_synced_through: None,
-            peer_omissions: 0,
-            unaudited_records: 0,
-        },
+        archive,
         records,
         next,
     }

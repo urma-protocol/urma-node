@@ -677,30 +677,29 @@ impl Scheduler {
             let synced_through = cursor.checked_sub(1).filter(|height| *height >= start);
             let recorded = peer.last_error.lock().map_err(|_| poisoned())?.clone();
             let (last_error, last_error_at) = RecordedError::split(recorded);
-            peers.push(OverlayPeerStatus {
-                label: peer.label.clone(),
-                cursor,
-                synced_through,
-                last_error,
-                last_error_at,
-                backoff_until: peer.backoff_until(now)?,
-                last_progress_at: peer.last_progress()?,
-            });
+            let mut status = OverlayPeerStatus::default();
+            status.label = peer.label.clone();
+            status.cursor = cursor;
+            status.synced_through = synced_through;
+            status.last_error = last_error;
+            status.last_error_at = last_error_at;
+            status.backoff_until = peer.backoff_until(now)?;
+            status.last_progress_at = peer.last_progress()?;
+            peers.push(status);
         }
-        Ok(OverlayStatus {
-            peer_id: self.info.peer_id.clone(),
-            listen: (self.info.listen)()
-                .iter()
-                .map(Multiaddr::to_string)
-                .collect(),
-            announce: self.info.announce.clone(),
-            peer_book: self.info.peer_book,
-            connected: (self.info.connected)(),
-            admitted: self.admitted.load(Ordering::Relaxed),
-            rejected: self.rejected.load(Ordering::Relaxed),
-            peers,
-            discovery: None,
-        })
+        let mut status = OverlayStatus::default();
+        status.peer_id = self.info.peer_id.clone();
+        status.listen = (self.info.listen)()
+            .iter()
+            .map(Multiaddr::to_string)
+            .collect();
+        status.announce = self.info.announce.clone();
+        status.peer_book = self.info.peer_book;
+        status.connected = (self.info.connected)();
+        status.admitted = self.admitted.load(Ordering::Relaxed);
+        status.rejected = self.rejected.load(Ordering::Relaxed);
+        status.peers = peers;
+        Ok(status)
     }
 }
 

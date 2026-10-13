@@ -310,32 +310,33 @@ impl Service {
         for sources in self.commit_sources.iter() {
             commit_sources.extend(sources.status()?);
         }
-        Ok(ServiceStatus {
-            archive: self.engine.status()?,
-            last_sync_error,
-            last_sync_error_at,
-            last_retention_error,
-            last_retention_error_at,
-            last_names_error,
-            last_names_error_at,
-            last_dependency_error,
-            last_dependency_error_at,
-            last_inventory_error,
-            last_inventory_error_at,
-            last_discovery_error,
-            last_discovery_error_at,
-            commit_sources,
-            cache_limit_bytes: self.cache_bytes,
-            last_cache_error,
-            last_cache_error_at,
-            last_cache_maintenance: cache.receipt,
-            overlay,
-            chain_peers: self.engine.chain_peers()?,
-            retention_configured: self.retention.is_some(),
-            record_sources_configured: u64::try_from(self.record_source_count())
-                .map_err(|error| Error::Invalid(format!("record source count: {error}")))?,
-            capabilities: Self::CAPABILITIES.map(String::from).to_vec(),
-        })
+        let mut status = ServiceStatus::default();
+        status.archive = self.engine.status()?;
+        status.last_sync_error = last_sync_error;
+        status.last_sync_error_at = last_sync_error_at;
+        status.last_retention_error = last_retention_error;
+        status.last_retention_error_at = last_retention_error_at;
+        status.last_names_error = last_names_error;
+        status.last_names_error_at = last_names_error_at;
+        status.last_dependency_error = last_dependency_error;
+        status.last_dependency_error_at = last_dependency_error_at;
+        status.last_inventory_error = last_inventory_error;
+        status.last_inventory_error_at = last_inventory_error_at;
+        status.last_discovery_error = last_discovery_error;
+        status.last_discovery_error_at = last_discovery_error_at;
+        status.commit_sources = commit_sources;
+        status.cache_limit_bytes = self.cache_bytes;
+        status.last_cache_error = last_cache_error;
+        status.last_cache_error_at = last_cache_error_at;
+        status.last_cache_maintenance = cache.receipt;
+        status.overlay = overlay;
+        status.chain_peers = self.engine.chain_peers()?;
+        status.chain_target = self.engine.chain_target();
+        status.retention_configured = self.retention.is_some();
+        status.record_sources_configured = u64::try_from(self.record_source_count())
+            .map_err(|error| Error::Invalid(format!("record source count: {error}")))?;
+        status.capabilities = Self::CAPABILITIES.map(String::from).to_vec();
+        Ok(status)
     }
 
     fn accept_loop(&self) -> Result<(), Error> {

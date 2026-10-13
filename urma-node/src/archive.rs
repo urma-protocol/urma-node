@@ -135,30 +135,28 @@ impl Archive {
         let stored_transactions =
             self.db
                 .query_row("SELECT count(*) FROM transactions", [], |r| unsigned(r, 0))?;
-        Ok(ArchiveStatus {
-            api_version: API_VERSION,
-            chain_genesis: self
-                .config
-                .chain
-                .genesis()
-                .map_err(|e| Error::Invalid(e.to_string()))?
-                .0,
-            application_start: self.config.application_start,
-            retention: self.config.retention,
-            generation,
-            selected_tip,
-            indexed_through,
-            scanned_blocks,
-            unresolved_dependencies,
-            stored_transactions,
-            scan_rules_version: SCAN_RULES_VERSION,
-            peer_synced_through: peers::synced_through(
-                &self.db,
-                self.config.application_start.height,
-            )?,
-            peer_omissions: peers::omission_count(&self.db)?,
-            unaudited_records: peers::unaudited_count(&self.db)?,
-        })
+        let mut status = ArchiveStatus::default();
+        status.api_version = API_VERSION;
+        status.chain_genesis = self
+            .config
+            .chain
+            .genesis()
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .0;
+        status.application_start = self.config.application_start;
+        status.retention = self.config.retention;
+        status.generation = generation;
+        status.selected_tip = selected_tip;
+        status.indexed_through = indexed_through;
+        status.scanned_blocks = scanned_blocks;
+        status.unresolved_dependencies = unresolved_dependencies;
+        status.stored_transactions = stored_transactions;
+        status.scan_rules_version = SCAN_RULES_VERSION;
+        status.peer_synced_through =
+            peers::synced_through(&self.db, self.config.application_start.height)?;
+        status.peer_omissions = peers::omission_count(&self.db)?;
+        status.unaudited_records = peers::unaudited_count(&self.db)?;
+        Ok(status)
     }
 
     /// Contiguous fully scanned, dependency-complete coverage from application start.

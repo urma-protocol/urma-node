@@ -379,30 +379,37 @@ impl ChainSource for Peered {
     fn chain_peers(&self) -> Result<u64, Error> {
         Ok(3)
     }
+    fn chain_target(&self) -> Option<u64> {
+        Some(4_913_600)
+    }
 }
 
 #[test]
-fn status_reports_chain_peers_from_the_source_and_zero_offline() {
+fn status_reports_chain_peers_and_target_from_the_source_and_none_offline() {
     let block = witness_block(&[], None, 41);
     let memory = Arc::new(MemorySource::new(std::slice::from_ref(&block)));
     let peered: Arc<dyn ChainSource> = Arc::new(Peered(memory.clone()));
     let plain: Arc<dyn ChainSource> = memory;
-    for (source, expected) in [(None, 0), (Some(plain), 0), (Some(peered), 3)] {
+    let cases = [
+        (None, 0, None),
+        (Some(plain), 0, None),
+        (Some(peered), 3, Some(4_913_600)),
+    ];
+    for (source, peers, target) in cases {
         let directory = tempfile::tempdir().unwrap();
         let config = config(&block, Retention::Unpruned);
         let engine = Engine::open(directory.path(), config, source).unwrap();
         let running = Running::start(engine, None, false);
         let mut current = status(running.address);
-        assert_eq!(
-            field(&current, "chain_peers"),
-            &json!(expected),
-            "{current}"
-        );
+        assert_eq!(field(&current, "chain_peers"), &json!(peers), "{current}");
+        assert_eq!(field(&current, "chain_target"), &json!(target), "{current}");
         let typed: ServiceStatus = serde_json::from_value(current.clone()).unwrap();
-        assert_eq!(typed.chain_peers, expected);
-        current.as_object_mut().unwrap().remove("chain_peers");
+        assert_eq!((typed.chain_peers, typed.chain_target), (peers, target));
+        let object = current.as_object_mut().unwrap();
+        object.remove("chain_peers");
+        object.remove("chain_target");
         let older: ServiceStatus = serde_json::from_value(current).unwrap();
-        assert_eq!(older.chain_peers, 0);
+        assert_eq!((older.chain_peers, older.chain_target), (0, None));
         running.finish();
     }
 }

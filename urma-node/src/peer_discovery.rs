@@ -321,17 +321,17 @@ impl Discovery {
             RecordedError::split(read(&self.seed_error, "seed round")?);
         let (last_gossip_error, last_gossip_error_at) =
             RecordedError::split(read(&self.gossip_error, "gossip")?);
-        Ok(DiscoveryStatus {
-            seeds: stats.seeds,
-            book: stats.book,
-            reached: stats.reached,
-            reached_ever: stats.reached_ever,
-            gossip: stats.gossip,
-            last_seed_round_error,
-            last_seed_round_error_at,
-            last_gossip_error,
-            last_gossip_error_at,
-        })
+        let mut status = DiscoveryStatus::default();
+        status.seeds = stats.seeds;
+        status.book = stats.book;
+        status.reached = stats.reached;
+        status.reached_ever = stats.reached_ever;
+        status.gossip = stats.gossip;
+        status.last_seed_round_error = last_seed_round_error;
+        status.last_seed_round_error_at = last_seed_round_error_at;
+        status.last_gossip_error = last_gossip_error;
+        status.last_gossip_error_at = last_gossip_error_at;
+        Ok(status)
     }
 
     /// Peers the inventory scheduler caught misbehaving back off in the book
