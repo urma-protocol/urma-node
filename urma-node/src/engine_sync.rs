@@ -3,10 +3,60 @@
 use crate::{
     Error,
     engine::Engine,
-    model::{ChainPoint, Omission},
+    model::{ArchiveStatus, ChainPoint, Omission},
+};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
+/// One catch-up pass: how many blocks it committed and how it ended.
+pub struct CatchUp {
+    pub scanned: u64,
+    pub outcome: Result<ArchiveStatus, Error>,
+}
+
 impl Engine {
+    /// Scan selected blocks one after another until the selected tip, `blocks`
+    /// commits, `time` elapsed or cancellation, which is checked between
+    /// blocks. Each block is still its own verified, atomic commit; the first
+    /// error ends the pass and keeps every block committed before it.
+    pub fn scan_catch_up(&self, cancelled: &AtomicBool, blocks: u64, time: Duration) -> CatchUp {
+        let deadline = Instant::now() + time;
+        let mut scanned = 0;
+        let mut last = match self.status() {
+            Ok(status) => status,
+            Err(error) => {
+                return CatchUp {
+                    scanned,
+                    outcome: Err(error),
+                };
+            }
+        };
+        while scanned < blocks && Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
+            match self.scan_next_until(cancelled) {
+                Ok(next) if next.scanned_blocks == last.scanned_blocks => {
+                    last = next;
+                    break;
+                }
+                Ok(next) => {
+                    scanned += 1;
+                    last = next;
+                }
+                Err(error) => {
+                    return CatchUp {
+                        scanned,
+                        outcome: Err(error),
+                    };
+                }
+            }
+        }
+        CatchUp {
+            scanned,
+            outcome: Ok(last),
+        }
+    }
+
     /// Record that `peer` (its PeerId string) listed every placement in
     /// selected [from, to] and each listed placement was admitted, already
     /// held, or answered Missing (listed-only).
