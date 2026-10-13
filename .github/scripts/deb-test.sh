@@ -57,5 +57,6 @@ getent passwd urma-node
 sudo apt-get purge -y urma-node
 test ! -e /var/lib/urma-node
 test ! -e /etc/urma-node
+test ! -e /var/log/urma-node
 absent getent passwd urma-node
 echo "deb lifecycle ok"

@@ -17,3 +17,8 @@ post_upgrade() {
 pre_remove() {
     _urma_service uninstall
 }
+
+post_remove() {
+    echo "urma-node: kept /etc/urma-node, /var/lib/urma-node and /var/log/urma-node;"
+    echo "to purge, run 'urma-node service uninstall --purge' before removing the package."
+}
