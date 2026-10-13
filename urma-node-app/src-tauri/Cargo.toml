@@ -1,0 +1,23 @@
+[package]
+name = "urma-node-app"
+version = "0.0.0"
+edition = "2024"
+license = "0BSD"
+publish = false
+description = "URMA Node desktop UI"
+
+[lib]
+name = "urma_node_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+bitcoin = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+urma-chain.workspace = true
+urma-io.workspace = true
+urma-node-client.workspace = true

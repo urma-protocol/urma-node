@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+<title id="title">URMA Node — decentralized mesh</title><desc id="desc">Six equal peers connect as a signal travels along and repairs the URMA trace. The completed logo remains visible.</desc>
+<style>
+.frame,.trace,.edge{fill:none;stroke-linecap:round;stroke-linejoin:round}
+.frame{stroke:#51ff0d;stroke-width:18;opacity:.68}
+.trace{stroke:#d6fa52;stroke-width:30}
+.edge{stroke:#51ff0d;stroke-width:7;stroke-dasharray:1;stroke-dashoffset:0}
+.peer{fill:#080c08;stroke:#d6fa52;stroke-width:7}
+@media(prefers-reduced-motion:reduce){.fracture,.traveler{display:none}.edge{stroke-dashoffset:0!important}}
+</style>
+<defs><mask id="repair-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512"><rect width="512" height="512" fill="white"/>
+<path id="fracture-0" class="fracture" d="M199 405L212 382 204 369 221 350" fill="none" stroke="black" stroke-width="12" opacity="0"><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.4167;0.4595;1" dur="4.2s" fill="freeze"/></path>
+<path id="fracture-1" class="fracture" d="M241 415L247 391 237 379 250 365" fill="none" stroke="black" stroke-width="12" opacity="0"><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.4762;0.5190;1" dur="4.2s" fill="freeze"/></path>
+<path id="fracture-2" class="fracture" d="M272 414L266 393 279 379 265 365" fill="none" stroke="black" stroke-width="12" opacity="0"><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5357;0.5786;1" dur="4.2s" fill="freeze"/></path>
+<path id="fracture-3" class="fracture" d="M309 404L296 383 305 368 291 350" fill="none" stroke="black" stroke-width="12" opacity="0"><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5952;0.6381;1" dur="4.2s" fill="freeze"/></path>
+</mask><path id="signal-path" d="M54 129h75v132C129 343 182 392 256 392S383 343 383 261V129h75"/></defs>
+<rect id="background" width="512" height="512" rx="48" fill="#080c08"/>
+<g id="frame" class="frame"><path d="M93 178V88h98"/><path d="M321 88h98v90"/><path d="M93 328v96h98"/><path d="M321 424h98v-96"/></g>
+<use href="#signal-path" class="trace" mask="url(#repair-mask)"/>
+<g id="mesh-links">
+<path id="edge-2-3" class="edge" pathLength="1" d="M332 246L294 311.818"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.0762;0.1714;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-5-0" class="edge" pathLength="1" d="M180 246L218 180.182"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.2048;0.3000;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-3-4" class="edge" pathLength="1" d="M294 311.818L218 311.818"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.1357;0.2310;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-1-2" class="edge" pathLength="1" d="M294 180.182L332 246"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.3405;0.4357;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-4-5" class="edge" pathLength="1" d="M218 311.818L180 246"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.2667;0.3619;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-0-1" class="edge" pathLength="1" d="M218 180.182L294 180.182"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.4500;0.5452;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-0-4" class="edge" pathLength="1" d="M218 180.182L218 311.818"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.6786;0.7738;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-1-3" class="edge" pathLength="1" d="M294 180.182L294 311.818"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.7429;0.8381;1" dur="4.2s" fill="freeze"/></path>
+<path id="edge-0-3" class="edge" pathLength="1" d="M218 180.182L294 311.818"><animate attributeName="stroke-dashoffset" values="1;1;0;0" keyTimes="0;0.8690;0.9643;1" dur="4.2s" fill="freeze"/></path>
+</g><g id="peers" class="peer">
+<circle id="peer-0" cx="218" cy="180.182" r="12"/>
+<circle id="peer-1" cx="294" cy="180.182" r="12"/>
+<circle id="peer-2" cx="332" cy="246" r="12"/>
+<circle id="peer-3" cx="294" cy="311.818" r="12"/>
+<circle id="peer-4" cx="218" cy="311.818" r="12"/>
+<circle id="peer-5" cx="180" cy="246" r="12"/>
+</g><circle id="repair-signal" class="traveler" r="11" fill="#51ff0d" opacity="0"><animateMotion dur="4.2s" keyPoints="0;0;1;1" keyTimes="0;.06;.94;1" calcMode="linear" fill="freeze"><mpath href="#signal-path"/></animateMotion><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.06;.94;1" dur="4.2s" fill="freeze"/></circle></svg>
