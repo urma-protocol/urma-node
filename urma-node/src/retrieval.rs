@@ -150,7 +150,9 @@ impl Pace {
     }
 
     /// Background unpruned acquisition: no size budget beyond the protocol
-    /// geometry and no overall deadline; only network time is sliced.
+    /// geometry and no overall deadline; only network time is sliced. Every
+    /// supplied source is asked in order, so a record one peer lacks or serves
+    /// badly still comes from the next; the caller bounds the source list.
     pub(crate) fn background(slice: Duration) -> Self {
         Self {
             limits: RecoveryLimits {
@@ -161,7 +163,7 @@ impl Pace {
             },
             slice,
             fetch: FetchLimits {
-                sources: 1,
+                sources: usize::MAX,
                 ..FetchLimits::default()
             },
         }

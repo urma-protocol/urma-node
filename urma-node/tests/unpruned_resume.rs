@@ -122,6 +122,14 @@ impl Peer {
         }
     }
 
+    fn empty() -> Self {
+        Self {
+            packages: BTreeMap::new(),
+            delay: Duration::ZERO,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
     fn calls(&self) -> Vec<Txid> {
         self.calls.lock().unwrap().clone()
     }
@@ -214,6 +222,31 @@ fn stored_members_reverify_outside_the_slice_so_the_round_fetches_the_next_missi
 
     assert_eq!(peer.calls(), [missing]);
     assert_eq!(status.root, object.root());
+    assert_eq!(status.members_total, 4);
+    assert!(status.selected_complete());
+}
+
+#[test]
+fn records_the_first_source_lacks_come_from_the_next_source() {
+    let object = Object::load();
+    let directory = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let engine = object.engine(directory.path(), Retention::Unpruned);
+    let first = Peer::empty();
+    let second = Peer::new(&object, Duration::ZERO);
+
+    let status = engine
+        .retain_next_object(
+            &[&first, &second],
+            SLICE,
+            scratch.path(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .expect("the second source completes the object");
+
+    assert_eq!(first.calls().len(), 3);
+    assert_eq!(second.calls().len(), 3);
     assert_eq!(status.members_total, 4);
     assert!(status.selected_complete());
 }

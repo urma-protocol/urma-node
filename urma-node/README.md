@@ -88,7 +88,9 @@ local-operator view described below; they do not register or step implicitly.
 
 Unpruned keeps everything: every multipart object is acquired completely,
 bounded only by the protocol geometry (8,553,279,476 payload bytes, 32,695
-records), with no node-side size or record limit. Background rounds attempt a
+records), with no node-side size or record limit, so its disk use grows with the
+objects published on the chain; `--cache-bytes` does not bound it. Background
+rounds ask every configured and live record source in turn, and attempt a
 block scan, then work on the next incomplete object. Its slice
 (`--object-timeout-seconds`, default 15) counts network fetch time only: records
 already stored re-verify outside it, and a fetch starts only while network time
