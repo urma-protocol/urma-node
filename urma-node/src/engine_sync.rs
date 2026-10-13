@@ -26,7 +26,13 @@ impl Engine {
 
     /// First height after the peer's contiguous coverage from app start.
     pub fn peer_cursor(&self, peer: &str) -> Result<u64, Error> {
-        self.archive()?.peer_cursor(peer)
+        self.archive()?.peer_cursor(peer, 0)
+    }
+
+    /// As `peer_cursor`, starting at the peer's own scan floor when that is
+    /// above app start: heights below it are never asked of this peer.
+    pub fn peer_cursor_from(&self, peer: &str, floor: u64) -> Result<u64, Error> {
+        self.archive()?.peer_cursor(peer, floor)
     }
 
     pub fn peer_synced_through(&self) -> Result<Option<ChainPoint>, Error> {

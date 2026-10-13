@@ -2,7 +2,7 @@
 //! serving through a real PeerNetwork), client A's archive, and A's running
 //! Service with an authenticated loopback status endpoint.
 //! Loaded with #[path]; it is not part of the shared common module.
-use crate::common::{FIRST_HEIGHT, MemorySource, config, profile, witness_block};
+use crate::common::{FIRST_HEIGHT, MemorySource, config, point, profile, witness_block};
 use bitcoin::Block;
 use libp2p::{Multiaddr, PeerId, identity::Keypair};
 use serde_json::{Value, json};
@@ -51,11 +51,19 @@ pub struct Server {
 
 // Node B: headers to the tip, then `scanned` full-block scans of its own.
 pub fn server(root: &Path, blocks: &[Block], scanned: usize) -> Server {
-    let directory = root.join("b");
-    fs::create_dir_all(&directory).unwrap();
+    server_from(&root.join("b"), blocks, 0, scanned)
+}
+
+// A server whose archive starts `start` blocks above the client's.
+pub fn server_from(directory: &Path, blocks: &[Block], start: usize, scanned: usize) -> Server {
+    fs::create_dir_all(directory).unwrap();
     let chain = Arc::new(MemorySource::new(blocks));
-    let config = config(&blocks[0], Retention::Unpruned);
-    let engine = Arc::new(Engine::open(&directory, config, Some(chain.clone())).unwrap());
+    let first = FIRST_HEIGHT + u64::try_from(start).unwrap();
+    let config = ArchiveConfig {
+        application_start: point(first, &blocks[start]),
+        ..config(&blocks[0], Retention::Unpruned)
+    };
+    let engine = Arc::new(Engine::open(directory, config, Some(chain.clone())).unwrap());
     engine.synchronize_headers().unwrap();
     for _ in 0..scanned {
         engine.scan_next().unwrap();

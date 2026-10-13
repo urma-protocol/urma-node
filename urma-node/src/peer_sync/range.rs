@@ -21,15 +21,27 @@ pub(super) struct Range {
     pub(super) missing: u32,
 }
 
-/// The next unclaimed range for peer `id`, bounded by the local selected tip.
-/// The range keeps the generation observed here for its whole lifetime, so a
-/// reorg between rounds makes its coverage claim Stale instead of mislabelled.
-pub(super) fn open(id: &str, engine: &Engine) -> Result<Option<Range>, Error> {
+/// What a page means for its range.
+pub(super) enum Accepted {
+    /// Entries installed; keep walking.
+    Walk,
+    /// The peer has not scanned the range's start yet.
+    Unscanned,
+    /// The peer never scanned below this height: its page says nothing about
+    /// the range's start, so the range reopens there and claims nothing below.
+    Floor(u64),
+}
+
+/// The next unclaimed range for peer `id` at or above its `floor`, bounded by
+/// the local selected tip. The range keeps the generation observed here for
+/// its whole lifetime, so a reorg between rounds makes its coverage claim
+/// Stale instead of mislabelled.
+pub(super) fn open(id: &str, engine: &Engine, floor: u64) -> Result<Option<Range>, Error> {
     let status = engine.status()?;
     let Some(tip) = status.selected_tip else {
         return Ok(None);
     };
-    let from = engine.peer_cursor(id)?;
+    let from = engine.peer_cursor_from(id, floor)?;
     if from > tip.height {
         return Ok(None);
     }
@@ -49,14 +61,19 @@ pub(super) fn open(id: &str, engine: &Engine) -> Result<Option<Range>, Error> {
     }))
 }
 
-/// Install a page. Returns false when the peer has not scanned this range yet.
-/// Entries must be strictly ordered after the page cursor and inside the
-/// requested range; anything else is a peer error. Entries above the peer's
-/// own scanned prefix (blocks still waiting on a dependency) are dropped
-/// without blame: they are outside what the page can claim.
-pub(super) fn accept(range: &mut Range, page: InventoryPage) -> Result<bool, Error> {
+/// Install a page. Coverage is only ever claimed inside the peer's own
+/// scanned interval [`scanned_from`, `scanned_through`]: a page whose floor is
+/// above the range start installs nothing. Entries must be strictly ordered
+/// after the page cursor and inside the requested range; anything else is a
+/// peer error. Entries above the peer's own scanned prefix (blocks still
+/// waiting on a dependency) are dropped without blame: they are outside what
+/// the page can claim.
+pub(super) fn accept(range: &mut Range, page: InventoryPage) -> Result<Accepted, Error> {
+    if page.scanned_from > range.from {
+        return Ok(Accepted::Floor(page.scanned_from));
+    }
     let Some(scanned_through) = page.scanned_through.filter(|height| *height >= range.from) else {
-        return Ok(false);
+        return Ok(Accepted::Unscanned);
     };
     let limit = usize::try_from(Scheduler::PAGE_ENTRIES)
         .map_err(|error| Error::Invalid(format!("page limit: {error}")))?;
@@ -85,5 +102,5 @@ pub(super) fn accept(range: &mut Range, page: InventoryPage) -> Result<bool, Err
     range.next = 0;
     range.more = page.more;
     range.scanned_through = scanned_through;
-    Ok(true)
+    Ok(Accepted::Walk)
 }

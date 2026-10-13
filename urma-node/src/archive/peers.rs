@@ -79,7 +79,9 @@ impl Archive {
         Ok(())
     }
 
-    pub(crate) fn peer_cursor(&self, peer: &str) -> Result<u64, Error> {
+    /// First height at or after `floor` (never below app start) that the
+    /// peer's coverage leaves open; `floor` is the peer's own scan start.
+    pub(crate) fn peer_cursor(&self, peer: &str, floor: u64) -> Result<u64, Error> {
         let mut stmt = self.db.prepare(
             "SELECT from_height,to_height FROM peer_coverage
              WHERE peer=?1 AND generation=?2 ORDER BY from_height",
@@ -88,7 +90,7 @@ impl Archive {
         let rows = stmt.query_map(params![peer, epoch], |r| {
             Ok((unsigned(r, 0)?, unsigned(r, 1)?))
         })?;
-        contiguous(self.config.application_start.height, rows)
+        contiguous(self.config.application_start.height.max(floor), rows)
     }
 
     pub(crate) fn peer_synced_through(&self) -> Result<Option<ChainPoint>, Error> {

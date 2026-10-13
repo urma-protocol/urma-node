@@ -78,6 +78,7 @@ fn answer(offer: &Offer, kind: &Kind, served: &AtomicUsize) -> Reply {
                 .is_none_or(|last| (last.height, last.position) < (at, offer.placement.position));
             let listed = (from_height..=to_height).contains(&at) && fresh;
             Reply::Inventory(InventoryPage {
+                scanned_from: 0,
                 scanned_through: Some(to_height),
                 entries: if listed {
                     vec![offer.placement]

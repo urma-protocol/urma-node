@@ -67,6 +67,7 @@ fn inventory(engine: &Engine, range: (u64, u64), after: Option<Placement>, limit
         })
         .collect();
     let page = InventoryPage {
+        scanned_from: rows.scanned_from,
         scanned_through: rows.scanned_through,
         entries,
         more: rows.more,

@@ -6,8 +6,8 @@ use bitcoin::{BlockHash, Txid, Wtxid};
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL: &str = "/urma/node/record/4";
-pub const VERSION: u32 = 4;
+pub const PROTOCOL: &str = "/urma/node/record/5";
+pub const VERSION: u32 = 5;
 pub const REQUEST_LIMIT: usize = 1024;
 pub const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 /// Raw parent bytes, matching the local RPC 16M-hex admission cap.
@@ -86,10 +86,14 @@ pub struct Placement {
     pub wtxid: Wtxid,
 }
 
-/// Complete only for scanned blocks at or below `scanned_through` in range.
+/// Complete only for scanned blocks in [`scanned_from`, `scanned_through`]
+/// within the requested range. `scanned_from` is the answering node's
+/// application start: below it the node never scanned, so an empty page there
+/// is no claim at all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryPage {
+    pub scanned_from: u64,
     pub scanned_through: Option<u64>,
     pub entries: Vec<Placement>,
     pub more: bool,

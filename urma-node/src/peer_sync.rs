@@ -19,7 +19,7 @@ use crate::{
     recorded::{RecordedError, unix_seconds},
 };
 use libp2p::{Multiaddr, PeerId};
-use range::{Range, accept, open};
+use range::{Accepted, Range, accept, open};
 use std::{
     sync::{
         Arc, Mutex,
@@ -54,6 +54,9 @@ struct Peer {
     peer_id: PeerId,
     source: PeerSource,
     range: Mutex<Option<Range>>,
+    /// Lowest height the peer last reported scanning; ranges start at or
+    /// above it. 0 until a page says otherwise.
+    floor: AtomicU64,
     last_request: Mutex<Option<Instant>>,
     last_error: Mutex<Option<RecordedError>>,
     backoff: Mutex<Backoff>,
@@ -227,6 +230,7 @@ fn inventory_peer(label: String, source: PeerSource) -> Result<Peer, Error> {
         peer_id,
         source,
         range: Mutex::new(None),
+        floor: AtomicU64::new(0),
         last_request: Mutex::new(None),
         last_error: Mutex::new(None),
         backoff: Mutex::new(Backoff {
@@ -537,7 +541,7 @@ impl Scheduler {
     fn advance(&self, peer: &Peer, engine: &Engine, round: &mut Round) -> Result<Turn, Error> {
         let mut slot = peer.range.lock().map_err(|_| poisoned())?;
         if slot.is_none() {
-            *slot = open(&peer.id, engine)?;
+            *slot = open(&peer.id, engine, peer.floor.load(Ordering::Relaxed))?;
             // Nothing left to ask a fully synced peer: as fresh as progress,
             // so surplus synced peers are not evicted every IDLE_BACKOFF.
             round.progressed |= slot.is_none();
@@ -610,8 +614,13 @@ impl Scheduler {
                 else {
                     return Err(Pause::Done);
                 };
-                if !accept(range, page).map_err(Pause::Blame)? {
-                    *slot = None;
+                match accept(range, page).map_err(Pause::Blame)? {
+                    Accepted::Walk => (),
+                    Accepted::Unscanned => *slot = None,
+                    Accepted::Floor(floor) => {
+                        peer.floor.store(floor, Ordering::Relaxed);
+                        *slot = open(&peer.id, engine, floor)?;
+                    }
                 }
             } else {
                 let through = range.to.min(range.scanned_through);

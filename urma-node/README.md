@@ -265,7 +265,7 @@ the independent completeness check. The standalone peer exchange is currently
 by requested TXID or inventory range; relay/DCUtR, NAT traversal and two real
 consumer applications are still pending.
 
-Wire messages use `/urma/node/record/4`, a 4-byte big-endian JSON length followed
+Wire messages use `/urma/node/record/5`, a 4-byte big-endian JSON length followed
 by exactly one payload and stream EOF. Requests are capped at 1 KiB and
 responses at 32 MiB (inventory pages 256 KiB, peer gossip 32 KiB). Connections
 are capped at sixteen (eight each direction),
@@ -317,7 +317,11 @@ range and is reported as that peer's `last_error`. Pages list only blocks at or
 below the serving node's `indexed_through`, which pages report as
 `scanned_through`; a scanned block still waiting on a dependency is not listed
 yet, and a client drops any listed entry above that ceiling without blaming the
-peer. A listed record the peer then answers Missing for stays listed-only: it
+peer. Pages also report the serving node's application start as `scanned_from`:
+it never scanned below that height, so its pages there are no claim at all. A
+client never asks a peer below its reported floor and never records that
+peer's coverage there; a later archive start than ours leaves our lower heights
+to other peers or our own scan. A listed record the peer then answers Missing for stays listed-only: it
 does not block coverage and is not retried within that range. Coverage is
 recorded only when a range ends with every other listed record present, up to
 the lower of the range end and the peer's own scanned height, and only for the

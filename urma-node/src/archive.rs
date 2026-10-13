@@ -333,8 +333,10 @@ impl Archive {
         after: Option<(u64, u32)>,
         limit: u32,
     ) -> Result<InventoryRows, Error> {
+        let scanned_from = self.config.application_start.height;
         let Some(ceiling) = self.indexed_through()? else {
             return Ok(InventoryRows {
+                scanned_from,
                 scanned_through: None,
                 entries: Vec::new(),
                 more: false,
@@ -387,6 +389,7 @@ impl Archive {
         let more = entries.len() > wanted;
         entries.truncate(wanted);
         Ok(InventoryRows {
+            scanned_from,
             scanned_through: Some(ceiling.height),
             entries,
             more,
@@ -626,6 +629,7 @@ fn migrate(db: &mut Connection, version: u32) -> Result<(), Error> {
 
 /// One inventory page as stored: (block, position, txid, wtxid) rows.
 pub(crate) struct InventoryRows {
+    pub(crate) scanned_from: u64,
     pub(crate) scanned_through: Option<u64>,
     pub(crate) entries: Vec<(ChainPoint, u32, bitcoin::Txid, bitcoin::Wtxid)>,
     pub(crate) more: bool,

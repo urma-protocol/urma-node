@@ -59,6 +59,7 @@ fn inventory_request() -> Request {
 // Maximal-width placement fields: every hash is a full 32-byte value.
 fn page(entries: u32) -> InventoryPage {
     InventoryPage {
+        scanned_from: u64::MAX,
         scanned_through: Some(u64::MAX),
         entries: (0..entries)
             .map(|position| Placement {
@@ -552,12 +553,12 @@ fn gossip_peers() -> Vec<GossipPeer> {
     vec![gossip_peer()]
 }
 
-// v4 adds address exchange: a Peers request carries only its limit, and the
-// reply lists identified peers with bare addresses and a unix last-seen time.
+// A Peers request carries only its limit, and the reply lists identified peers
+// with bare addresses and a unix last-seen time.
 #[test]
-fn v4_peers_request_and_reply_have_stable_shapes_and_round_trip() {
-    assert_eq!(PROTOCOL, "/urma/node/record/4");
-    assert_eq!(VERSION, 4);
+fn peers_request_and_reply_have_stable_shapes_and_round_trip() {
+    assert_eq!(PROTOCOL, "/urma/node/record/5");
+    assert_eq!(VERSION, 5);
     block_on(async {
         let protocol = StreamProtocol::new(PROTOCOL);
         let asked = Request {
