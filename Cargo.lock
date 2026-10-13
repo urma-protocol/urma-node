@@ -6100,6 +6100,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
+ "tracing",
  "urma-chain",
  "urma-core",
  "urma-io",

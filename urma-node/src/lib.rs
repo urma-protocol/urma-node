@@ -6,6 +6,7 @@ pub mod archive;
 pub mod cache;
 pub mod client;
 pub mod config;
+pub mod daemon;
 pub mod engine;
 mod engine_sync;
 mod error;

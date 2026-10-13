@@ -48,13 +48,24 @@ pub fn ensure_defaults(paths: &Paths) -> Result<Vec<PathBuf>, Error> {
 
 /// A fresh Ed25519 transport identity, never a wallet or decryption key.
 pub fn write_peer_key(file: &mut File) -> Result<(), Error> {
-    let key = libp2p::identity::Keypair::generate_ed25519();
-    let mut bytes = key
-        .to_protobuf_encoding()
-        .map_err(|error| Error::Invalid(error.to_string()))?;
+    let mut bytes = peer_key_bytes()?;
     let written = file.write_all(&bytes);
     bytes.fill(0);
     Ok(written?)
+}
+
+/// A private per-user transport identity at `path`; an existing file stays.
+pub fn create_peer_key(path: &Path) -> Result<(), Error> {
+    let mut bytes = peer_key_bytes()?;
+    let written = urma_io::write_new(path, &bytes);
+    bytes.fill(0);
+    written.map_err(|error| Error::Invalid(error.to_string()))
+}
+
+fn peer_key_bytes() -> Result<Vec<u8>, Error> {
+    libp2p::identity::Keypair::generate_ed25519()
+        .to_protobuf_encoding()
+        .map_err(|error| Error::Invalid(error.to_string()))
 }
 
 fn absent_directory(path: &Path) -> Result<bool, Error> {

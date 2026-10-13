@@ -14,7 +14,7 @@ use unix as os;
 #[cfg(windows)]
 use windows as os;
 
-pub use defaults::{ensure_defaults, write_peer_key};
+pub use defaults::{create_peer_key, ensure_defaults, write_peer_key};
 pub use exposure::Exposure;
 pub use paths::Paths;
 pub use service_sid::service_sid;
