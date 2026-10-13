@@ -20,11 +20,8 @@ export const audit = (status: ServiceStatus): Sync => {
 export const fast = (status: ServiceStatus): Sync | null =>
   status.overlay ? reach(status.archive, status.archive.peer_synced_through) : null;
 
-export const loading = (status: ServiceStatus): Sync => {
-  const audited = audit(status);
-  const synced = fast(status);
-  return synced && (synced.fraction > audited.fraction || (synced.complete && !audited.complete)) ? synced : audited;
-};
+export const loading = (status: ServiceStatus): Sync =>
+  (status.archive.indexed_through ? null : fast(status)) ?? audit(status);
 
 export type Issue = { name: string; error: string | null; at: number | null };
 

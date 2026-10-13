@@ -11,6 +11,7 @@
   const audited = $derived(status ? audit(status) : null);
   const tip = $derived(status?.archive.selected_tip);
   const overlay = $derived(status?.overlay);
+  const peerTip = $derived(status?.archive.peer_synced_through);
 
   const headline = $derived.by(() => {
     if (failure?.kind === "offline") return "Node not running";
@@ -18,10 +19,8 @@
     if (failure) return "Can't read the node";
     if (!audited) return "Connecting…";
     if (!tip) return "Waiting for chain headers";
-    if (!synced) return audited.complete ? "Up to date" : "Scanning chain";
-    if (!synced.complete && !overlay?.connected) return audited.complete ? "Up to date" : "Scanning chain · no URMA peers";
-    if (!synced.complete) return "Syncing records";
-    return audited.complete ? "Up to date" : "Ready · auditing";
+    if (audited.complete) return "Up to date";
+    return overlay && !overlay.connected ? "Synchronizing · no URMA peers" : "Synchronizing";
   });
 
   const shown = (sync: { fraction: number; complete: boolean } | null) =>
@@ -39,17 +38,20 @@
   {#if status && audited}
     <div class="progress">
       <div class="row">
-        <span><i class="swatch fast"></i>From URMA peers</span>
-        <b>{shown(synced)}</b>
-      </div>
-      <div class="row">
         <span><i class="swatch audit"></i>Audited against chain</span>
         <b>{shown(audited)}</b>
+      </div>
+      <div class="row">
+        <span><i class="swatch fast"></i>Cross-checked with peers</span>
+        <b>{shown(synced)}{#if synced && peerTip}<small> · #{num(peerTip.height)}</small>{/if}</b>
       </div>
       <div class="bar stacked">
         <span class="fast" style:width="{(synced?.fraction ?? 0) * 100}%"></span>
         <span class="audit" style:width="{audited.fraction * 100}%"></span>
       </div>
+      {#if audited.complete && synced && !synced.complete && peerTip}
+        <p class="sub">peer has indexed through #{num(peerTip.height)}</p>
+      {/if}
     </div>
 
     {#if status.archive.peer_omissions}
