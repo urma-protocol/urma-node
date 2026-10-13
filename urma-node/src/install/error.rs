@@ -16,7 +16,10 @@ pub enum Error {
     Account(String),
     Node(NodeError),
     #[cfg(windows)]
-    Windows(windows_service::Error),
+    Windows {
+        call: &'static str,
+        error: windows_service::Error,
+    },
 }
 
 impl Error {
@@ -56,7 +59,12 @@ impl fmt::Display for Error {
             Self::Account(message) => write!(f, "service account: {message}"),
             Self::Node(error) => write!(f, "service defaults: {error}"),
             #[cfg(windows)]
-            Self::Windows(error) => write!(f, "Windows service manager: {error}"),
+            Self::Windows { call, error } => match error {
+                windows_service::Error::Winapi(cause) => {
+                    write!(f, "Windows service manager: {call}: {cause}")
+                }
+                other => write!(f, "Windows service manager: {call}: {other}"),
+            },
         }
     }
 }
@@ -68,7 +76,7 @@ impl std::error::Error for Error {
             Self::Json(error) => Some(error),
             Self::Node(error) => Some(error),
             #[cfg(windows)]
-            Self::Windows(error) => Some(error),
+            Self::Windows { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -89,12 +97,5 @@ impl From<serde_json::Error> for Error {
 impl From<NodeError> for Error {
     fn from(error: NodeError) -> Self {
         Self::Node(error)
-    }
-}
-
-#[cfg(windows)]
-impl From<windows_service::Error> for Error {
-    fn from(error: windows_service::Error) -> Self {
-        Self::Windows(error)
     }
 }
