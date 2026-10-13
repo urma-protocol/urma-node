@@ -17,11 +17,27 @@ export const audit = (status: ServiceStatus): Sync => {
   return { ...audited, complete: audited.complete && status.archive.unresolved_dependencies === 0 };
 };
 
-export const fast = (status: ServiceStatus): Sync | null =>
-  status.overlay ? reach(status.archive, status.archive.peer_synced_through) : null;
+/** Simple view bar over application_start → selected_tip: verified, then records from peers ahead of it. */
+export type Bar = { state: "chain" } | { state: "records"; verified: number; peers: number };
 
-export const loading = (status: ServiceStatus): Sync =>
-  (status.archive.indexed_through ? null : fast(status)) ?? audit(status);
+export const bar = (status: ServiceStatus): Bar => {
+  const { archive } = status;
+  if (!archive.selected_tip) return { state: "chain" };
+  const verified = reach(archive, archive.indexed_through).fraction;
+  const peers = Math.max(0, reach(archive, archive.peer_synced_through).fraction - verified);
+  return { state: "records", verified, peers };
+};
+
+/** Peers delivered inventory within this many seconds. */
+const RECEIVING = 10;
+
+export const receiving = (status: ServiceStatus, now: number) =>
+  (status.overlay?.peers ?? []).some((p) => p.last_progress_at !== null && now - p.last_progress_at <= RECEIVING);
+
+export const loading = (status: ServiceStatus): Phase => {
+  const b = bar(status);
+  return b.state === "chain" ? "connecting" : { fraction: b.verified, complete: b.verified === 1 };
+};
 
 export type Issue = { name: string; error: string | null; at: number | null };
 

@@ -4,9 +4,6 @@ export const num = (n: number) => grouped.format(n).replaceAll(",", " ");
 
 export const short = (hash: string) => `${hash.slice(0, 4)}…${hash.slice(-4)}`;
 
-export const percent = (fraction: number, complete: boolean) =>
-  complete ? "100%" : `${(Math.floor(fraction * 1000) / 10).toFixed(1)}%`;
-
 export const mib = (bytes: number) => `${(bytes / 1048576).toFixed(1)} MiB`;
 
 export const ago = (unix: number) => {
