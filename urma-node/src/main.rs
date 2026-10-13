@@ -408,13 +408,7 @@ fn attach_commit_sources(
 }
 
 fn private_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(path) {
+    match urma_io::create_private_directory(path) {
         Ok(()) => Ok(()),
         Err(error)
             if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -515,24 +509,13 @@ fn urma_io_read_config(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error
 }
 
 fn read_token(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > 128 {
-        return Err("invalid service token file".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err("service token must not be accessible by group or others".into());
+    let bytes = match urma_io::read_shared(path, 128) {
+        Ok(bytes) => bytes,
+        Err(urma_io::Error::PrivatePermissions) => {
+            return Err("service token must not be writable by group or open to others".into());
         }
-    }
-    let mut bytes = Vec::new();
-    file.take(129).read_to_end(&mut bytes)?;
-    if bytes.len() > 128 {
-        return Err("service token size limit".into());
-    }
+        Err(error) => return Err(format!("invalid service token file: {error}").into()),
+    };
     Ok(std::str::from_utf8(&bytes)?.trim().to_string())
 }
 

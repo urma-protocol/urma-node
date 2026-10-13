@@ -36,14 +36,15 @@ impl Archive {
                 "application start exceeds storage range".into(),
             ));
         }
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+        match directory.parent() {
+            Some(parent) => std::fs::create_dir_all(parent)?,
+            None => return Err(Error::Invalid("archive directory has no parent".into())),
         }
-        builder.create(directory)?;
+        match urma_io::create_private_directory(directory) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.into()),
+        }
         if std::fs::symlink_metadata(directory)?
             .file_type()
             .is_symlink()

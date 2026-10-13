@@ -632,21 +632,23 @@ fn config_and_token_size_and_format_are_refused_before_listening() {
 
 #[cfg(unix)]
 #[test]
-fn group_readable_token_is_refused() {
+fn token_open_to_others_or_group_writers_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     fixture.create_token();
-    fs::set_permissions(&fixture.token_path, fs::Permissions::from_mode(0o640)).unwrap();
-    let result = fixture.serve_at("127.0.0.1:0").finish();
-    assert!(!result.status.success());
-    assert!(
-        result
-            .stderr
-            .contains("must not be accessible by group or others"),
-        "{}",
-        result.stderr
-    );
-    assert!(!result.stderr.contains("URMA Node listening at"));
+    for mode in [0o644, 0o660, 0o604] {
+        fs::set_permissions(&fixture.token_path, fs::Permissions::from_mode(mode)).unwrap();
+        let result = fixture.serve_at("127.0.0.1:0").finish();
+        assert!(!result.status.success());
+        assert!(
+            result
+                .stderr
+                .contains("service token must not be writable by group or open to others"),
+            "{mode:o}: {}",
+            result.stderr
+        );
+        assert!(!result.stderr.contains("URMA Node listening at"));
+    }
 }
 
 #[test]
