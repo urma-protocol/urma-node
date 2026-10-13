@@ -1,0 +1,4 @@
+target/
+node_modules/
+/urma-node-app/dist/
+/urma-node-app/src-tauri/gen/

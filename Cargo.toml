@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["urma-node", "urma-node-app/src-tauri"]
+
+[workspace.package]
+version = "0.2.2"
+edition = "2024"
+license = "0BSD"
+authors = ["Cristian Zmole <urma@rosint.org>"]
+homepage = "https://urma.rosint.org"
+repository = "https://github.com/urma-protocol/urma-node"
+
+[workspace.dependencies]
+urma-chain = { git = "https://github.com/urma-protocol/urma.git", rev = "755258425c71e62511f099ddd253d570116aa660" }
+urma-core = { git = "https://github.com/urma-protocol/urma.git", rev = "755258425c71e62511f099ddd253d570116aa660" }
+urma-io = { git = "https://github.com/urma-protocol/urma.git", rev = "755258425c71e62511f099ddd253d570116aa660" }
+urma-names = { git = "https://github.com/urma-protocol/urma.git", rev = "755258425c71e62511f099ddd253d570116aa660" }
+urma-node-client = { git = "https://github.com/urma-protocol/urma.git", rev = "755258425c71e62511f099ddd253d570116aa660" }
+urma-runtime = { git = "https://github.com/urma-protocol/urma.git", rev = "755258425c71e62511f099ddd253d570116aa660" }
+urma-wire = { git = "https://github.com/urma-protocol/urma.git", rev = "755258425c71e62511f099ddd253d570116aa660" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
