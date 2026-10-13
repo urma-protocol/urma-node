@@ -43,7 +43,7 @@
       </div>
       <div class="row">
         <span><i class="swatch fast"></i>Cross-checked with peers</span>
-        <b>{shown(synced)}{#if synced && peerTip}<small> · #{num(peerTip.height)}</small>{/if}</b>
+        <b>{shown(synced)}{#if synced && peerTip}<small>{` · #${num(peerTip.height)}`}</small>{/if}</b>
       </div>
       <div class="bar stacked">
         <span class="fast" style:width="{(synced?.fraction ?? 0) * 100}%"></span>
