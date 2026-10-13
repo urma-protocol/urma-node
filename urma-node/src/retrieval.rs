@@ -9,9 +9,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-use urma_core::multipart::VerifiedRecord;
+use urma_core::multipart::{Geometry, VerifiedRecord};
 use urma_runtime::multipart::{
-    Candidate, FetchError, MultipartSource, RecordRequest, RecoveredObject, RecoveryLimits,
+    Candidate, FetchError, MultipartSource, RecordRequest, RecoveredObject, RecoveryError,
+    RecoveryLimits,
 };
 
 /// A data source, not a chain verifier or completeness authority. Implementations
@@ -125,6 +126,64 @@ pub fn fetch_record(
     }
 }
 
+/// How one object acquisition spends time. `slice` bounds network fetches only:
+/// records already stored re-verify outside it, and a fetch is started only
+/// while network time remains, so every attempt that reaches a missing record
+/// fetches at least one. Each fetch is bounded by its own `fetch` limits.
+#[derive(Clone, Copy)]
+pub(crate) struct Pace {
+    limits: RecoveryLimits,
+    slice: Duration,
+    fetch: FetchLimits,
+}
+
+impl Pace {
+    fn on_demand(limits: RecoveryLimits) -> Self {
+        Self {
+            limits,
+            slice: limits.timeout,
+            fetch: FetchLimits {
+                sources: limits.attempts.max(1) as usize,
+                timeout: limits.timeout,
+            },
+        }
+    }
+
+    /// Background unpruned acquisition: no size budget beyond the protocol
+    /// geometry and no overall deadline; only network time is sliced.
+    pub(crate) fn background(slice: Duration) -> Self {
+        Self {
+            limits: RecoveryLimits {
+                max_payload_bytes: Geometry::MAX_OBJECT_BYTES,
+                max_nodes: Geometry::MAX_NODES,
+                attempts: 1,
+                timeout: RecoveryLimits::TIMEOUT,
+            },
+            slice,
+            fetch: FetchLimits {
+                sources: 1,
+                ..FetchLimits::default()
+            },
+        }
+    }
+}
+
+/// A completed object, or an attempt whose network slice ran out. A sliced
+/// attempt keeps every record it fetched; the next attempt continues from them.
+pub(crate) enum Recovery {
+    Complete(RecoveredObject),
+    Sliced(RecoveryError),
+}
+
+fn completed(recovery: Recovery) -> Result<RecoveredObject, Error> {
+    match recovery {
+        Recovery::Complete(object) => Ok(object),
+        Recovery::Sliced(cause) => {
+            Err(Error::Busy(format!("object acquisition deadline: {cause}")))
+        }
+    }
+}
+
 /// Recover an object without exporting partial output. This reuses the existing
 /// root/leaf/data signed-reference and final length/digest checks. Reorg during
 /// recovery invalidates the result; cached immutable bytes remain reusable.
@@ -136,15 +195,15 @@ pub fn recover(
     limits: RecoveryLimits,
     scratch: &Path,
 ) -> Result<RecoveredObject, Error> {
-    recover_inner(
+    completed(recover_inner(
         engine,
         root,
         sources,
-        limits,
+        Pace::on_demand(limits),
         scratch,
         false,
         &AtomicBool::new(false),
-    )
+    )?)
 }
 
 /// Recover and protect all exact members in the same completion transaction.
@@ -157,51 +216,53 @@ pub fn recover_and_pin(
     limits: RecoveryLimits,
     scratch: &Path,
 ) -> Result<RecoveredObject, Error> {
-    recover_inner(
+    completed(recover_inner(
         engine,
         root,
         sources,
-        limits,
+        Pace::on_demand(limits),
         scratch,
         true,
         &AtomicBool::new(false),
-    )
+    )?)
 }
 
 pub(crate) fn recover_inner(
     engine: &Engine,
     root: Txid,
     sources: &[&dyn RecordSource],
-    limits: RecoveryLimits,
+    pace: Pace,
     scratch: &Path,
     pin: bool,
     cancelled: &AtomicBool,
-) -> Result<RecoveredObject, Error> {
+) -> Result<Recovery, Error> {
     check_cancelled(cancelled)?;
     let generation = engine.status()?.generation;
     let began = Instant::now();
     let deadline = began
-        .checked_add(limits.timeout)
+        .checked_add(pace.limits.timeout)
         .ok_or_else(|| Error::Invalid("object deadline overflow".into()))?;
-    let fetch_limits = FetchLimits {
-        sources: limits.attempts.max(1) as usize,
-        timeout: limits.timeout,
-    };
-    let root = fetch_record(engine, root, sources, fetch_limits)?
+    let root = fetch_record(engine, root, sources, pace.fetch)?
         .ok_or_else(|| Error::Invalid("root is not available from the supplied sources".into()))?;
     check_cancelled(cancelled)?;
-    let mut remaining = limits;
-    remaining.timeout = limits.timeout.saturating_sub(began.elapsed());
+    let mut remaining = pace.limits;
+    remaining.timeout = pace.limits.timeout.saturating_sub(began.elapsed());
     let mut adapter = Adapter {
         engine,
         sources,
-        fetch_limits,
+        pace,
         began,
+        network: Duration::ZERO,
+        sliced: false,
         members: BTreeMap::from([(root.txid(), crate::archive::ObjectMember::from(&root))]),
         cancelled,
     };
-    let object = urma_runtime::multipart::reconstruct(&root, &mut adapter, remaining, scratch)
-        .map_err(|e| Error::Source(Box::new(e)))?;
+    let object = match urma_runtime::multipart::reconstruct(&root, &mut adapter, remaining, scratch)
+    {
+        Ok(object) => object,
+        Err(cause) if adapter.sliced => return Ok(Recovery::Sliced(cause)),
+        Err(error) => return Err(Error::Source(Box::new(error))),
+    };
     check_cancelled(cancelled)?;
     // Completion atomically rechecks the epoch and retained identities. A
     // concurrent prune may refuse completion, never create false availability.
@@ -213,17 +274,67 @@ pub(crate) fn recover_inner(
         deadline,
         cancelled,
     )?;
-    Ok(object)
+    Ok(Recovery::Complete(object))
+}
+
+fn source_error(message: String) -> FetchError {
+    FetchError::Source(urma_runtime::error::Error::Io(std::io::Error::other(
+        message,
+    )))
 }
 
 struct Adapter<'a> {
     engine: &'a Engine,
     sources: &'a [&'a dyn RecordSource],
-    fetch_limits: FetchLimits,
+    pace: Pace,
     began: Instant,
+    network: Duration,
+    sliced: bool,
     members: BTreeMap<Txid, crate::archive::ObjectMember>,
     cancelled: &'a AtomicBool,
 }
+
+impl Adapter<'_> {
+    /// Stored records re-verify without spending the network slice.
+    fn stored(&self, txid: Txid) -> Result<Option<VerifiedRecord>, Error> {
+        self.engine
+            .record(txid)?
+            .map(|record| verify_cached(self.engine, txid, &record.package))
+            .transpose()
+    }
+
+    fn fetch_missing(&mut self, txid: Txid) -> Result<VerifiedRecord, FetchError> {
+        if self.network >= self.pace.slice {
+            self.sliced = true;
+            return Err(source_error("object acquisition slice ended".into()));
+        }
+        let timeout = self.pace.fetch.timeout.min(
+            self.pace
+                .limits
+                .timeout
+                .saturating_sub(self.began.elapsed()),
+        );
+        let started = Instant::now();
+        // Source-level proof failures have already tried the bounded source list.
+        // A fully authenticated wrong reference hash remains terminal in reconstruct.
+        let fetched = fetch_record(
+            self.engine,
+            txid,
+            self.sources,
+            FetchLimits {
+                timeout,
+                ..self.pace.fetch
+            },
+        );
+        self.network += started.elapsed();
+        match fetched {
+            Ok(Some(record)) => Ok(record),
+            Ok(None) => Err(FetchError::Unavailable),
+            Err(error) => Err(source_error(error.to_string())),
+        }
+    }
+}
+
 impl MultipartSource for Adapter<'_> {
     fn fetch(
         &mut self,
@@ -231,37 +342,20 @@ impl MultipartSource for Adapter<'_> {
         _rejected: &[String],
     ) -> Result<Candidate, FetchError> {
         if self.cancelled.load(Ordering::Acquire) {
-            return Err(FetchError::Source(urma_runtime::error::Error::Io(
-                std::io::Error::other("object retention cancelled"),
-            )));
+            return Err(source_error("object retention cancelled".into()));
         }
-        // Source-level proof failures have already tried the bounded source list.
-        // A fully authenticated wrong reference hash remains terminal in reconstruct.
-        match fetch_record(
-            self.engine,
-            request.reference.txid,
-            self.sources,
-            FetchLimits {
-                timeout: self
-                    .fetch_limits
-                    .timeout
-                    .saturating_sub(self.began.elapsed()),
-                ..self.fetch_limits
-            },
-        ) {
-            Ok(Some(record)) => {
-                self.members
-                    .insert(record.txid(), crate::archive::ObjectMember::from(&record));
-                Ok(Candidate {
-                    origin: "node-selected-view".into(),
-                    record,
-                })
-            }
-            Ok(None) => Err(FetchError::Unavailable),
-            Err(error) => Err(FetchError::Source(urma_runtime::error::Error::Io(
-                std::io::Error::other(error.to_string()),
-            ))),
-        }
+        let txid = request.reference.txid;
+        let record = match self.stored(txid) {
+            Ok(Some(record)) => record,
+            Ok(None) => self.fetch_missing(txid)?,
+            Err(error) => return Err(source_error(error.to_string())),
+        };
+        self.members
+            .insert(record.txid(), crate::archive::ObjectMember::from(&record));
+        Ok(Candidate {
+            origin: "node-selected-view".into(),
+            record,
+        })
     }
 }
 

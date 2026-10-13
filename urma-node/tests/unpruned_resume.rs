@@ -105,16 +105,32 @@ impl Object {
     }
 }
 
-// Each fetch takes most of a slice, so no single round can finish the object.
-struct SlowPeer {
+// Serves the children after `delay`; PEER_DELAY takes most of a slice, so no
+// single round can finish the object.
+struct Peer {
     packages: BTreeMap<Txid, RecordPackage>,
+    delay: Duration,
     calls: Mutex<Vec<Txid>>,
 }
 
-impl RecordSource for SlowPeer {
+impl Peer {
+    fn new(object: &Object, delay: Duration) -> Self {
+        Self {
+            packages: object.child_packages(),
+            delay,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<Txid> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl RecordSource for Peer {
     fn fetch(&self, txid: Txid) -> Result<Option<RecordPackage>, Error> {
         self.calls.lock().unwrap().push(txid);
-        thread::sleep(PEER_DELAY);
+        thread::sleep(self.delay);
         Ok(self.packages.get(&txid).cloned())
     }
 }
@@ -133,10 +149,7 @@ fn unpruned_object_completes_across_slices_without_refetching_stored_records() {
                 .is_none()
         );
     }
-    let peer = SlowPeer {
-        packages: object.child_packages(),
-        calls: Mutex::new(Vec::new()),
-    };
+    let peer = Peer::new(&object, PEER_DELAY);
     let cancelled = AtomicBool::new(false);
 
     let mut rounds = 0;
@@ -167,12 +180,42 @@ fn unpruned_object_completes_across_slices_without_refetching_stored_records() {
     }
     // Every record a peer delivered was persisted, even one that arrived after
     // its slice ended, so no record is ever fetched twice.
-    let mut calls = peer.calls.lock().unwrap().clone();
+    let mut calls = peer.calls();
     calls.sort();
     let fetched = calls.len();
     calls.dedup();
     assert_eq!(fetched, calls.len(), "a stored record was fetched again");
     assert_eq!(calls.len(), 3);
+}
+
+#[test]
+fn stored_members_reverify_outside_the_slice_so_the_round_fetches_the_next_missing_one() {
+    let object = Object::load();
+    let directory = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let engine = object.engine(directory.path(), Retention::Unpruned);
+    let packages = object.child_packages();
+    let missing = object.pairs[3].reveal.compute_txid();
+    for pair in &object.pairs[1..3] {
+        engine
+            .admit_record(packages[&pair.reveal.compute_txid()].clone())
+            .unwrap();
+    }
+    let peer = Peer::new(&object, Duration::ZERO);
+    // Re-verifying the stored root, leaf and first part alone takes far longer
+    // than this slice, so a slice that also counted local work would never
+    // reach the missing part.
+    let slice = Duration::from_nanos(1);
+
+    let status = engine
+        .retain_next_object(&[&peer], slice, scratch.path(), &AtomicBool::new(false))
+        .unwrap()
+        .expect("one round completes the object from its stored members");
+
+    assert_eq!(peer.calls(), [missing]);
+    assert_eq!(status.root, object.root());
+    assert_eq!(status.members_total, 4);
+    assert!(status.selected_complete());
 }
 
 #[test]
@@ -195,10 +238,7 @@ fn pruned_scan_keeps_the_root_omits_children_and_acquires_nothing() {
     .unwrap();
     engine.synchronize_headers().unwrap();
     engine.scan_next().unwrap();
-    let peer = SlowPeer {
-        packages: object.child_packages(),
-        calls: Mutex::new(Vec::new()),
-    };
+    let peer = Peer::new(&object, PEER_DELAY);
 
     assert!(
         engine
@@ -206,7 +246,7 @@ fn pruned_scan_keeps_the_root_omits_children_and_acquires_nothing() {
             .unwrap()
             .is_none()
     );
-    assert!(peer.calls.lock().unwrap().is_empty());
+    assert!(peer.calls().is_empty());
     assert!(engine.record(object.root()).unwrap().is_some());
     for child in &object.pairs[1..] {
         assert!(

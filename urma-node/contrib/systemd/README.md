@@ -128,9 +128,9 @@ created implicitly by this template.
 
 Optional resource flags remain the binary's explicit configuration:
 `--cache-bytes` is a soft logical multipart-cache target, not a disk quota;
-`--object-timeout-seconds` is the time slice one background round spends on an
-object before it resumes in a later round; objects have no size limit beyond the
-protocol geometry. Neither imposes a hard deadline on entered I/O or SQL. The config's retention policy and existing CLI validation remain
+`--object-timeout-seconds` is the network time slice one background round spends
+on an object before it resumes in a later round; objects have no size limit
+beyond the protocol geometry. Neither imposes a hard deadline on entered I/O or SQL. The config's retention policy and existing CLI validation remain
 unchanged.
 
 ## Static verification

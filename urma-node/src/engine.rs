@@ -2,6 +2,7 @@ use crate::{
     Error,
     archive::{Archive, InventoryRows},
     model::*,
+    retrieval::{Pace, Recovery, recover_inner},
     source::{ChainSource, CommitSource},
 };
 use std::{
@@ -246,15 +247,16 @@ impl Engine {
         archive.maintain_cache(limit_bytes)
     }
 
-    /// One fair unpruned maintenance step: at most `slice` on the next
-    /// incomplete root. Objects are bounded only by the protocol geometry.
-    /// Every record fetched is admitted as it is verified, so a slice that ends
-    /// before completion is progress, not failure: the next visit re-verifies
-    /// the stored records and continues from what is missing. The cursor always
-    /// advances, so rounds stay fair across objects. Scan coverage is never
-    /// advanced by object recovery. Pruned mode performs no acquisition.
-    /// Cancellation is cooperative between record acquisitions; in-flight
-    /// source I/O may still finish and leave independently verified cache bytes.
+    /// One fair unpruned maintenance step on the next incomplete root. Objects
+    /// are bounded only by the protocol geometry. `slice` bounds network fetch
+    /// time only: stored records re-verify outside it, so every visit fetches at
+    /// least one missing record however large the object. Every record fetched
+    /// is admitted as it is verified, so a slice that ends before completion is
+    /// progress, not failure: the next visit continues from what is missing.
+    /// The cursor always advances, so rounds stay fair across objects. Scan
+    /// coverage is never advanced by object recovery. Pruned mode performs no
+    /// acquisition. Cancellation is cooperative between record acquisitions;
+    /// in-flight source I/O may still finish and leave verified cache bytes.
     pub fn retain_next_object(
         &self,
         sources: &[&dyn crate::retrieval::RecordSource],
@@ -262,12 +264,6 @@ impl Engine {
         scratch: &Path,
         cancelled: &AtomicBool,
     ) -> Result<Option<ObjectStatus>, Error> {
-        let limits = urma_runtime::multipart::RecoveryLimits {
-            max_payload_bytes: urma_core::multipart::Geometry::MAX_OBJECT_BYTES,
-            max_nodes: urma_core::multipart::Geometry::MAX_NODES,
-            attempts: 1,
-            timeout: slice,
-        };
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::Busy("object retention cancelled".into()));
         }
@@ -291,18 +287,10 @@ impl Engine {
             {
                 continue;
             }
-            let began = Instant::now();
-            return match crate::retrieval::recover_inner(
-                self, root, sources, limits, scratch, false, cancelled,
-            ) {
-                Ok(_object) => self.object_status(root),
-                // A slice that ran out is the resumable case; a genuine failure
-                // reached again on a later visit surfaces sooner, because the
-                // stored records before it re-verify without any fetch.
-                Err(_) if began.elapsed() >= slice && !cancelled.load(Ordering::Acquire) => {
-                    Ok(None)
-                }
-                Err(error) => Err(error),
+            let pace = Pace::background(slice);
+            return match recover_inner(self, root, sources, pace, scratch, false, cancelled)? {
+                Recovery::Complete(_object) => self.object_status(root),
+                Recovery::Sliced(_cause) => Ok(None),
             };
         }
         Ok(None)

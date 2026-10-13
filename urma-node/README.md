@@ -89,15 +89,18 @@ local-operator view described below; they do not register or step implicitly.
 Unpruned keeps everything: every multipart object is acquired completely,
 bounded only by the protocol geometry (8,553,279,476 payload bytes, 32,695
 records), with no node-side size or record limit. Background rounds attempt a
-block scan, then spend at most one time slice on the next incomplete object
-(`--object-timeout-seconds`, default 15). Every leaf and data record is verified
-and stored as it arrives, including one that arrives after the slice ended, and
-the payload is streamed through scratch files, never held in memory. An object
-that does not finish within its slice is in progress, not failed: the rotating
-root cursor moves on so rounds stay fair across objects, and the next visit
-re-verifies the stored records without fetching them and continues from what is
-missing, so a large object completes over many rounds. Such a slice is not
-reported as a retention error. Previously verified cached objects can complete
+block scan, then work on the next incomplete object. Its slice
+(`--object-timeout-seconds`, default 15) counts network fetch time only: records
+already stored re-verify outside it, and a fetch starts only while network time
+remains, so every visit fetches at least one missing record however large the
+object or slow the disk. Each fetch is bounded by its own per-record timeout.
+Every leaf and data record is verified and stored as it arrives, including one
+that arrives after the slice ended, and the payload is streamed through scratch
+files, never held in memory. An object that does not finish within its slice is
+in progress, not failed: the rotating root cursor moves on so rounds stay fair
+across objects, and the next visit continues from what is missing, so a large
+object completes over many rounds. Such a slice is not reported as a retention
+error. Previously verified cached objects can complete
 even when the current synchronization or scan attempt fails; synchronization
 and retention errors are reported separately. A genuine failure stays visible
 as the last retention error. In-flight source calls and SQL commits are not

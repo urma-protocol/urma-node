@@ -89,7 +89,7 @@ enum Command {
         /// Soft reclaimable cache target (not a SQLite/WAL or total archive quota).
         #[arg(long, default_value_t = urma_node::cache::DEFAULT_CACHE_BYTES, value_parser = clap::value_parser!(u64).range(..=MAX_ARG))]
         cache_bytes: u64,
-        /// Time slice per background object round; an unfinished object resumes next round.
+        /// Network time slice per background object round; an unfinished object resumes next round.
         #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
         object_timeout_seconds: u64,
     },
