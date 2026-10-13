@@ -28,19 +28,12 @@ export const bar = (status: ServiceStatus): Bar => {
   return { state: "records", verified, peers };
 };
 
-/** Whole percents of a partition, summing to 100 (largest remainder); only a complete part shows 100. */
+/** Floored whole percents of a partition; the rounding leftover goes to the last non-empty part, so the
+ * shares sum to 100 and no earlier part is ever rounded up (an incomplete "verified" never shows 100). */
 export const shares = (parts: number[]): number[] => {
-  const raw = parts.map((p) => p * 100);
-  const out = raw.map(Math.floor);
-  let left = 100 - out.reduce((a, b) => a + b, 0);
-  const order = raw.map((_, i) => i).sort((a, b) => raw[b] - out[b] - (raw[a] - out[a]));
-  for (const i of order) {
-    if (left <= 0) break;
-    if (raw[i] > out[i] && out[i] < 99) {
-      out[i] += 1;
-      left -= 1;
-    }
-  }
+  const out = parts.map((p) => Math.floor(p * 100 + 1e-9));
+  const last = parts.reduce((found, p, i) => (p > 0 ? i : found), -1);
+  if (last >= 0) out[last] += 100 - out.reduce((a, b) => a + b, 0);
   return out;
 };
 

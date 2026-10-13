@@ -92,6 +92,7 @@
       <span class:muted={!status.chain_peers}>
         <span class="dot" class:on={status.chain_peers}></span>Litecoin {status.chain_peers}
       </span>
+      <span class="muted" aria-hidden="true">·</span>
       <span class:muted={!overlay?.connected}>
         <span class="dot" class:on={overlay?.connected}></span>URMA {overlay ? overlay.connected : "off"}
       </span>
