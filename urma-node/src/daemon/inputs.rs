@@ -1,4 +1,4 @@
-use crate::{Error, model::ArchiveConfig};
+use crate::{Error, model::ArchiveConfig, platform::read_admin_file};
 use libp2p::identity::{KeyType, Keypair};
 use std::{fmt::Display, io, path::Path};
 use urma_chain::observation::Chain;
@@ -28,20 +28,10 @@ struct HeaderBootstrapFile {
 }
 
 pub fn read_archive_config(path: &Path) -> Result<ArchiveConfig, Error> {
-    let bytes = match urma_io::read_admin(path, Limits::CONFIG) {
-        Ok(bytes) => bytes,
-        Err(urma_io::Error::TooLarge { .. }) => {
-            return Err(Error::Invalid("config exceeds 64 KiB".into()));
-        }
-        Err(urma_io::Error::PrivatePermissions) => {
-            return Err(Error::Invalid(format!(
-                "{} must be owned by and writable only by administrators",
-                path.display()
-            )));
-        }
-        Err(error) => return Err(io::Error::other(error).into()),
-    };
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(serde_json::from_slice(&read_admin_file(
+        path,
+        Limits::CONFIG,
+    )?)?)
 }
 
 pub fn read_token(path: &Path) -> Result<String, Error> {

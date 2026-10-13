@@ -607,7 +607,7 @@ fn config_and_token_size_and_format_are_refused_before_listening() {
     let result = fixture.spawn(&["status"]).finish();
     assert!(!result.status.success());
     assert!(
-        result.stderr.contains("config exceeds 64 KiB"),
+        result.stderr.contains("config.json exceeds 64 KiB"),
         "{}",
         result.stderr
     );

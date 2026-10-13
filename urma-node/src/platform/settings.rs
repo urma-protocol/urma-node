@@ -50,16 +50,36 @@ impl ServiceSettings {
     }
 
     pub fn read(path: &Path) -> Result<Self, Error> {
-        let bytes = match urma_io::read_admin(path, Self::LIMIT) {
-            Ok(bytes) => bytes,
-            Err(urma_io::Error::PrivatePermissions) => {
-                return Err(Error::Invalid(format!(
-                    "{} must be owned by and writable only by administrators",
-                    path.display()
-                )));
-            }
-            Err(error) => return Err(std::io::Error::other(error).into()),
-        };
-        Ok(serde_json::from_slice(&bytes)?)
+        Ok(serde_json::from_slice(&read_admin_file(
+            path,
+            Self::LIMIT,
+        )?)?)
+    }
+}
+
+/// Settings an administrator controls: the file and the directory holding it
+/// must be owned by and writable only by administrators (or the reader).
+pub(crate) fn read_admin_file(path: &Path, limit: usize) -> Result<Vec<u8>, Error> {
+    let refused = |what: &Path| {
+        Error::Invalid(format!(
+            "{} must be owned by and writable only by administrators",
+            what.display()
+        ))
+    };
+    let parent = urma_io::output_parent(path);
+    match urma_io::check_admin(parent) {
+        Ok(()) => {}
+        Err(urma_io::Error::PrivatePermissions) => return Err(refused(parent)),
+        Err(error) => return Err(std::io::Error::other(error).into()),
+    }
+    match urma_io::read_admin(path, limit) {
+        Ok(bytes) => Ok(bytes.to_vec()),
+        Err(urma_io::Error::PrivatePermissions) => Err(refused(path)),
+        Err(urma_io::Error::TooLarge { limit }) => Err(Error::Invalid(format!(
+            "{} exceeds {} KiB",
+            path.display(),
+            limit / 1024
+        ))),
+        Err(error) => Err(std::io::Error::other(error).into()),
     }
 }

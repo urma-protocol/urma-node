@@ -189,8 +189,8 @@ fn serve_options(data: PathBuf, config: PathBuf, serve: ServeArguments) -> Serve
 fn manage(action: install::Action) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let host = install::Host {
         sudo_user: env::var("SUDO_USER").unwrap_or_default(),
+        sudo_uid: env::var("SUDO_UID").unwrap_or_default(),
         pkexec_uid: env::var("PKEXEC_UID").unwrap_or_default(),
-        path: env::split_paths(&env::var_os("PATH").unwrap_or_default()).collect(),
         binary: env::current_exe()?,
     };
     match install::run(action, &host, &mut io::stdout().lock()) {

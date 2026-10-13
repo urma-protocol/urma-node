@@ -1,13 +1,10 @@
-use super::ServeOptions;
 #[cfg(windows)]
 use super::scm;
 #[cfg(not(windows))]
-use super::serve;
-use crate::{
-    Error, install,
-    platform::{Paths, ServiceSettings},
-    service::ShutdownHandle,
-};
+use super::{ServeOptions, serve};
+#[cfg(not(windows))]
+use crate::platform::ServiceSettings;
+use crate::{Error, install, platform::Paths, service::ShutdownHandle};
 use std::{io::Write, path::PathBuf};
 
 #[derive(Clone, Debug, clap::Subcommand)]
@@ -30,13 +27,13 @@ pub fn run(
     signals: impl FnOnce(ShutdownHandle) -> Result<(), Error>,
     log: &mut impl Write,
 ) -> Result<(), Error> {
-    let options = ServeOptions::from_settings(ServiceSettings::read(settings)?);
     #[cfg(windows)]
     {
-        scm::run(options, signals, log)
+        scm::run(settings, signals, log)
     }
     #[cfg(not(windows))]
     {
+        let options = ServeOptions::from_settings(ServiceSettings::read(settings)?);
         serve(options, signals, log)
     }
 }

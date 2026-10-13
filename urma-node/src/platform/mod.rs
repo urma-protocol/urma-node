@@ -18,6 +18,7 @@ pub use defaults::{create_peer_key, ensure_defaults, write_peer_key};
 pub use exposure::Exposure;
 pub use paths::Paths;
 pub use service_sid::service_sid;
+pub(crate) use settings::read_admin_file;
 pub use settings::{CommitRpc, ServiceSettings};
 #[cfg(windows)]
 pub(crate) use windows::{Descriptor, Sddl};
