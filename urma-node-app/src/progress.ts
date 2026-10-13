@@ -28,6 +28,22 @@ export const bar = (status: ServiceStatus): Bar => {
   return { state: "records", verified, peers };
 };
 
+/** Whole percents of a partition, summing to 100 (largest remainder); only a complete part shows 100. */
+export const shares = (parts: number[]): number[] => {
+  const raw = parts.map((p) => p * 100);
+  const out = raw.map(Math.floor);
+  let left = 100 - out.reduce((a, b) => a + b, 0);
+  const order = raw.map((_, i) => i).sort((a, b) => raw[b] - out[b] - (raw[a] - out[a]));
+  for (const i of order) {
+    if (left <= 0) break;
+    if (raw[i] > out[i] && out[i] < 99) {
+      out[i] += 1;
+      left -= 1;
+    }
+  }
+  return out;
+};
+
 /** Peers delivered inventory within this many seconds. */
 const RECEIVING = 10;
 
