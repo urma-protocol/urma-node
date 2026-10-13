@@ -14,7 +14,7 @@ jobs:
   fmt:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -23,13 +23,15 @@ jobs:
   test-linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
+      - name: Allow unprivileged user namespaces (commit_cli uses unshare)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo test --workspace --locked
 
   check-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - run: cargo check --workspace --all-targets --locked

@@ -14,7 +14,7 @@ jobs:
   deb:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - name: Build deb
         working-directory: urma-node-app
@@ -26,16 +26,21 @@ jobs:
       - name: Build upgrade deb
         working-directory: urma-node-app
         run: |
-          pnpm tauri build --bundles deb --config src-tauri/tauri.bundle.json --config '{"version":"0.5.1"}'
+          rc=0
+          pnpm tauri build --bundles deb --config src-tauri/tauri.bundle.json --config '{"version":"0.5.1"}' || rc=$?
+          echo "tauri build exit $rc"
+          df -h / "$GITHUB_WORKSPACE"
+          ls -la ../target/release/bundle/deb/
+          test "$rc" = 0
           mkdir -p ../dist/second
           cp ../target/release/bundle/deb/*_0.5.1_*.deb ../dist/second/
       - name: Install, upgrade, remove, purge
         run: bash .github/scripts/deb-test.sh dist/first/*.deb dist/second/*.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb
           path: dist/first/*.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-bins
           path: dist/bins/
@@ -44,8 +49,8 @@ jobs:
     needs: deb
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: linux-bins
           path: bins
@@ -65,8 +70,8 @@ jobs:
     needs: deb
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: linux-bins
           path: bins
@@ -82,7 +87,7 @@ jobs:
   nsis:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - name: Build NSIS installer
         working-directory: urma-node-app
@@ -91,7 +96,7 @@ jobs:
       - name: Install, reinstall, uninstall
         shell: pwsh
         run: ./.github/scripts/nsis-test.ps1 (Get-ChildItem target/release/bundle/nsis/*-setup.exe).FullName
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nsis
           path: target/release/bundle/nsis/*-setup.exe
@@ -101,7 +106,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm git rust nodejs pnpm namcap webkit2gtk-4.1 gtk3 hicolor-icon-theme
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: makepkg from a local tarball
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
