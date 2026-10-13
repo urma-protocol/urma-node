@@ -105,7 +105,7 @@ export type ServiceStatus = {
 
 export type Overview = { endpoint: string; chain: string | null; status: ServiceStatus };
 
-export type Failure = { kind: "unconfigured" | "config" | "offline" | "node"; message: string };
+export type Failure = { kind: "missing" | "access" | "config" | "offline" | "node"; message: string };
 
 export const loadStatus = () => invoke<Overview>("node_status");
 

@@ -12,7 +12,8 @@
 
   const headline = $derived.by(() => {
     if (failure?.kind === "offline") return "Node not running";
-    if (failure?.kind === "unconfigured") return "Node not configured";
+    if (failure?.kind === "missing") return "Node not installed";
+    if (failure?.kind === "access") return "No access to the node";
     if (failure) return "Can't read the node";
     return "Connecting…";
   });

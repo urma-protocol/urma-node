@@ -6042,13 +6042,15 @@ dependencies = [
 
 [[package]]
 name = "urma-io"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4182dbf4aba230d412e8f81ac82a021d30bdabf1e3530442051ad6a217a9ff16"
+checksum = "3ede8f4a889977b4e2d5854b5d329770be89eecc961134d8dc99f798c0c254db"
 dependencies = [
  "libc",
  "sha2",
  "tempfile",
+ "tracing",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

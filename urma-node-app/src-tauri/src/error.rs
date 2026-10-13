@@ -5,8 +5,10 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Error {
-    Home,
-    Unconfigured(PathBuf),
+    #[cfg(windows)]
+    ProgramData,
+    NotInstalled(PathBuf),
+    Access(PathBuf),
     Config(PathBuf, String),
     Token(PathBuf, String),
     Offline(SocketAddr, std::io::Error),
@@ -24,7 +26,10 @@ impl Error {
 
     fn kind(&self) -> &'static str {
         match self {
-            Self::Home | Self::Unconfigured(_) => "unconfigured",
+            Self::NotInstalled(_) => "missing",
+            Self::Access(_) => "access",
+            #[cfg(windows)]
+            Self::ProgramData => "config",
             Self::Config(..) | Self::Token(..) => "config",
             Self::Offline(..) => "offline",
             Self::Node(_) | Self::Genesis(_) => "node",
@@ -35,8 +40,17 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Home => f.write_str("HOME is unset; set URMA_CONFIG"),
-            Self::Unconfigured(path) => write!(f, "no archive endpoint in {}", path.display()),
+            #[cfg(windows)]
+            Self::ProgramData => f.write_str("ProgramData is unset"),
+            Self::NotInstalled(path) => write!(f, "URMA Node is not installed: no {}", path.display()),
+            #[cfg(not(windows))]
+            Self::Access(path) => write!(
+                f,
+                "No access to {}: add your user to group urma-node and log in again: sudo usermod -aG urma-node $USER",
+                path.display()
+            ),
+            #[cfg(windows)]
+            Self::Access(path) => write!(f, "No access to {}: run the URMA Node installer again", path.display()),
             Self::Config(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Token(path, error) => write!(f, "token {}: {error}", path.display()),
             Self::Offline(endpoint, error) => write!(f, "no node at {endpoint}: {error}"),

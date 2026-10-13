@@ -6,11 +6,15 @@ It polls `GET /v1/status` from the local node service every 2 s through
 
 ## Connection
 
-The app reads the same config as the CLI: `$URMA_CONFIG`, else
+By default the app talks to the installed service on `127.0.0.1:28331` with its
+token: Linux `/var/lib/urma-node/service.token` (group `urma-node`; join it with
+`sudo usermod -aG urma-node $USER` and log in again), Windows
+`%ProgramData%\URMA Node\service.token`.
+
+A developer node overrides that: `$URMA_CONFIG`, else
 `~/.config/urma/config.json`, key
-`"archive": {"endpoint": "127.0.0.1:28331", "token_file": "/abs/path/token"}`.
-The token file must be private (mode 0600). For a local development node, see
-`urma-node/contrib/dev/local-node.md`.
+`"archive": {"endpoint": "127.0.0.1:28331", "token_file": "/abs/path/token"}`,
+with a private token file (mode 0600). See `urma-node/contrib/dev/local-node.md`.
 
 ## System dependencies
 

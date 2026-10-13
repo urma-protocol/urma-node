@@ -2,6 +2,7 @@ use crate::config;
 use crate::error::Error;
 use bitcoin::BlockHash;
 use serde::{Deserialize, Serialize};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use urma_chain::observation::Chain;
@@ -20,28 +21,44 @@ struct Archive {
 }
 
 impl Settings {
-    fn connect() -> Result<(Client, SocketAddr), Error> {
-        let path = config::path()?;
-        let missing = !path
+    fn archive() -> Result<Option<Archive>, Error> {
+        let path = match config::developer_override() {
+            config::Override::At(path) => path,
+            config::Override::Unset => return Ok(None),
+        };
+        let present = path
             .try_exists()
             .map_err(|error| Error::Config(path.clone(), error.to_string()))?;
-        if missing {
-            return Err(Error::Unconfigured(path));
+        if !present {
+            return Ok(None);
         }
         let bytes = urma_io::read_regular(&path, config::CONFIG_LIMIT)
             .map_err(|error| Error::Config(path.clone(), error.to_string()))?;
         let settings: Self = serde_json::from_slice(&bytes)
             .map_err(|error| Error::Config(path.clone(), error.to_string()))?;
-        let Some(archive) = settings.archive else {
-            return Err(Error::Unconfigured(path));
+        Ok(settings.archive)
+    }
+
+    fn connect() -> Result<(Client, SocketAddr), Error> {
+        let (endpoint, path, token) = match Self::archive()? {
+            Some(archive) => {
+                let token = urma_io::read_private(&archive.token_file, config::TOKEN_LIMIT)
+                    .map_err(|error| Error::Token(archive.token_file.clone(), error.to_string()))?;
+                (archive.endpoint, archive.token_file, token)
+            }
+            None => {
+                let path = config::service_token()?;
+                let token = urma_io::read_shared(&path, config::TOKEN_LIMIT).map_err(|error| match &error {
+                    urma_io::Error::Io(io) if io.kind() == ErrorKind::NotFound => Error::NotInstalled(path.clone()),
+                    urma_io::Error::Io(io) if io.kind() == ErrorKind::PermissionDenied => Error::Access(path.clone()),
+                    _ => Error::Token(path.clone(), error.to_string()),
+                })?;
+                (config::SERVICE_ENDPOINT, path, token)
+            }
         };
-        let token = urma_io::read_private(&archive.token_file, config::TOKEN_LIMIT)
-            .map_err(|error| Error::Token(archive.token_file.clone(), error.to_string()))?;
-        let token = std::str::from_utf8(&token)
-            .map_err(|error| Error::Token(archive.token_file.clone(), error.to_string()))?;
-        let client = Client::new(archive.endpoint, token.trim().to_owned())
-            .map_err(|error| Error::Token(archive.token_file.clone(), error.to_string()))?;
-        Ok((client, archive.endpoint))
+        let token = std::str::from_utf8(&token).map_err(|error| Error::Token(path.clone(), error.to_string()))?;
+        let client = Client::new(endpoint, token.trim().to_owned()).map_err(|error| Error::Token(path, error.to_string()))?;
+        Ok((client, endpoint))
     }
 }
 
