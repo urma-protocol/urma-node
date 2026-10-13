@@ -1,0 +1,2 @@
+#!/bin/sh
+exec chpst -u urma-node:urma-node @BIN@ service run 2>&1

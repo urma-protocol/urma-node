@@ -1,5 +1,17 @@
-//! `urma-node service install|update|uninstall|status`: init-system
-//! integration (URMA_NODE_INSTALL.md §4). Owned by U2.
-mod stub;
+#[cfg(unix)]
+mod account;
+mod cli;
+mod error;
+#[cfg(unix)]
+mod linux;
+mod runner;
+mod system;
+#[cfg(windows)]
+mod windows;
 
-pub use stub::{Action, Error, Host, InitChoice, run};
+pub use cli::{Action, Host, InitChoice};
+pub use error::Error;
+#[cfg(unix)]
+pub use linux::AdapterFile;
+pub use runner::{Commands, Outcome, Runner};
+pub use system::{Init, Registration, Status, System, run};

@@ -1,0 +1,22 @@
+[Unit]
+Description=URMA Node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=urma-node
+Group=urma-node
+ExecStart=/usr/bin/urma-node service run
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/urma-node
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
