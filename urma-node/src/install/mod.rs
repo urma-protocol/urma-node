@@ -4,10 +4,14 @@ mod cli;
 mod error;
 #[cfg(unix)]
 mod linux;
+#[cfg(unix)]
+mod ownership;
 mod runner;
 mod system;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_acl;
 
 pub use cli::{Action, Host, InitChoice};
 pub use error::Error;

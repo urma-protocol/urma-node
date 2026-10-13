@@ -1,3 +1,4 @@
+# ProtectHome=yes hides /home from the node: keep a commit_rpc cookie outside /home.
 [Unit]
 Description=URMA Node
 Wants=network-online.target
@@ -15,6 +16,17 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/urma-node
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 

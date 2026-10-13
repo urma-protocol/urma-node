@@ -1,14 +1,9 @@
 use crate::{
     config::SERVICE_NAME,
     install::{Error, Runner, System, system::text},
-    platform::{Paths, ensure_defaults},
+    platform::Paths,
 };
-use std::{
-    fs::{self, Permissions},
-    io::Write,
-    os::unix::fs::{PermissionsExt, lchown},
-    path::Path,
-};
+use std::{fs, io::Write, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ids {
@@ -22,6 +17,7 @@ impl Account {
     pub const NAME: &'static str = SERVICE_NAME;
     const NOLOGIN: [&'static str; 3] = ["/usr/sbin/nologin", "/sbin/nologin", "/usr/bin/nologin"];
     const NO_SHELL: &'static str = "/bin/false";
+    const ROOT: &'static str = "root";
 }
 
 fn number(field: &str) -> Result<u32, Error> {
@@ -81,15 +77,6 @@ impl<R: Runner> System<R> {
             .collect())
     }
 
-    fn user_by_uid(&self, uid: u32) -> Result<Option<String>, Error> {
-        for fields in self.table("/etc/passwd")? {
-            if number(&fields[2])? == uid {
-                return Ok(Some(fields[0].clone()));
-            }
-        }
-        Ok(None)
-    }
-
     fn nologin(&self) -> &'static str {
         for shell in Account::NOLOGIN {
             if self.at(Path::new(shell)).is_file() {
@@ -107,7 +94,7 @@ impl<R: Runner> System<R> {
         let home = Paths::linux_under(Path::new("/")).state_dir;
         let home = text(&home)?.to_owned();
         let shell = self.nologin();
-        if self.on_path("useradd") {
+        if self.has_program("useradd") {
             let group: &[&str] = match grouped {
                 true => &["--gid", Account::NAME],
                 false => &["--user-group"],
@@ -116,17 +103,17 @@ impl<R: Runner> System<R> {
             args.extend(["--shell", shell]);
             args.extend(group);
             args.push(Account::NAME);
-            self.runner.require("useradd", &args)?;
-        } else if self.on_path("adduser") {
+            self.exec("useradd", &args)?;
+        } else if self.has_program("adduser") {
             if !grouped {
-                self.runner.require("addgroup", &["-S", Account::NAME])?;
+                self.exec("addgroup", &["-S", Account::NAME])?;
             }
             let mut args = vec!["-S", "-D", "-H", "-h", &home, "-s", shell, "-G"];
             args.extend([Account::NAME, Account::NAME]);
-            self.runner.require("adduser", &args)?;
+            self.exec("adduser", &args)?;
         } else {
             return Err(Error::Account(
-                "neither useradd nor adduser is on PATH".into(),
+                "neither useradd nor adduser is installed".into(),
             ));
         }
         self.ids()
@@ -134,38 +121,51 @@ impl<R: Runner> System<R> {
 
     pub fn remove_account(&mut self) -> Result<(), Error> {
         if self.has("/etc/passwd")? {
-            let program = match self.on_path("userdel") {
+            let program = match self.has_program("userdel") {
                 true => "userdel",
                 false => "deluser",
             };
-            self.runner.require(program, &[Account::NAME])?;
+            self.exec(program, &[Account::NAME])?;
         }
         if self.has("/etc/group")? {
-            let program = match self.on_path("groupdel") {
+            let program = match self.has_program("groupdel") {
                 true => "groupdel",
                 false => "delgroup",
             };
-            self.runner.require(program, &[Account::NAME])?;
+            self.exec(program, &[Account::NAME])?;
         }
         Ok(())
     }
 
-    fn invoker(&self) -> Result<Option<String>, Error> {
-        let sudo = self.host.sudo_user.trim();
-        if !sudo.is_empty() && sudo != "root" {
-            return Ok(Some(sudo.to_owned()));
+    fn pkexec_invoker(&self) -> Result<Option<String>, Error> {
+        let uid = number(self.host.pkexec_uid.trim())?;
+        for fields in self.table("/etc/passwd")? {
+            if number(&fields[2])? == uid && fields[0] != Account::ROOT {
+                return Ok(Some(fields[0].clone()));
+            }
         }
-        let uid = self.host.pkexec_uid.trim();
-        if uid.is_empty() {
+        Ok(None)
+    }
+
+    fn sudo_invoker(&self) -> Result<Option<String>, Error> {
+        let user = self.host.sudo_user.trim();
+        let claimed = self.host.sudo_uid.trim();
+        if user.is_empty() || user == Account::ROOT || claimed.is_empty() {
             return Ok(None);
         }
-        let uid = number(uid)?;
-        match self.user_by_uid(uid)? {
-            Some(name) if name != "root" => Ok(Some(name)),
-            Some(..) => Ok(None),
-            None => Err(Error::Account(format!(
-                "PKEXEC_UID {uid} is not in /etc/passwd"
-            ))),
+        let claimed = number(claimed)?;
+        for fields in self.table("/etc/passwd")? {
+            if fields[0] == user && number(&fields[2])? == claimed {
+                return Ok(Some(user.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn invoker(&self) -> Result<Option<String>, Error> {
+        match self.host.pkexec_uid.trim().is_empty() {
+            false => self.pkexec_invoker(),
+            true => self.sudo_invoker(),
         }
     }
 
@@ -181,32 +181,15 @@ impl<R: Runner> System<R> {
         if self.members()?.contains(&user) {
             return Ok(());
         }
-        match self.on_path("usermod") {
-            true => self
-                .runner
-                .require("usermod", &["-a", "-G", Account::NAME, &user])?,
-            false => self.runner.require("adduser", &[&user, Account::NAME])?,
+        match self.has_program("usermod") {
+            true => self.exec("usermod", &["-a", "-G", Account::NAME, &user])?,
+            false => self.exec("adduser", &[&user, Account::NAME])?,
         };
         writeln!(
             out,
             "Added {user} to group {}; log in again to read the node token.",
             Account::NAME
         )?;
-        Ok(())
-    }
-
-    pub fn own(&self, paths: &Paths, ids: Ids) -> Result<(), Error> {
-        ensure_defaults(paths)?;
-        for path in [&paths.state_dir, &paths.data, &paths.token, &paths.peer_key] {
-            lchown(path, Some(ids.uid), Some(ids.gid))?;
-        }
-        Ok(())
-    }
-
-    pub fn log_directory(&self, log: &Path, ids: Ids) -> Result<(), Error> {
-        fs::create_dir_all(log)?;
-        lchown(log, Some(ids.uid), Some(ids.gid))?;
-        fs::set_permissions(log, Permissions::from_mode(0o750))?;
         Ok(())
     }
 }

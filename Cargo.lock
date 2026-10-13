@@ -6090,6 +6090,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "hex",
+ "libc",
  "libp2p",
  "rand 0.8.8",
  "rusqlite",

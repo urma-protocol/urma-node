@@ -21,7 +21,7 @@ use windows_sys::Win32::{
     },
 };
 
-struct Sddl;
+pub(crate) struct Sddl;
 
 impl Sddl {
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -31,15 +31,15 @@ impl Sddl {
         template.replace("{svc}", &service_sid(config::SERVICE_NAME))
     }
 
-    fn settings_directory() -> String {
+    pub(crate) fn settings_directory() -> String {
         Self::of("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;{svc})(A;OICI;FRFX;;;BU)")
     }
 
-    fn data_directory() -> String {
+    pub(crate) fn data_directory() -> String {
         Self::of("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{svc})")
     }
 
-    fn file(exposure: Exposure) -> String {
+    pub(crate) fn file(exposure: Exposure) -> String {
         Self::of(match exposure {
             Exposure::Private => "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{svc})",
             Exposure::Readers => "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;{svc})(A;;FR;;;BU)",
@@ -48,7 +48,7 @@ impl Sddl {
     }
 }
 
-struct Descriptor(PSECURITY_DESCRIPTOR);
+pub(crate) struct Descriptor(PSECURITY_DESCRIPTOR);
 
 impl Drop for Descriptor {
     fn drop(&mut self) {
@@ -58,7 +58,11 @@ impl Drop for Descriptor {
 }
 
 impl Descriptor {
-    fn parse(sddl: &str) -> Result<Self, io::Error> {
+    pub(crate) fn raw(&self) -> PSECURITY_DESCRIPTOR {
+        self.0
+    }
+
+    pub(crate) fn parse(sddl: &str) -> Result<Self, io::Error> {
         let text = wide(OsStr::new(sddl));
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
         // SAFETY: `text` is NUL-terminated; `Descriptor` frees the result.

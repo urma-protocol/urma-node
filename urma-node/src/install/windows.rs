@@ -1,6 +1,9 @@
 use crate::{
     config::SERVICE_NAME,
-    install::{Error, Init, Registration, Runner, Status, System},
+    install::{
+        Error, Init, Registration, Runner, Status, System,
+        windows_acl::{reclaim, trusted_binary},
+    },
     platform::ensure_defaults,
 };
 use std::{
@@ -127,19 +130,24 @@ impl<R: Runner> System<R> {
 
     pub fn install(&mut self, init: Init, out: &mut impl Write) -> Result<(), Error> {
         native(init)?;
+        trusted_binary(&self.host.binary)?;
         let manager = Scm::manager()?;
         let info = Scm::info(&self.host.binary);
         let existing = Scm::open(&manager)?;
+        for service in &existing {
+            Scm::stop(service)?;
+        }
+        let paths = self.paths();
+        reclaim(&paths)?;
         let service = match existing.into_iter().next() {
             Some(service) => {
                 service.change_config(&info)?;
-                Scm::stop(&service)?;
                 service
             }
             None => manager.create_service(&info, Scm::access())?,
         };
         Scm::recover(&service)?;
-        ensure_defaults(&self.paths())?;
+        ensure_defaults(&paths)?;
         Scm::start(&service)?;
         writeln!(out, "{} is installed and running.", Scm::DISPLAY)?;
         Ok(())
@@ -147,6 +155,7 @@ impl<R: Runner> System<R> {
 
     pub fn update(&mut self, init: Init) -> Result<(), Error> {
         native(init)?;
+        trusted_binary(&self.host.binary)?;
         let manager = Scm::manager()?;
         let Some(service) = Scm::open(&manager)?.into_iter().next() else {
             return Err(Error::NotInstalled);

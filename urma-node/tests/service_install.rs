@@ -2,9 +2,9 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
+    fs::{self, OpenOptions, Permissions},
     io::Write,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
 use tempfile::TempDir;
@@ -62,9 +62,17 @@ impl Fake {
 
 impl Runner for Fake {
     fn run(&mut self, program: &str, args: &[&str]) -> Result<Outcome, Error> {
+        assert!(
+            program.starts_with('/'),
+            "{program} is not an absolute path"
+        );
         let call = [&[program], args].concat().join(" ");
         self.calls.push(call.clone());
-        match (program, args.first().copied()) {
+        let name = Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Failed(format!("bad program {program}")))?;
+        match (name, args.first().copied()) {
             ("useradd", ..) | ("adduser", Some("-S")) => self.create_account()?,
             ("addgroup", Some("-S")) => {
                 self.append("etc/group", &format!("urma-node:x:{}:", self.gid))?
@@ -103,18 +111,21 @@ impl Lab {
         for program in programs {
             fs::write(root.join("usr/bin").join(program), "")?;
         }
+        let binary = root.join("usr/bin/urma-node");
+        fs::write(&binary, "")?;
+        fs::set_permissions(&binary, Permissions::from_mode(0o755))?;
         Ok(Self { dir })
     }
 
-    fn system(&self, sudo_user: &str, pkexec_uid: &str) -> Result<System<Fake>, Error> {
+    fn system(&self, sudo: (&str, &str), pkexec_uid: &str) -> Result<System<Fake>, Error> {
         let root = self.dir.path().to_path_buf();
         let meta = fs::metadata(&root)?;
         Ok(System {
             root: root.clone(),
             host: Host {
-                sudo_user: sudo_user.to_owned(),
+                sudo_user: sudo.0.to_owned(),
+                sudo_uid: sudo.1.to_owned(),
                 pkexec_uid: pkexec_uid.to_owned(),
-                path: vec![PathBuf::from("/usr/bin"), PathBuf::from("/usr/sbin")],
                 binary: PathBuf::from("/usr/bin/urma-node"),
             },
             runner: Fake {
@@ -136,7 +147,18 @@ impl Lab {
     }
 }
 
-const SHADOW: [&str; 3] = ["useradd", "usermod", "userdel"];
+const NOBODY: (&str, &str) = ("", "");
+const ALICE: (&str, &str) = ("alice", "1000");
+const SYSTEMD: [&str; 5] = ["useradd", "usermod", "userdel", "groupdel", "systemctl"];
+const OPENRC: [&str; 6] = [
+    "adduser",
+    "addgroup",
+    "deluser",
+    "delgroup",
+    "rc-update",
+    "rc-service",
+];
+const RUNIT: [&str; 3] = ["sv", "useradd", "usermod"];
 
 fn install(system: &mut System<Fake>) -> Result<String, Error> {
     let mut out = Vec::new();
@@ -162,6 +184,8 @@ fn snapshot(name: &str) -> Result<String, Error> {
     Ok(fs::read_to_string(path)?)
 }
 
+const HINT: &str = "To read the node token as your desktop user, run: sudo usermod -a -G urma-node <user>, then log in again.\n";
+
 #[test]
 fn detection_follows_the_contract_order() -> Result<(), Error> {
     let cases: [(&[&str], &[&str], Init); 5] = [
@@ -178,7 +202,7 @@ fn detection_follows_the_contract_order() -> Result<(), Error> {
     for (markers, programs, expected) in cases {
         let lab = Lab::new(markers, programs)?;
         assert_eq!(
-            lab.system("", "")?.detect()?,
+            lab.system(NOBODY, "")?.detect()?,
             expected,
             "{markers:?} {programs:?}"
         );
@@ -190,7 +214,7 @@ fn detection_follows_the_contract_order() -> Result<(), Error> {
 fn an_unknown_init_names_the_manual_route_and_the_paths() -> Result<(), Error> {
     for (markers, programs) in [(&[][..], &[][..]), (&["run/runit"][..], &[][..])] {
         let lab = Lab::new(markers, programs)?;
-        let mut system = lab.system("", "")?;
+        let mut system = lab.system(NOBODY, "")?;
         let error = match install(&mut system) {
             Err(error) => error,
             Ok(out) => panic!("install without an init system succeeded: {out}"),
@@ -219,7 +243,7 @@ fn an_unknown_init_names_the_manual_route_and_the_paths() -> Result<(), Error> {
 #[test]
 fn adapters_render_the_snapshots() -> Result<(), Error> {
     let lab = Lab::new(&[], &[])?;
-    let system = lab.system("", "")?;
+    let system = lab.system(NOBODY, "")?;
     let cases = [
         (
             Init::Systemd,
@@ -259,16 +283,16 @@ fn adapters_render_the_snapshots() -> Result<(), Error> {
 
 #[test]
 fn systemd_install_creates_the_account_and_starts_once() -> Result<(), Error> {
-    let lab = Lab::new(&["run/systemd/system"], &SHADOW)?;
-    let mut system = lab.system("alice", "")?;
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let mut system = lab.system(ALICE, "")?;
     let out = install(&mut system)?;
     assert_eq!(
         system.runner.calls,
         [
-            "useradd --system --home-dir /var/lib/urma-node --no-create-home --shell /usr/sbin/nologin --user-group urma-node",
-            "systemctl daemon-reload",
-            "systemctl enable --now urma-node.service",
-            "usermod -a -G urma-node alice",
+            "/usr/bin/useradd --system --home-dir /var/lib/urma-node --no-create-home --shell /usr/sbin/nologin --user-group urma-node",
+            "/usr/bin/systemctl daemon-reload",
+            "/usr/bin/systemctl enable --now urma-node.service",
+            "/usr/bin/usermod -a -G urma-node alice",
         ]
     );
     assert_eq!(
@@ -292,6 +316,7 @@ fn systemd_install_creates_the_account_and_starts_once() -> Result<(), Error> {
         (token.uid(), token.gid()),
         (system.runner.uid, system.runner.gid)
     );
+    assert!(!lab.path("var/log/urma-node").exists());
     assert_eq!(
         system.registration()?,
         Registration::Registered(Init::Systemd)
@@ -301,8 +326,8 @@ fn systemd_install_creates_the_account_and_starts_once() -> Result<(), Error> {
 
 #[test]
 fn a_second_install_is_an_update() -> Result<(), Error> {
-    let lab = Lab::new(&["run/systemd/system"], &SHADOW)?;
-    let mut system = lab.system("alice", "")?;
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let mut system = lab.system(ALICE, "")?;
     install(&mut system)?;
     let unit = fs::read_to_string(lab.path("etc/systemd/system/urma-node.service"))?;
     system.runner.calls.clear();
@@ -310,8 +335,8 @@ fn a_second_install_is_an_update() -> Result<(), Error> {
     assert_eq!(
         system.runner.calls,
         [
-            "systemctl daemon-reload",
-            "systemctl restart urma-node.service"
+            "/usr/bin/systemctl daemon-reload",
+            "/usr/bin/systemctl restart urma-node.service"
         ]
     );
     assert_eq!(out, "");
@@ -324,17 +349,74 @@ fn a_second_install_is_an_update() -> Result<(), Error> {
     assert_eq!(
         system.runner.calls,
         [
-            "systemctl daemon-reload",
-            "systemctl restart urma-node.service"
+            "/usr/bin/systemctl daemon-reload",
+            "/usr/bin/systemctl restart urma-node.service"
         ]
     );
     Ok(())
 }
 
 #[test]
+fn pre_existing_state_is_never_chowned() -> Result<(), Error> {
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let outside = lab.path("etc/shadow");
+    fs::write(&outside, "root:secret\n")?;
+    fs::set_permissions(&outside, Permissions::from_mode(0o600))?;
+    let before = fs::metadata(&outside)?;
+    fs::create_dir_all(lab.path("etc/urma-node"))?;
+    fs::create_dir_all(lab.path("var/lib/urma-node/data"))?;
+    fs::write(lab.path("etc/urma-node/config.json"), "{}")?;
+    fs::write(lab.path("etc/urma-node/service.json"), "{}")?;
+    fs::write(lab.path("var/lib/urma-node/peer.key"), "key")?;
+    fs::hard_link(&outside, lab.path("var/lib/urma-node/service.token"))?;
+    let mut system = lab.system(NOBODY, "")?;
+    system.runner.gid = 0;
+    install(&mut system)?;
+    let after = fs::metadata(&outside)?;
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    let state = fs::metadata(lab.path("var/lib/urma-node"))?;
+    assert_eq!(state.gid(), before.gid());
+    Ok(())
+}
+
+#[test]
+fn a_symlinked_log_dir_is_refused_and_never_chmodded() -> Result<(), Error> {
+    let lab = Lab::new(&["run/openrc"], &OPENRC)?;
+    let target = lab.path("target");
+    fs::create_dir_all(&target)?;
+    fs::set_permissions(&target, Permissions::from_mode(0o700))?;
+    fs::create_dir_all(lab.path("var/log"))?;
+    symlink(&target, lab.path("var/log/urma-node"))?;
+    let mut system = lab.system(NOBODY, "")?;
+    let result = install(&mut system);
+    assert!(matches!(result, Err(Error::Failed(..))), "{result:?}");
+    assert_eq!(lab.mode("target")?, 0o700);
+    assert!(lab.path("var/log/urma-node").is_symlink());
+    assert!(!lab.path("etc/init.d/urma-node").exists());
+    Ok(())
+}
+
+#[test]
+fn a_binary_outside_usr_bin_or_writable_by_others_is_refused() -> Result<(), Error> {
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let mut system = lab.system(NOBODY, "")?;
+    system.host.binary = PathBuf::from("/home/alice/urma-node");
+    assert!(matches!(install(&mut system), Err(Error::Failed(..))));
+    system.host.binary = PathBuf::from("/usr/bin/urma-node");
+    fs::set_permissions(lab.path("usr/bin/urma-node"), Permissions::from_mode(0o775))?;
+    assert!(matches!(install(&mut system), Err(Error::Failed(..))));
+    assert!(system.runner.calls.is_empty());
+    assert!(!lab.path("etc/urma-node").exists());
+    Ok(())
+}
+
+#[test]
 fn the_windows_adapter_is_refused_before_any_change() -> Result<(), Error> {
-    let lab = Lab::new(&["run/systemd/system"], &SHADOW)?;
-    let mut system = lab.system("alice", "")?;
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let mut system = lab.system(ALICE, "")?;
     let init = InitChoice::Windows;
     let result = system.execute(Action::Install { init }, &mut Vec::new());
     assert!(matches!(result, Err(Error::Failed(..))));
@@ -345,8 +427,8 @@ fn the_windows_adapter_is_refused_before_any_change() -> Result<(), Error> {
 
 #[test]
 fn update_without_a_registration_fails() -> Result<(), Error> {
-    let lab = Lab::new(&["run/systemd/system"], &SHADOW)?;
-    let mut system = lab.system("", "")?;
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let mut system = lab.system(NOBODY, "")?;
     let result = system.execute(Action::Update, &mut Vec::new());
     assert!(matches!(result, Err(Error::NotInstalled)));
     assert!(system.runner.calls.is_empty());
@@ -355,16 +437,19 @@ fn update_without_a_registration_fails() -> Result<(), Error> {
 
 #[test]
 fn status_reports_json() -> Result<(), Error> {
-    let lab = Lab::new(&["run/systemd/system"], &SHADOW)?;
-    let mut system = lab.system("", "")?;
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let mut system = lab.system(NOBODY, "")?;
     assert_eq!(
         status(&mut system)?,
         "{\"init\":\"systemd\",\"registered\":false,\"enabled\":false,\"running\":false}\n"
     );
     install(&mut system)?;
     let answers = [
-        ("systemctl is-enabled urma-node.service", "enabled\n"),
-        ("systemctl is-active urma-node.service", "active\n"),
+        (
+            "/usr/bin/systemctl is-enabled urma-node.service",
+            "enabled\n",
+        ),
+        ("/usr/bin/systemctl is-active urma-node.service", "active\n"),
     ];
     for (call, stdout) in answers {
         system.runner.answers.insert(call.to_owned(), ok(stdout));
@@ -377,61 +462,60 @@ fn status_reports_json() -> Result<(), Error> {
 }
 
 #[test]
-fn without_an_invoker_install_prints_the_usermod_command() -> Result<(), Error> {
-    let lab = Lab::new(&["run/systemd/system"], &SHADOW)?;
-    let mut system = lab.system("root", "")?;
-    let out = install(&mut system)?;
-    assert_eq!(
-        out,
-        "To read the node token as your desktop user, run: sudo usermod -a -G urma-node <user>, then log in again.\n"
-    );
-    assert!(
-        !system
+fn only_a_verified_invoker_joins_the_group() -> Result<(), Error> {
+    let cases = [
+        (("root", "0"), "", false),
+        (("alice", "1001"), "", false),
+        (("alice", ""), "", false),
+        (("mallory", "1000"), "", false),
+        (ALICE, "", true),
+        (("bob", "1002"), "1000", true),
+    ];
+    for (sudo, pkexec_uid, joins) in cases {
+        let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+        let mut system = lab.system(sudo, pkexec_uid)?;
+        let out = install(&mut system)?;
+        let added = system
             .runner
             .calls
             .iter()
-            .any(|call| call.starts_with("usermod"))
-    );
-    Ok(())
-}
-
-#[test]
-fn pkexec_uid_names_the_invoker() -> Result<(), Error> {
-    let lab = Lab::new(&["run/systemd/system"], &SHADOW)?;
-    let mut system = lab.system("", "1000")?;
-    install(&mut system)?;
-    assert!(
-        system
-            .runner
-            .calls
-            .iter()
-            .any(|call| call == "usermod -a -G urma-node alice")
-    );
+            .any(|call| call == "/usr/bin/usermod -a -G urma-node alice");
+        assert_eq!(added, joins, "{sudo:?} {pkexec_uid:?}");
+        if !joins {
+            assert_eq!(out, HINT);
+            assert!(
+                !system
+                    .runner
+                    .calls
+                    .iter()
+                    .any(|call| call.contains("usermod"))
+            );
+        }
+    }
     Ok(())
 }
 
 #[test]
 fn openrc_install_and_purge_with_busybox() -> Result<(), Error> {
-    let lab = Lab::new(
-        &["run/openrc"],
-        &["adduser", "addgroup", "deluser", "delgroup"],
-    )?;
-    let mut system = lab.system("alice", "")?;
+    let lab = Lab::new(&["run/openrc"], &OPENRC)?;
+    let mut system = lab.system(ALICE, "")?;
     install(&mut system)?;
     assert_eq!(
         system.runner.calls,
         [
-            "addgroup -S urma-node",
-            "adduser -S -D -H -h /var/lib/urma-node -s /usr/sbin/nologin -G urma-node urma-node",
-            "rc-update add urma-node default",
-            "rc-service urma-node start",
-            "adduser alice urma-node",
+            "/usr/bin/addgroup -S urma-node",
+            "/usr/bin/adduser -S -D -H -h /var/lib/urma-node -s /usr/sbin/nologin -G urma-node urma-node",
+            "/usr/bin/rc-update add urma-node default",
+            "/usr/bin/rc-service urma-node start",
+            "/usr/bin/adduser alice urma-node",
         ]
     );
     assert_eq!(lab.mode("etc/init.d/urma-node")?, 0o755);
-    assert_eq!(lab.mode("var/lib/urma-node/log")?, 0o750);
+    assert_eq!(lab.mode("var/log/urma-node")?, 0o750);
+    let log = fs::metadata(lab.path("var/log/urma-node"))?;
+    assert_eq!(log.gid(), system.runner.gid);
     fs::create_dir_all(lab.path("etc/runlevels/default"))?;
-    std::os::unix::fs::symlink(
+    symlink(
         "/etc/init.d/urma-node",
         lab.path("etc/runlevels/default/urma-node"),
     )?;
@@ -440,15 +524,16 @@ fn openrc_install_and_purge_with_busybox() -> Result<(), Error> {
     assert_eq!(
         system.runner.calls,
         [
-            "rc-service urma-node stop",
-            "rc-update del urma-node default",
-            "deluser urma-node",
-            "delgroup urma-node",
+            "/usr/bin/rc-service urma-node stop",
+            "/usr/bin/rc-update del urma-node default",
+            "/usr/bin/deluser urma-node",
+            "/usr/bin/delgroup urma-node",
         ]
     );
     assert!(!lab.path("etc/init.d/urma-node").exists());
     assert!(!lab.path("etc/urma-node").exists());
     assert!(!lab.path("var/lib/urma-node").exists());
+    assert!(!lab.path("var/log/urma-node").exists());
     Ok(())
 }
 
@@ -460,9 +545,9 @@ fn runit_links_into_the_first_active_service_dir() -> Result<(), Error> {
             "etc/runit/runsvdir/default",
             "run/runit/service",
         ],
-        &["sv", "useradd", "usermod"],
+        &RUNIT,
     )?;
-    let mut system = lab.system("", "")?;
+    let mut system = lab.system(NOBODY, "")?;
     install(&mut system)?;
     let link = lab.path("etc/runit/runsvdir/default/urma-node");
     assert_eq!(fs::read_link(&link)?, PathBuf::from("/etc/sv/urma-node"));
@@ -472,8 +557,9 @@ fn runit_links_into_the_first_active_service_dir() -> Result<(), Error> {
         1,
         "runsvdir starts a linked service by itself"
     );
+    assert_eq!(lab.mode("var/log/urma-node")?, 0o750);
     system.runner.answers.insert(
-        "sv status /etc/sv/urma-node".to_owned(),
+        "/usr/bin/sv status /etc/sv/urma-node".to_owned(),
         ok("run: /etc/sv/urma-node: (pid 7) 3s\n"),
     );
     assert_eq!(
@@ -482,12 +568,15 @@ fn runit_links_into_the_first_active_service_dir() -> Result<(), Error> {
     );
     system.runner.calls.clear();
     install(&mut system)?;
-    assert_eq!(system.runner.calls, ["sv restart /etc/sv/urma-node"]);
+    assert_eq!(
+        system.runner.calls,
+        ["/usr/bin/sv restart /etc/sv/urma-node"]
+    );
     fs::create_dir_all(lab.path("etc/sv/urma-node/supervise"))?;
     fs::write(lab.path("etc/sv/urma-node/supervise/ok"), "")?;
     system.runner.calls.clear();
     system.execute(Action::Uninstall { purge: false }, &mut Vec::new())?;
-    assert_eq!(system.runner.calls, ["sv down /etc/sv/urma-node"]);
+    assert_eq!(system.runner.calls, ["/usr/bin/sv down /etc/sv/urma-node"]);
     assert!(!link.is_symlink());
     assert!(!lab.path("etc/sv/urma-node").exists());
     assert!(lab.path("var/lib/urma-node").is_dir());

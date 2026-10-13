@@ -49,6 +49,14 @@ pub fn program_data() -> std::path::PathBuf {
     }
 }
 
+#[cfg(windows)]
+pub fn program_files() -> std::path::PathBuf {
+    match std::env::var_os("ProgramFiles") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(r"C:\Program Files"),
+    }
+}
+
 pub const SEEDS: &[(Chain, &str)] = &[
     (Chain::LitecoinMainnet, "/dnsaddr/ltc-seed.urma.rosint.org"),
     (Chain::LitecoinTestnet, "/dnsaddr/tltc-seed.urma.rosint.org"),

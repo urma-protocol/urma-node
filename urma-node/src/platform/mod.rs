@@ -19,3 +19,5 @@ pub use exposure::Exposure;
 pub use paths::Paths;
 pub use service_sid::service_sid;
 pub use settings::{CommitRpc, ServiceSettings};
+#[cfg(windows)]
+pub(crate) use windows::{Descriptor, Sddl};

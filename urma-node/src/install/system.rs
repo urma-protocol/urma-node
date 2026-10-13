@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use crate::install::Outcome;
 use crate::{
     install::{Action, Commands, Error, Host, InitChoice, Runner},
     platform::Paths,
@@ -29,6 +31,12 @@ pub struct Status {
     pub registered: bool,
     pub enabled: bool,
     pub running: bool,
+}
+
+pub struct Search;
+
+impl Search {
+    pub const DIRS: [&'static str; 4] = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
 }
 
 pub struct System<R: Runner> {
@@ -99,11 +107,36 @@ impl<R: Runner> System<R> {
         self.root.join(relative)
     }
 
-    pub fn on_path(&self, program: &str) -> bool {
-        self.host
-            .path
+    pub fn has_program(&self, name: &str) -> bool {
+        Search::DIRS
             .iter()
-            .any(|dir| self.at(dir).join(program).is_file())
+            .any(|dir| self.at(&Path::new(dir).join(name)).is_file())
+    }
+
+    #[cfg(unix)]
+    pub fn program(&self, name: &str) -> Result<String, Error> {
+        for dir in Search::DIRS {
+            let program = Path::new(dir).join(name);
+            if self.at(&program).is_file() {
+                return Ok(format!("{dir}/{name}"));
+            }
+        }
+        Err(Error::Failed(format!(
+            "{name} is not in {}",
+            Search::DIRS.join(":")
+        )))
+    }
+
+    #[cfg(unix)]
+    pub fn exec(&mut self, name: &str, args: &[&str]) -> Result<Outcome, Error> {
+        let program = self.program(name)?;
+        self.runner.require(&program, args)
+    }
+
+    #[cfg(unix)]
+    pub fn query(&mut self, name: &str, args: &[&str]) -> Result<Outcome, Error> {
+        let program = self.program(name)?;
+        self.runner.run(&program, args)
     }
 
     pub fn detect(&self) -> Result<Init, Error> {
@@ -113,12 +146,12 @@ impl<R: Runner> System<R> {
         if self.at(Path::new("/run/systemd/system")).is_dir() {
             return Ok(Init::Systemd);
         }
-        if self.at(Path::new("/run/openrc")).is_dir() || self.on_path("openrc-run") {
+        if self.at(Path::new("/run/openrc")).is_dir() || self.has_program("openrc-run") {
             return Ok(Init::Openrc);
         }
         let runit = self.at(Path::new("/run/runit")).is_dir()
             || self.at(Path::new("/etc/runit/runsvdir")).is_dir();
-        if runit && self.on_path("sv") {
+        if runit && self.has_program("sv") {
             return Ok(Init::Runit);
         }
         Err(Error::NoInit)

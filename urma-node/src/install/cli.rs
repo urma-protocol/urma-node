@@ -30,7 +30,7 @@ pub enum Action {
 #[derive(Clone, Debug, Default)]
 pub struct Host {
     pub sudo_user: String,
+    pub sudo_uid: String,
     pub pkexec_uid: String,
-    pub path: Vec<PathBuf>,
     pub binary: PathBuf,
 }

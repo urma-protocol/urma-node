@@ -4,8 +4,8 @@ supervisor=supervise-daemon
 command="/usr/bin/urma-node"
 command_args="service run"
 command_user="urma-node:urma-node"
-output_log="/var/lib/urma-node/log/urma-node.log"
-error_log="/var/lib/urma-node/log/urma-node.log"
+output_log="/var/log/urma-node/urma-node.log"
+error_log="/var/log/urma-node/urma-node.log"
 respawn_delay=10
 
 depend() {
