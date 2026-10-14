@@ -2,7 +2,8 @@ name: ci
 
 on:
   push:
-    branches: ['integration/**', 'u*/**']
+    branches: [main, 'integration/**', 'u*/**']
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
