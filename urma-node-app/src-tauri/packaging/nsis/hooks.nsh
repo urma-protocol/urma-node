@@ -45,7 +45,7 @@
     nsExec::ExecToLog '"$INSTDIR\urma-node.exe" service uninstall'
     Pop $0
     ${If} $0 <> 0
-      MessageBox MB_ICONSTOP "URMA Node service uninstall failed ($0); nothing was removed." /SD IDOK
+      MessageBox MB_ICONSTOP "URMA Node service uninstall failed ($0); nothing was removed.$\r$\nTo remove it anyway, run 'sc.exe delete urma-node' as Administrator, then run this uninstaller again." /SD IDOK
       SetErrorLevel 3
       Abort
     ${EndIf}

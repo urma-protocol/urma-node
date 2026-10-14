@@ -15,7 +15,7 @@ jobs:
   deb:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup
       - name: Build deb
         working-directory: urma-node-app
@@ -37,11 +37,11 @@ jobs:
           test "$rc" = 0
           mkdir -p ../dist/second
           cp ../target/release/bundle/deb/*_"$next"_*.deb ../dist/second/
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: deb
           path: dist/first/*.deb
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linux-bins
           path: dist/bins/
@@ -53,8 +53,8 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: linux-bins
           path: bins
@@ -75,8 +75,8 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: linux-bins
           path: bins
@@ -92,7 +92,7 @@ jobs:
   nsis:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup
       - name: Build NSIS installer
         working-directory: urma-node-app
@@ -101,7 +101,7 @@ jobs:
       - name: Install, reinstall, uninstall
         shell: pwsh
         run: ./.github/scripts/nsis-test.ps1 (Get-ChildItem target/release/bundle/nsis/*-setup.exe).FullName
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nsis
           path: target/release/bundle/nsis/*-setup.exe
@@ -111,7 +111,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm git rust nodejs pnpm namcap webkit2gtk-4.1 gtk3 hicolor-icon-theme
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: makepkg from a local tarball
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -136,12 +136,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: deb
           path: in/deb
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: nsis
           path: in/nsis

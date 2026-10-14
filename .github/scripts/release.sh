@@ -17,8 +17,8 @@ for script in postinst prerm postrm; do
 done
 cp in/nsis/*_"$ver"_x64-setup.exe "out/urma-node_${ver}_x64-setup.exe"
 
-curl -fsSL -o source.tar.gz "https://github.com/$GITHUB_REPOSITORY/archive/v$ver.tar.gz"
-sum=$(sha256sum source.tar.gz | cut -d' ' -f1)
+git archive --format=tar.gz --prefix="urma-node-$ver/" -o "out/urma-node-$ver.tar.gz" "$tag"
+sum=$(sha256sum "out/urma-node-$ver.tar.gz" | cut -d' ' -f1)
 sed -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=1/" \
     -e "s/^sha256sums=.*/sha256sums=('$sum')/" \
     contrib/aur/PKGBUILD >"out/urma-node-$ver.PKGBUILD"
@@ -33,6 +33,6 @@ URMA Node $ver: the urma-node service, urma-node-control and the desktop app.
 
 - Debian/Ubuntu: \`sudo apt install ./urma-node_${ver}_amd64.deb\`
 - Windows: run \`urma-node_${ver}_x64-setup.exe\` (per-machine, installs the urma-node service)
-- Arch: \`urma-node-$ver.PKGBUILD\` (save as PKGBUILD) and \`urma-node.install\`, then \`makepkg -si\`
+- Arch: \`urma-node-$ver.PKGBUILD\` (save as PKGBUILD) and \`urma-node.install\`, then \`makepkg -si\`; it builds from \`urma-node-$ver.tar.gz\` attached here
 
 Check downloads against SHA256SUMS."

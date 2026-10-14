@@ -1,10 +1,12 @@
 # AUR package
 
-`PKGBUILD` here builds from the GitHub tag tarball. Its `sha256sums` stays `SKIP`
-in the repository because CI builds it from a local `git archive` tarball.
+`PKGBUILD` here builds from the `urma-node-<ver>.tar.gz` source tarball attached
+to the GitHub release. Its `sha256sums` stays `SKIP` in the repository because CI
+builds it from a local `git archive` tarball.
 
-For a `v*` tag, the release job publishes `urma-node-<ver>.PKGBUILD` with
-`pkgver` and the tag tarball's sha256 filled in, next to `urma-node.install`.
+For a `v*` tag, the release job attaches `git archive` of the tag as
+`urma-node-<ver>.tar.gz` and publishes `urma-node-<ver>.PKGBUILD` with `pkgver`
+and that tarball's sha256 filled in, next to `urma-node.install`.
 To update the AUR package:
 
 ```sh
