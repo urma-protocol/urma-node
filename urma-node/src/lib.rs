@@ -24,6 +24,7 @@ mod peer_parent;
 pub mod peer_protocol;
 mod peer_rate;
 pub mod peer_sync;
+mod peer_transport;
 pub mod peerbook;
 pub mod platform;
 pub mod projection;

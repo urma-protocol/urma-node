@@ -195,7 +195,11 @@ impl Discovery {
         let local = Protocol::P2p(self.network.peer_id());
         let outcome = match address.iter().any(|part| part == local) {
             true => Err(Error::LocalPeer),
-            false => self.network.dial(address.clone(), stop, deadline),
+            false => match self.network.dns().admits(address) {
+                // Without a resolver the address is unreachable here, not bad.
+                Err(unresolvable) => return Ok(Err(unresolvable)),
+                Ok(()) => self.network.dial(address.clone(), stop, deadline),
+            },
         };
         if stop.load(Ordering::Acquire) {
             return Ok(outcome);
