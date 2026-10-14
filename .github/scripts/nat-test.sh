@@ -9,6 +9,10 @@
 #   P 11.0.1.10 (seed, relay) ── inet ─┬─ 11.0.2.10 nat-a ── 192.168.1.2 A
 #                                      └─ 11.0.3.10 nat-b ── 192.168.2.2 B
 #
+# The WAN side is 11.0.0.0/8 on purpose: AutoNAT and the public-address
+# filters treat it as public. Reserved ranges such as 198.18.0.0/15 are
+# never advertised, so circuit addresses through them are invalid.
+#
 # cone: MASQUERADE keeps the source port, hole punching opens a direct A-B
 # link and A syncs B's inventory over it. symmetric: --random-fully maps
 # every flow to a new port, the punch fails and nothing syncs over the relay.
@@ -122,10 +126,25 @@ topology() {
     nat nat-b
     at a ping -c 1 -W 2 "$P_IP" >/dev/null
     at b ping -c 1 -W 2 "$P_IP" >/dev/null
-    if at inet ping -c 1 -W 1 192.168.1.2 >/dev/null 2>&1; then
-        echo "A is reachable from outside its NAT" >&2
-        exit 1
-    fi
+}
+
+# With A and B listening, the internet side routes straight at each LAN
+# through its router: new inbound flows (ICMP or TCP to 28332) must die in
+# FORWARD, and the WAN address must not answer on 28332 either.
+sealed() {
+    local lan wan pair
+    for pair in "192.168.1.2 11.0.2.10" "192.168.2.2 11.0.3.10"; do
+        read -r lan wan <<<"$pair"
+        at inet ip route add "${lan%.*}.0/24" via "$wan"
+        if at inet ping -c 1 -W 1 "$lan" >/dev/null 2>&1 ||
+            at inet timeout 3 bash -c "exec 3<>/dev/tcp/$lan/28332" 2>/dev/null ||
+            at inet timeout 3 bash -c "exec 3<>/dev/tcp/$wan/28332" 2>/dev/null; then
+            echo "$lan is reachable from outside its NAT" >&2
+            exit 1
+        fi
+        at inet ip route del "${lan%.*}.0/24"
+    done
+    echo "ok: A and B unreachable from outside their NATs"
 }
 
 # Chain sync is pinned to a closed local port: the fixture's headers are
@@ -190,12 +209,14 @@ reserved() {
     status "$1" | jq -e --arg relay "${id[p]}" 'any(.overlay.relays[]?; . == $relay)' >/dev/null
 }
 
+# NODE ran a punch and recorded its failure.
 punch_failed() {
-    status "$1" | jq -e '.overlay.hole_punch.last_error != null' >/dev/null
+    status "$1" | jq -e '.overlay.hole_punch
+        | .attempts >= 1 and .last_error != null and .last_error_at != null' >/dev/null
 }
 
 punched() {
-    status "$1" | jq -e '.overlay.hole_punch.successes >= 1' >/dev/null
+    status "$1" | jq -e '.overlay.hole_punch | .attempts >= 1 and .successes >= 1' >/dev/null
 }
 
 # A holds every transaction B scanned and B's cursor covers B's tip.
@@ -206,8 +227,6 @@ synced() {
     held=$(status a | jq .archive.stored_transactions)
     [ "$held" = "$want" ] && [ "$(peer a b | jq .synced_through)" = "$tip" ]
 }
-
-nothing_synced() { [ "$(peer a b | jq .synced_through)" = null ]; }
 
 either() { "$1" a || "$1" b; }
 
@@ -222,6 +241,32 @@ cone_events() {
     [ "${#seen[@]}" -eq 4 ]
 }
 
+# B's entry in NODE's book: no failure and no ban (clean), or one of them.
+book_b() {
+    control "$1" overlay-book | jq -e --arg id "${id[b]}" --arg want "$2" \
+        'any(.[]; .peer_id == $id
+            and ((.failures == 0 and .banned_until == null) == ($want == "clean")))' >/dev/null
+}
+
+# Held for 30 s: never a direct A-B link, no cursor on B and no record on A.
+# Status peers are direct sync peers only, and P serves only blocks it
+# scanned itself (none), so anything A held could only have come from B.
+symmetric_hold() {
+    for _ in $(seq 15); do
+        if linked a b direct || linked b a direct; then
+            echo "direct A-B link through symmetric NAT" >&2
+            return 1
+        fi
+        if peer a b | jq -e '.synced_through != null' >/dev/null ||
+            status a | jq -e '.archive.stored_transactions != 0' >/dev/null; then
+            echo "A synced from B without a direct link" >&2
+            return 1
+        fi
+        sleep 2
+    done
+    echo "ok: no direct link, nothing synced over the relay"
+}
+
 topology
 for node in "${NODES[@]}"; do
     mkdir -m 700 "$work/$node"
@@ -231,6 +276,7 @@ serve p --urma-announce "/ip4/$P_IP/tcp/28332" --urma-announce "/ip4/$P_IP/udp/2
 seed=/ip4/$P_IP/tcp/28332/p2p/${id[p]}
 serve a --urma-seed "$seed"
 serve b --urma-seed "$seed"
+sealed
 
 wait_for 120 "A reaches P" reached a p
 wait_for 120 "B reaches P" reached b p
@@ -244,18 +290,13 @@ wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p
 case $mode in
 cone)
     wait_for 240 "direct A-B link, hole punch success, A synced B's inventory" cone_events
+    book_b a clean || { echo "A blames B in its book after the sync" >&2; exit 1; }
+    echo "ok: B's entry in A's book is clean"
     ;;
 symmetric)
     wait_for 180 "hole punch failure recorded" either punch_failed
-    for _ in $(seq 15); do
-        if linked a b direct || linked b a direct; then
-            echo "direct A-B link through symmetric NAT" >&2
-            exit 1
-        fi
-        sleep 2
-    done
-    nothing_synced || { echo "A synced from B without a direct link" >&2; exit 1; }
-    echo "ok: no direct link, nothing synced over the relay"
+    symmetric_hold
+    wait_for 240 "B's entry in A's book shows a failure or backoff" book_b a failed
     ;;
 esac
 echo "nat $mode ok"
