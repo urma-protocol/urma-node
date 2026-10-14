@@ -1,7 +1,8 @@
 //! Writes the three archives of the local NAT simulation (.github/scripts/
 //! nat-test.sh). Not a check: run once with URMA_FIXTURE_DIR set. No network.
-//! P, A and B select one mock Litecoin testnet chain; only B scans it, so
-//! every record A holds came over the overlay and none from P or a scan.
+//! P, A and B select one mock Litecoin testnet chain of four blocks. A scans
+//! all of them, B the first two and P none, so B's records of the last two
+//! blocks can only come from A over the overlay, and A gets coverage from B.
 #![cfg(target_os = "linux")]
 #[allow(dead_code)]
 mod common;
@@ -42,8 +43,8 @@ fn blocks() -> Vec<Block> {
     built
 }
 
-// Headers selected to the tip; B also scans every block.
-fn node(dir: &Path, blocks: &[Block], scan: bool) {
+// Headers selected to the tip, then the first `scanned` blocks scanned.
+fn node(dir: &Path, blocks: &[Block], scanned: usize) {
     fs::create_dir_all(dir).unwrap();
     let config = ArchiveConfig {
         chain: Chain::LitecoinTestnet,
@@ -63,10 +64,8 @@ fn node(dir: &Path, blocks: &[Block], scan: bool) {
     ));
     let engine = Engine::open(&dir.join("data"), config, Some(source)).unwrap();
     engine.synchronize_headers().unwrap();
-    if scan {
-        for _ in blocks {
-            engine.scan_next().unwrap();
-        }
+    for _ in 0..scanned {
+        engine.scan_next().unwrap();
     }
     drop(engine);
     let token = dir.join("service.token");
@@ -82,7 +81,7 @@ fn write_nat_fixture() {
     let root = Path::new(&root);
     assert!(!root.exists(), "fixture directory must be new");
     let blocks = blocks();
-    node(&root.join("p"), &blocks, false);
-    node(&root.join("a"), &blocks, false);
-    node(&root.join("b"), &blocks, true);
+    node(&root.join("p"), &blocks, 0);
+    node(&root.join("a"), &blocks, blocks.len());
+    node(&root.join("b"), &blocks, 2);
 }

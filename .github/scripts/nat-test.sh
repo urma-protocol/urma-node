@@ -4,7 +4,8 @@
 #   sudo nat-test.sh BIN_DIR FIXTURE_DIR cone|symmetric|cone-proxy|cone-restart|cone-kill
 # BIN_DIR holds urma-node and urma-node-control; FIXTURE_DIR is written by
 #   URMA_FIXTURE_DIR=DIR cargo test -p urma-node --test nat_fixture -- --ignored
-# and copied, never changed. Only B holds records. Optional environment
+# and copied, never changed: A scanned all four blocks, B the first two, P
+# none. Optional environment
 # (pass through sudo with `sudo env NAT_LOG=... nat-test.sh ...`):
 #   NAT_LOG   RUST_LOG filter for the three daemons
 #   NAT_KEEP  directory that receives each daemon's log and status timeline
@@ -17,8 +18,9 @@
 # never advertised, so circuit addresses through them are invalid.
 #
 # cone: MASQUERADE keeps the source port, hole punching opens a direct A-B
-# link and A syncs B's inventory over it. symmetric: --random-fully maps
-# every flow to a new port, the punch fails and nothing syncs over the relay.
+# link, B syncs A's records and A B's coverage over it. symmetric:
+# --random-fully maps every flow to a new port, the punch fails and nothing
+# syncs over the relay.
 # cone-proxy: cone, with P behind a TCP proxy like Fly's: every inbound TCP
 # peer reaches P from one private address (172.16.0.1) while UDP keeps its
 # real source, and A and B are seeded TCP first, then QUIC, as the dnsaddr
@@ -51,7 +53,7 @@ P_IP=11.0.1.10
 NODES=(p a b)
 NAMESPACES=(inet p nat-a nat-b a b)
 work=$(mktemp -d)
-declare -A pid=() id=() seen=() again=()
+declare -A pid=() id=() seen=() again=() base=()
 exec 7>&1 8>&2
 
 at() { ip netns exec "urmanat-$1" "${@:2}"; }
@@ -272,13 +274,14 @@ punched() {
     status "$1" | jq -e '.overlay.hole_punch | .attempts >= 1 and .successes >= 1' >/dev/null
 }
 
-# A holds every transaction B scanned and B's cursor covers B's tip.
-synced() {
-    local tip held want
-    tip=$(status b | jq .archive.selected_tip.height)
-    want=$(status b | jq .archive.stored_transactions)
-    held=$(status a | jq .archive.stored_transactions)
-    [ "$held" = "$want" ] && [ "$(peer a b | jq .synced_through)" = "$tip" ]
+stored() { status "$1" | jq .archive.stored_transactions; }
+
+# NODE holds at least what PEER holds and its cursor on PEER covers the
+# blocks PEER scanned: B gets A's last two blocks as data, A gets coverage.
+synced_from() {
+    local tip
+    tip=$(status "$2" | jq .archive.indexed_through.height)
+    [ "$(stored "$1")" -ge "$(stored "$2")" ] && [ "$(peer "$1" "$2" | jq .synced_through)" = "$tip" ]
 }
 
 either() { "$1" a || "$1" b; }
@@ -291,7 +294,8 @@ cone_events() {
     linked b a direct && seen[b-a]=1
     punched a && seen[a-punched]=1
     punched b && seen[b-punched]=1
-    synced && seen[synced]=1
+    synced_from a b && seen[a-from-b]=1
+    synced_from b a && seen[b-from-a]=1
     # Both sides count the punch that made the link direct, not a later one.
     if [ -n "${seen[a-b]:-}" ] && [ -n "${seen[b-a]:-}" ]; then
         linked_at=${linked_at:-$SECONDS}
@@ -302,7 +306,7 @@ cone_events() {
             fi
         done
     fi
-    [ "${#seen[@]}" -eq 5 ]
+    [ "${#seen[@]}" -eq 6 ]
 }
 
 successes() { status "$1" | jq '.overlay.hole_punch.successes'; }
@@ -340,20 +344,24 @@ book_b() {
             and ((.failures == 0 and .banned_until == null) == ($want == "clean")))' >/dev/null
 }
 
-# Held for 30 s: never a direct A-B link, no cursor on B and no record on A.
-# Status peers are direct sync peers only, and P serves only blocks it
-# scanned itself (none), so anything A held could only have come from B.
+# Held for 30 s: never a direct A-B link, no cursor either way, and each
+# node holds what it scanned itself. Status peers are direct sync peers
+# only, and P serves only blocks it scanned (none).
 symmetric_hold() {
+    local node other
     for _ in $(seq 15); do
         if linked a b direct || linked b a direct; then
             echo "direct A-B link through symmetric NAT" >&2
             return 1
         fi
-        if peer a b | jq -e '.synced_through != null' >/dev/null ||
-            status a | jq -e '.archive.stored_transactions != 0' >/dev/null; then
-            echo "A synced from B without a direct link" >&2
-            return 1
-        fi
+        for node in a b; do
+            other=$([ "$node" = a ] && echo b || echo a)
+            if peer "$node" "$other" | jq -e '.synced_through != null' >/dev/null ||
+                [ "$(stored "$node")" != "${base[$node]}" ]; then
+                echo "$node synced from $other without a direct link" >&2
+                return 1
+            fi
+        done
         sleep 2
     done
     echo "ok: no direct link, nothing synced over the relay"
@@ -371,6 +379,8 @@ if [ "$mode" = cone-proxy ]; then
 fi
 serve a "${seeds[@]}"
 serve b "${seeds[@]}"
+base[a]=$(stored a)
+base[b]=$(stored b)
 sample &
 sampler=$!
 sealed
@@ -394,7 +404,7 @@ wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p
 
 case $mode in
 cone | cone-proxy | cone-restart | cone-kill)
-    wait_for 240 "direct A-B link, hole punch success on A and B, A synced B's inventory" cone_events
+    wait_for 240 "direct A-B link, hole punch success on A and B, B synced A's records, A B's coverage" cone_events
     book_b a clean || { echo "A blames B in its book after the sync" >&2; exit 1; }
     echo "ok: B's entry in A's book is clean"
     if [ "$mode" = cone-restart ] || [ "$mode" = cone-kill ]; then
