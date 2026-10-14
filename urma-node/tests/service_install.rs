@@ -282,6 +282,20 @@ fn adapters_render_the_snapshots() -> Result<(), Error> {
 }
 
 #[test]
+fn openrc_hands_the_service_only_its_log_file() -> Result<(), Error> {
+    let lab = Lab::new(&[], &[])?;
+    let files = lab.system(NOBODY, "")?.render(Init::Openrc)?;
+    let script = &files[0].content;
+    let log = "/var/log/urma-node/urma-node.log";
+    assert!(script.contains(&format!("output_log=\"{log}\"")));
+    assert!(script.contains(&format!("error_log=\"{log}\"")));
+    assert!(script.contains(&format!(
+        "start_pre() {{\n\tcheckpath -f -m 0640 -o urma-node:urma-node \"{log}\"\n}}"
+    )));
+    Ok(())
+}
+
+#[test]
 fn systemd_install_creates_the_account_and_starts_once() -> Result<(), Error> {
     let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
     let mut system = lab.system(ALICE, "")?;

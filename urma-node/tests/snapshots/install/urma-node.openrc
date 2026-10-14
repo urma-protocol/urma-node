@@ -12,3 +12,7 @@ depend() {
 	use net
 	after firewall
 }
+
+start_pre() {
+	checkpath -f -m 0640 -o urma-node:urma-node "/var/log/urma-node/urma-node.log"
+}
