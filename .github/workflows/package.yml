@@ -36,8 +36,6 @@ jobs:
           test "$rc" = 0
           mkdir -p ../dist/second
           cp ../target/release/bundle/deb/*_"$next"_*.deb ../dist/second/
-      - name: Install, upgrade, remove, purge
-        run: bash .github/scripts/deb-test.sh dist/first/*.deb dist/second/*.deb
       - uses: actions/upload-artifact@v7
         with:
           name: deb
@@ -46,9 +44,12 @@ jobs:
         with:
           name: linux-bins
           path: dist/bins/
+      - name: Install, upgrade, remove, purge
+        run: bash .github/scripts/deb-test.sh dist/first/*.deb dist/second/*.deb
 
   openrc:
     needs: deb
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -70,6 +71,7 @@ jobs:
 
   runit:
     needs: deb
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

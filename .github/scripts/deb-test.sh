@@ -20,12 +20,15 @@ control() {
 
 wait_control() {
     for _ in $(seq 60); do
-        if control >/tmp/status.json 2>/dev/null; then
+        if control >/tmp/status.json 2>/tmp/status.err; then
             cat /tmp/status.json
             return 0
         fi
         sleep 2
     done
+    cat /tmp/status.err
+    ls -la /var/lib/urma-node
+    id
     sudo journalctl -u urma-node --no-pager | tail -50
     return 1
 }
