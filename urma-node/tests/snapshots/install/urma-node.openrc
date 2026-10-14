@@ -9,5 +9,6 @@ error_log="/var/log/urma-node/urma-node.log"
 respawn_delay=10
 
 depend() {
-	need net
+	use net
+	after firewall
 }
