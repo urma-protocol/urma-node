@@ -12,6 +12,9 @@ fi
 
 mkdir -p out
 cp in/deb/*_"$ver"_amd64.deb "out/urma-node_${ver}_amd64.deb"
+for script in postinst prerm postrm; do
+    dpkg-deb --ctrl-tarfile "out/urma-node_${ver}_amd64.deb" | tar -t | grep -qE "^(\./)?$script\$"
+done
 cp in/nsis/*_"$ver"_x64-setup.exe "out/urma-node_${ver}_x64-setup.exe"
 
 curl -fsSL -o source.tar.gz "https://github.com/$GITHUB_REPOSITORY/archive/v$ver.tar.gz"

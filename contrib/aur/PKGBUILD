@@ -11,6 +11,7 @@ makedepends=('cargo' 'nodejs' 'pnpm')
 options=('!lto')
 install=urma-node.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+# SKIP only here, for CI's local git-archive tarball; each release publishes urma-node-<ver>.PKGBUILD with the tag tarball's sha256.
 sha256sums=('SKIP')
 
 prepare() {

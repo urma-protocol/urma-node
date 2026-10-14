@@ -4,10 +4,14 @@ set -e
 # The binaries are already gone at purge, so this mirrors `service uninstall --purge`.
 if [ "$1" = purge ]; then
     rm -rf /etc/urma-node /var/lib/urma-node /var/log/urma-node
-    if getent passwd urma-node >/dev/null; then
+    entry=$(getent passwd urma-node || true)
+    uid=$(echo "$entry" | cut -d: -f3)
+    home=$(echo "$entry" | cut -d: -f6)
+    if [ -n "$uid" ] && [ "$uid" -lt 1000 ] && [ "$home" = /var/lib/urma-node ]; then
         userdel urma-node || true
     fi
-    if getent group urma-node >/dev/null; then
+    gid=$(getent group urma-node | cut -d: -f3 || true)
+    if [ -n "$gid" ] && [ "$gid" -lt 1000 ]; then
         groupdel urma-node || true
     fi
 fi
