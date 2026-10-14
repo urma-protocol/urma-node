@@ -14,6 +14,15 @@ pub enum AddressKind {
     Circuit(PeerId),
 }
 
+/// What a dial reached. A relayed-only peer is not reached yet: records/5
+/// (and with it the chain probe) never runs over a circuit, so the peer
+/// counts once DCUtR has given it a direct connection and the probe passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialed {
+    Direct(PeerId),
+    Relayed(PeerId),
+}
+
 /// A dialable address split into its bare form (no terminal `/p2p`), the
 /// identity it names and its kind.
 pub struct Shape {

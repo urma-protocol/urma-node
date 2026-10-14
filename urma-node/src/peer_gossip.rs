@@ -6,7 +6,7 @@ use crate::{
     peer::{
         Answer, Behaviour, CALL_TIMEOUT, Command, PeerNetwork, Pending, bind_response, request,
     },
-    peer_address::{AddressKind, is_circuit, parse, relay},
+    peer_address::{AddressKind, Dialed, is_circuit, parse, relay},
     peer_limits::LimitDenied,
     peer_nat::{HolePunch, Nat, PeerLink, Reachability},
     peer_protocol::{
@@ -15,12 +15,12 @@ use crate::{
     source::check_cancelled,
 };
 use bitcoin::BlockHash;
-use rand::seq::SliceRandom;
 use libp2p::{
     Multiaddr, PeerId, Swarm,
     multiaddr::Protocol,
     swarm::{ConnectionId, DialError, dial_opts::DialOpts},
 };
+use rand::seq::SliceRandom;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     net::{Ipv4Addr, Ipv6Addr},
@@ -463,7 +463,9 @@ pub fn validate_announce(address: &Multiaddr, local: PeerId) -> Result<Multiaddr
         return Err(Error::Invalid("announce address names another peer".into()));
     }
     if !is_public(address) || is_circuit(address) {
-        return Err(Error::Invalid("announce address must be public and direct".into()));
+        return Err(Error::Invalid(
+            "announce address must be public and direct".into(),
+        ));
     }
     Ok(address
         .iter()
@@ -476,7 +478,9 @@ pub fn validate_announce(address: &Multiaddr, local: PeerId) -> Result<Multiaddr
 pub fn validate_dial(address: &Multiaddr) -> Result<Option<PeerId>, Error> {
     let shape = parse(address)?;
     if shape.peer.is_none() && matches!(shape.kind, AddressKind::Circuit(_)) {
-        return Err(Error::Invalid("circuit dial must name its target peer".into()));
+        return Err(Error::Invalid(
+            "circuit dial must name its target peer".into(),
+        ));
     }
     Ok(shape.peer)
 }
@@ -692,17 +696,29 @@ impl PeerNetwork {
         self.shared.drain_identified()
     }
 
-    /// Dial an address (with or without `/p2p`), then probe the peer with a
-    /// zero-limit Peers request. Returns the authenticated identity; the
-    /// connection stays for later requests. A Busy probe is an error that keeps
-    /// the connection; any other failed probe closes it: the peer is on another
-    /// chain or does not speak this protocol.
+    /// `dial_any` for a peer that must be reached directly: a peer reached
+    /// only through a relay is a Busy error until DCUtR links it directly.
     pub fn dial(
         &self,
         address: Multiaddr,
         cancelled: &AtomicBool,
         deadline: Instant,
     ) -> Result<PeerId, Error> {
+        match self.dial_any(address, cancelled, deadline)? {
+            Dialed::Direct(peer) => Ok(peer),
+            Dialed::Relayed(peer) => Err(Error::Busy(format!("{peer} reachable only via relay"))),
+        }
+    }
+
+    /// Dial an address (with or without `/p2p`); a direct peer gets the chain
+    /// `probe`. A relayed-only peer is returned unprobed: records/5 never runs
+    /// on relayed links. The connection stays for later requests.
+    pub fn dial_any(
+        &self,
+        address: Multiaddr,
+        cancelled: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Dialed, Error> {
         validate_dial(&address)?;
         check_cancelled(cancelled)?;
         if self.stop.load(Ordering::Acquire) {
@@ -731,6 +747,21 @@ impl PeerNetwork {
                 }
             }
         };
+        if !self.has_direct(peer) {
+            return Ok(Dialed::Relayed(peer));
+        }
+        self.probe(peer, cancelled, deadline).map(Dialed::Direct)
+    }
+
+    /// The chain probe: a zero-limit Peers request over a direct link. Busy
+    /// keeps the connection; any other failure closes it (another chain, or
+    /// not this protocol).
+    pub fn probe(
+        &self,
+        peer: PeerId,
+        cancelled: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<PeerId, Error> {
         match self.peers_of(peer, 0, cancelled, deadline) {
             Ok(_) => Ok(peer),
             Err(busy @ (Error::Busy(_) | Error::PeerBusy)) => Err(busy),
