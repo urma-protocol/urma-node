@@ -172,7 +172,9 @@ impl PeerBook {
             book.entries.push(entry);
         }
         if book.circuit_entries() > Self::CIRCUIT_CAPACITY {
-            return Err(Error::Busy("peer book has too many circuit-only entries".into()));
+            return Err(Error::Busy(
+                "peer book has too many circuit-only entries".into(),
+            ));
         }
         Ok(book)
     }
@@ -230,7 +232,7 @@ impl PeerBook {
         if origin == Origin::Gossip {
             self.admit_gossip(&address)?;
         }
-        if let Some(index) = self.position_of_address(&address) {
+        if let Some(index) = self.position_of_address(&address, peer) {
             if learned != Learned::Operator {
                 return Ok(false);
             }
@@ -321,7 +323,8 @@ impl PeerBook {
     fn insert_learned_peer(&mut self, id: PeerId, addresses: Vec<Multiaddr>) -> usize {
         let mut admitted = Vec::new();
         for address in addresses {
-            if self.position_of_address(&address).is_none() && self.admit_gossip(&address).is_ok() {
+            let known = self.position_of_address(&address, Some(id)).is_some();
+            if !known && self.admit_gossip(&address).is_ok() {
                 admitted.push(address);
             }
         }
@@ -346,10 +349,10 @@ impl PeerBook {
     /// entry that turns out to be this node is dropped: the book never holds
     /// ourselves.
     pub fn succeeded(&mut self, address: &Multiaddr, peer: PeerId, local: PeerId, now: u64) {
-        let Ok((address, _)) = split(address.clone()) else {
+        let Ok((address, named)) = split(address.clone()) else {
             return;
         };
-        let Some(index) = self.position_of_address(&address) else {
+        let Some(index) = self.position_of_address(&address, named) else {
             return;
         };
         if peer == local {
@@ -372,10 +375,10 @@ impl PeerBook {
     /// A dial through `address` failed: back off 60 s × 2^(failures−1), so the
     /// first failure waits 60 s, capped at one day (ten minutes for seeds).
     pub fn failed(&mut self, address: &Multiaddr, now: u64) {
-        let Ok((address, _)) = split(address.clone()) else {
+        let Ok((address, named)) = split(address.clone()) else {
             return;
         };
-        let Some(index) = self.position_of_address(&address) else {
+        let Some(index) = self.position_of_address(&address, named) else {
             return;
         };
         self.fail_entry(index, now);
@@ -535,10 +538,13 @@ impl PeerBook {
         self.entries.len() != before
     }
 
-    fn position_of_address(&self, address: &Multiaddr) -> Option<usize> {
+    /// A circuit is stored without its target, so every peer behind one relay
+    /// shares the bare address: it matches only the entry of `peer`.
+    fn position_of_address(&self, address: &Multiaddr, peer: Option<PeerId>) -> Option<usize> {
+        let circuit = is_circuit(address);
         self.entries
             .iter()
-            .position(|entry| entry.addrs.contains(address))
+            .position(|entry| entry.addrs.contains(address) && (!circuit || entry.peer_id == peer))
     }
 
     fn position_of_peer(&self, peer: PeerId) -> Option<usize> {
@@ -558,10 +564,10 @@ impl PeerBook {
         candidate
             .peer_id
             .is_some_and(|peer| self.position_of_peer(peer).is_some())
-            || candidate
-                .addrs
-                .iter()
-                .any(|address| self.position_of_address(address).is_some())
+            || candidate.addrs.iter().any(|address| {
+                self.position_of_address(address, candidate.peer_id)
+                    .is_some()
+            })
     }
 
     /// Gossip may only name public literal IPs, two direct entries per
@@ -586,7 +592,7 @@ impl PeerBook {
             .filter(|entry| entry.origin == Origin::Gossip)
             .filter(|entry| entry.addrs.iter().any(|known| same_group(known, ip)))
             .count();
-        if neighbours >= Self::GROUP_LIMIT && self.position_of_address(address).is_none() {
+        if neighbours >= Self::GROUP_LIMIT && self.position_of_address(address, None).is_none() {
             return Err(Error::Busy("gossip network group is full".into()));
         }
         Ok(())
