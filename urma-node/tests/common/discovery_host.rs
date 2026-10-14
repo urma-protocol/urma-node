@@ -47,6 +47,13 @@ pub fn bare(address: &Multiaddr) -> Multiaddr {
         .collect()
 }
 
+/// Whether `addrs` is exactly the node's advertised pair, in any order:
+/// identify reports listeners unordered.
+pub fn is_tcp_and_quic(addrs: &[Multiaddr], listening: &Multiaddr) -> bool {
+    let pair = tcp_and_quic(listening);
+    addrs.len() == pair.len() && pair.iter().all(|address| addrs.contains(address))
+}
+
 /// A node's advertised pair: its TCP listener and the QUIC listener on the
 /// same port.
 pub fn tcp_and_quic(listening: &Multiaddr) -> Vec<Multiaddr> {
