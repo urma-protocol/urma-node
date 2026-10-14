@@ -382,19 +382,29 @@ impl Discovery {
         self.relayed.lock().map_err(|_| poisoned())
     }
 
-    /// Remember a circuit dial until DCUtR settles it; the oldest of a full
-    /// list makes room, and a newer contact replaces the peer's older one.
+    /// Remember a circuit dial until DCUtR settles it; a newer contact
+    /// replaces the peer's older one. The oldest of a full list makes room
+    /// and counts as a failed dial; the book lock is taken only after the
+    /// waiting list is released.
     fn await_direct(&self, address: Multiaddr, peer: PeerId) -> Result<(), Error> {
-        let mut relayed = self.relayed()?;
-        relayed.retain(|waiting| waiting.peer != peer);
-        if relayed.len() == Self::RELAYED_MAX {
-            relayed.remove(0);
-        }
-        relayed.push(Relayed {
-            address,
-            peer,
-            since: Instant::now(),
-        });
+        let evicted = {
+            let mut relayed = self.relayed()?;
+            relayed.retain(|waiting| waiting.peer != peer);
+            let evicted = match relayed.len() == Self::RELAYED_MAX {
+                true => Some(relayed.remove(0)),
+                false => None,
+            };
+            relayed.push(Relayed {
+                address,
+                peer,
+                since: Instant::now(),
+            });
+            evicted
+        };
+        let Some(entry) = evicted else {
+            return Ok(());
+        };
+        self.lock()?.failed(&entry.address, now()?);
         Ok(())
     }
 

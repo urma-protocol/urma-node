@@ -13,7 +13,7 @@ use bitcoin::BlockHash;
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::{fs, io::ErrorKind, net::IpAddr, path::Path};
+use std::{cmp::Reverse, fs, io::ErrorKind, net::IpAddr, path::Path};
 use urma_node_client::model::BookEntry as ListedEntry;
 
 pub use crate::peer_address::PeerAddress;
@@ -171,12 +171,26 @@ impl PeerBook {
             }
             book.entries.push(entry);
         }
-        if book.circuit_entries() > Self::CIRCUIT_CAPACITY {
-            return Err(Error::Busy(
-                "peer book has too many circuit-only entries".into(),
-            ));
-        }
+        book.trim_circuits();
         Ok(book)
+    }
+
+    /// Drop the worst circuit-only entries (most failures, then oldest
+    /// success) beyond the circuit share.
+    fn trim_circuits(&mut self) {
+        while self.circuit_entries() > Self::CIRCUIT_CAPACITY {
+            let Some(worst) = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.circuit_only())
+                .max_by_key(|(_, entry)| (entry.failures, Reverse(entry.last_success)))
+                .map(|(index, _)| index)
+            else {
+                return;
+            };
+            self.entries.remove(worst);
+        }
     }
 
     /// Atomically replace a bounded snapshot sorted by identity then address.
@@ -374,6 +388,7 @@ impl PeerBook {
 
     /// A dial through `address` failed: back off 60 s × 2^(failures−1), so the
     /// first failure waits 60 s, capped at one day (ten minutes for seeds).
+    /// The address moves to the back, so the next dial tries another one.
     pub fn failed(&mut self, address: &Multiaddr, now: u64) {
         let Ok((address, named)) = split(address.clone()) else {
             return;
@@ -381,6 +396,9 @@ impl PeerBook {
         let Some(index) = self.position_of_address(&address, named) else {
             return;
         };
+        let addrs = &mut self.entries[index].addrs;
+        addrs.retain(|known| *known != address);
+        addrs.push(address);
         self.fail_entry(index, now);
     }
 

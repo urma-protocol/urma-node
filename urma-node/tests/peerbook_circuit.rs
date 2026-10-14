@@ -3,6 +3,7 @@
 //! their own share of the book and dialed after direct addresses. No sockets.
 use bitcoin::{BlockHash, hashes::Hash};
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
+use serde_json::json;
 use urma_node::{
     peer_protocol::GossipPeer,
     peerbook::{Origin, PeerBook},
@@ -120,6 +121,41 @@ fn a_crowded_circuit_share_keeps_reached_circuit_entries() {
     }
     assert!(book.add(circuit(peer(500)), Origin::Gossip).is_err());
     assert_eq!(circuit_only(&book), PeerBook::CIRCUIT_CAPACITY);
+}
+
+#[test]
+fn a_saved_book_over_the_circuit_share_loads_without_its_worst_circuits() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("peers.json");
+    let entries: Vec<_> = (100..400_u16)
+        .map(|index| {
+            let failed = index < 144;
+            json!({"peer_id": peer(index).to_string(),
+                "addrs": [through(peer(RELAY)).to_string()], "origin": "gossip",
+                "last_success": (!failed).then_some(NOW), "failures": if failed { 3 } else { 0 },
+                "banned_until": null})
+        })
+        .collect();
+    let document =
+        json!({"version": 2, "chain_genesis": genesis().to_string(), "entries": entries});
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let book = PeerBook::load(&path, genesis()).unwrap();
+    assert_eq!(circuit_only(&book), PeerBook::CIRCUIT_CAPACITY);
+    assert!(book.entries().iter().all(|entry| entry.failures == 0));
+}
+
+#[test]
+fn a_failed_address_moves_back_so_the_next_dial_tries_another() {
+    let mut book = PeerBook::empty(genesis());
+    let first = spread(1).with(Protocol::P2p(peer(1)));
+    let second = spread(2).with(Protocol::P2p(peer(1)));
+    book.add(first.clone(), Origin::Manual).unwrap();
+    book.add(second.clone(), Origin::Manual).unwrap();
+    assert_eq!(book.candidates(NOW, &[], &[], 1), vec![first.clone()]);
+    book.failed(&first, NOW);
+    assert_eq!(book.candidates(NOW + 61, &[], &[], 1), vec![second.clone()]);
+    book.failed(&second, NOW + 61);
+    assert_eq!(book.candidates(NOW + 200, &[], &[], 1), vec![first]);
 }
 
 #[test]
