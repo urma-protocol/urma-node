@@ -6,6 +6,7 @@ use crate::{
     peer::{
         Answer, Behaviour, CALL_TIMEOUT, Command, PeerNetwork, Pending, bind_response, request,
     },
+    peer_address::{AddressKind, is_circuit, parse, relay},
     peer_limits::LimitDenied,
     peer_nat::{HolePunch, Nat, PeerLink, Reachability},
     peer_protocol::{
@@ -398,25 +399,26 @@ pub(crate) fn is_loopback(address: &Multiaddr) -> bool {
     }
 }
 
-/// Gossip carries only `/ip4|ip6/<literal>/tcp/<port>[/p2p/<id>]`: names come
-/// from operators (seeds, manual entries), never from peers.
+/// Gossip carries only IP-literal addresses, direct or circuit, each with an
+/// optional `/p2p`: names come from operators (seeds, manual), never peers.
 pub fn validate_gossip_address(address: &Multiaddr) -> Result<Option<PeerId>, Error> {
-    match address.iter().next() {
-        Some(Protocol::Ip4(_) | Protocol::Ip6(_)) => validate_dial(address),
+    let shape = parse(address)?;
+    match shape.bare.iter().next() {
+        Some(Protocol::Ip4(_) | Protocol::Ip6(_)) => Ok(shape.peer),
         _ => Err(Error::Invalid(
-            "gossiped addresses must be IP literals with TCP".into(),
+            "gossiped addresses must be IP literals".into(),
         )),
     }
 }
 
-/// An operator announce address: a public IP literal with TCP, without a /p2p
+/// An operator announce address: a direct public IP literal, without a /p2p
 /// of another node. Returned without /p2p, as identify advertises it.
 pub fn validate_announce(address: &Multiaddr, local: PeerId) -> Result<Multiaddr, Error> {
     if validate_gossip_address(address)?.is_some_and(|named| named != local) {
         return Err(Error::Invalid("announce address names another peer".into()));
     }
-    if !is_public(address) {
-        return Err(Error::Invalid("announce address must be public".into()));
+    if !is_public(address) || is_circuit(address) {
+        return Err(Error::Invalid("announce address must be public and direct".into()));
     }
     Ok(address
         .iter()
@@ -424,34 +426,14 @@ pub fn validate_announce(address: &Multiaddr, local: PeerId) -> Result<Multiaddr
         .collect())
 }
 
-/// Operator-supplied dial targets: `/ip4|ip6|dns|dns4|dns6/<host>/tcp/<port>`
-/// or `/dnsaddr/<name>`, each with optional `/p2p`. Returns the named identity.
+/// Dial targets: any direct address shape, or a circuit that names its
+/// target. Returns the named identity.
 pub fn validate_dial(address: &Multiaddr) -> Result<Option<PeerId>, Error> {
-    let invalid = || Error::Invalid("peer dial requires host, TCP port and optional /p2p".into());
-    let mut parts = address.iter();
-    match parts.next() {
-        Some(Protocol::Dnsaddr(_)) => (),
-        Some(
-            Protocol::Ip4(_)
-            | Protocol::Ip6(_)
-            | Protocol::Dns(_)
-            | Protocol::Dns4(_)
-            | Protocol::Dns6(_),
-        ) => match parts.next() {
-            Some(Protocol::Tcp(port)) if port != 0 => (),
-            _ => return Err(invalid()),
-        },
-        _ => return Err(invalid()),
+    let shape = parse(address)?;
+    if shape.peer.is_none() && matches!(shape.kind, AddressKind::Circuit(_)) {
+        return Err(Error::Invalid("circuit dial must name its target peer".into()));
     }
-    let peer = match parts.next() {
-        None => None,
-        Some(Protocol::P2p(peer)) => Some(peer),
-        Some(_) => return Err(invalid()),
-    };
-    if parts.next().is_some() {
-        return Err(invalid());
-    }
-    Ok(peer)
+    Ok(shape.peer)
 }
 
 /// Bind the reply to its request, then check every gossiped hint's shape.
@@ -493,7 +475,9 @@ fn check_gossip(entry: &GossipPeer) -> Result<(), Error> {
         ));
     }
     for address in &entry.addrs {
-        if validate_gossip_address(address)?.is_some_and(|named| named != peer) {
+        if validate_gossip_address(address)?.is_some_and(|named| named != peer)
+            || relay(address) == Some(peer)
+        {
             return Err(Error::Invalid(
                 "peer gossip address names another peer".into(),
             ));
