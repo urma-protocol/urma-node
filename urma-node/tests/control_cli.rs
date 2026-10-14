@@ -744,10 +744,24 @@ fn invalid_root_and_token_files_are_refused_before_any_http_connection() {
         failure(&invalid.spawn(mock.address, &["status"]).finish());
         mock.assert_no_connection();
     }
-    fs::set_permissions(&fixture.token, fs::Permissions::from_mode(0o644)).unwrap();
-    failure(&fixture.spawn(mock.address, &["status"]).finish());
-    mock.assert_no_connection();
+    for mode in [0o644, 0o660, 0o604] {
+        fs::set_permissions(&fixture.token, fs::Permissions::from_mode(mode)).unwrap();
+        failure(&fixture.spawn(mock.address, &["status"]).finish());
+        mock.assert_no_connection();
+    }
     fixture.assert_only_owned_files();
+}
+
+#[test]
+fn installed_service_token_readable_by_its_group_is_accepted() {
+    let fixture = Fixture::new(TOKEN.as_bytes());
+    fs::set_permissions(&fixture.token, fs::Permissions::from_mode(0o640)).unwrap();
+    let mock = Mock::new();
+    let child = fixture.spawn(mock.address, &["status"]);
+    let body = serde_json::to_vec(&service_status()).unwrap();
+    mock.respond("GET", "/v1/status", &response(200, &body));
+    success(child.finish(), service_status());
+    mock.assert_no_connection();
 }
 
 #[test]

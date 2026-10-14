@@ -74,9 +74,9 @@ fn parse_name(text: &str) -> Result<Name, String> {
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if !std::fs::symlink_metadata(&args.token_file)?.is_file() {
-        return Err(io::Error::other("token file must be a regular private file").into());
+        return Err(io::Error::other("token file must be a regular file").into());
     }
-    let bytes = urma_io::read_private(&args.token_file, 256)?;
+    let bytes = urma_io::read_shared(&args.token_file, 256)?;
     let token = std::str::from_utf8(&bytes)?.trim();
     // The existing constructor checks loopback and exactly 64 hexadecimal bytes
     // before any connection. No endpoint, token or command is inferred from env.
