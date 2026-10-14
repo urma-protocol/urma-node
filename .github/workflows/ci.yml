@@ -31,6 +31,23 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo test --workspace --locked
 
+  nat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build and write the NAT fixture
+        run: URMA_FIXTURE_DIR="$RUNNER_TEMP/nat-fixture" cargo test --locked -p urma-node --test nat_fixture -- --ignored
+      - name: Cone NAT, direct link after hole punching
+        run: sudo .github/scripts/nat-test.sh target/debug "$RUNNER_TEMP/nat-fixture" cone
+      - name: Symmetric NAT, no direct link and no data over the relay
+        if: ${{ !cancelled() }}
+        run: sudo .github/scripts/nat-test.sh target/debug "$RUNNER_TEMP/nat-fixture" symmetric
+
   check-windows:
     runs-on: windows-latest
     steps:
