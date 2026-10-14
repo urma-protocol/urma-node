@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=URMA Node
+Comment=Local URMA Node status
+Exec=urma-node-app
+Icon=urma-node
+Categories=Network;
+Terminal=false

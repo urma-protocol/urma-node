@@ -1,0 +1,127 @@
+name: package
+
+on:
+  push:
+    branches: ['integration/**', 'u*/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Build deb
+        working-directory: urma-node-app
+        run: |
+          pnpm tauri build --bundles deb --config src-tauri/tauri.bundle.json
+          mkdir -p ../dist/first ../dist/bins
+          cp ../target/release/bundle/deb/*.deb ../dist/first/
+          cp ../target/release/urma-node ../target/release/urma-node-control ../dist/bins/
+      - name: Build upgrade deb
+        working-directory: urma-node-app
+        run: |
+          next=$(grep -m1 '^version' ../Cargo.toml | cut -d'"' -f2 | awk -F. '{print $1"."$2"."$3+1}')
+          echo "upgrade version $next"
+          rc=0
+          pnpm tauri build --bundles deb --config src-tauri/tauri.bundle.json --config "{\"version\":\"$next\"}" || rc=$?
+          echo "tauri build exit $rc"
+          df -h / "$GITHUB_WORKSPACE"
+          ls -la ../target/release/bundle/deb/
+          test "$rc" = 0
+          mkdir -p ../dist/second
+          cp ../target/release/bundle/deb/*_"$next"_*.deb ../dist/second/
+      - name: Install, upgrade, remove, purge
+        run: bash .github/scripts/deb-test.sh dist/first/*.deb dist/second/*.deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deb
+          path: dist/first/*.deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-bins
+          path: dist/bins/
+
+  openrc:
+    needs: deb
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-bins
+          path: bins
+      - name: OpenRC (Artix) as PID 1
+        run: |
+          docker run -d --name init --privileged --cgroupns=host \
+            -v "$PWD/bins:/bins:ro" -v "$PWD/.github/scripts:/scripts:ro" \
+            artixlinux/artixlinux:base-openrc /sbin/init
+          for _ in $(seq 60); do
+            docker exec init rc-status --runlevel 2>/dev/null | grep -qx default && break
+            sleep 2
+          done
+          docker exec init rc-status
+          docker exec init sh /scripts/init-test.sh openrc /etc/init.d/urma-node
+
+  runit:
+    needs: deb
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-bins
+          path: bins
+      - name: runit (Void) runsvdir as PID 1
+        run: |
+          docker run -d --name init --privileged \
+            -v "$PWD/bins:/bins:ro" -v "$PWD/.github/scripts:/scripts:ro" \
+            ghcr.io/void-linux/void-glibc-full:latest \
+            sh -c '[ -e /var/service ] || ln -s /etc/runit/runsvdir/default /var/service; exec runsvdir -P /var/service'
+          docker exec init sh -c 'command -v sv && command -v chpst && command -v svlogd'
+          docker exec init sh /scripts/init-test.sh runit /etc/sv/urma-node/run
+
+  nsis:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Build NSIS installer
+        working-directory: urma-node-app
+        shell: bash
+        run: pnpm tauri build --bundles nsis --config src-tauri/tauri.bundle.json
+      - name: Install, reinstall, uninstall
+        shell: pwsh
+        run: ./.github/scripts/nsis-test.ps1 (Get-ChildItem target/release/bundle/nsis/*-setup.exe).FullName
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nsis
+          path: target/release/bundle/nsis/*-setup.exe
+
+  aur:
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm git rust nodejs pnpm namcap webkit2gtk-4.1 gtk3 hicolor-icon-theme
+      - uses: actions/checkout@v7
+      - name: makepkg from a local tarball
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder
+          mkdir /build
+          cp contrib/aur/PKGBUILD contrib/aur/urma-node.install /build/
+          ver=$(. contrib/aur/PKGBUILD && echo "$pkgver")
+          git archive --prefix="urma-node-$ver/" -o "/build/urma-node-$ver.tar.gz" HEAD
+          chown -R builder /build
+          cd /build
+          su builder -c 'makepkg -f --noconfirm'
+          namcap PKGBUILD
+          namcap urma-node-*.pkg.tar.zst
+          pacman -U --noconfirm urma-node-*.pkg.tar.zst
+          urma-node --help >/dev/null
+          pacman -R --noconfirm urma-node
