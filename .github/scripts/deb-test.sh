@@ -18,15 +18,19 @@ control() {
     sg urma-node -c "urma-node-control --endpoint 127.0.0.1:28331 --token-file $token status"
 }
 
-wait_control() {
+wait_listening() {
     for _ in $(seq 60); do
-        if control >/tmp/status.json 2>/tmp/status.err; then
-            cat /tmp/status.json
+        status=$(sudo urma-node service status)
+        if echo "$status" | grep -q '"listening": *true'; then
+            echo "$status"
+            echo "$status" | grep -q '"init": *"systemd"'
+            echo "$status" | grep -q '"running": *true'
+            control
             return 0
         fi
         sleep 2
     done
-    cat /tmp/status.err
+    echo "$status"
     ls -la /var/lib/urma-node
     id
     sudo journalctl -u urma-node --no-pager | tail -50
@@ -38,7 +42,7 @@ systemctl is-active urma-node
 systemctl is-enabled urma-node
 test -f "$unit"
 id -nG "$USER" | tr ' ' '\n' | grep -qx urma-node
-wait_control
+wait_listening
 before=$(systemctl show -p MainPID --value urma-node)
 
 sudo apt-get install -y "$second"
@@ -48,7 +52,7 @@ after=$(systemctl show -p MainPID --value urma-node)
 echo "MainPID $before -> $after"
 test "$after" != 0
 test "$before" != "$after"
-wait_control
+wait_listening
 
 sudo apt-get remove -y urma-node
 absent systemctl is-active urma-node

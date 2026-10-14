@@ -29,11 +29,17 @@ function WaitRunning {
 
 function WaitStatus {
     for ($i = 0; $i -lt 60; $i++) {
-        & (Join-Path $dir 'urma-node-control.exe') --endpoint 127.0.0.1:28331 --token-file $token status
-        if ($LASTEXITCODE -eq 0) { return }
+        $status = & (Join-Path $dir 'urma-node.exe') service status | Out-String
+        if (($status | ConvertFrom-Json).listening) { break }
         Start-Sleep 2
     }
-    throw 'control status failed'
+    Write-Output $status
+    $s = $status | ConvertFrom-Json
+    if (-not ($s.listening -and $s.running -and $s.registered -and $s.init -eq 'windows')) {
+        throw 'service status not listening'
+    }
+    & (Join-Path $dir 'urma-node-control.exe') --endpoint 127.0.0.1:28331 --token-file $token status
+    if ($LASTEXITCODE -ne 0) { throw 'control status failed' }
 }
 
 Run $Setup '/S'
