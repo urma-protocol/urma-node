@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NAT traversal simulation in network namespaces. Root on Linux, needs
 # iproute2, iptables and jq:
-#   sudo nat-test.sh BIN_DIR FIXTURE_DIR cone|symmetric
+#   sudo nat-test.sh BIN_DIR FIXTURE_DIR cone|symmetric|cone-proxy
 # BIN_DIR holds urma-node and urma-node-control; FIXTURE_DIR is written by
 #   URMA_FIXTURE_DIR=DIR cargo test -p urma-node --test nat_fixture -- --ignored
 # and copied, never changed. Only B holds records. Optional environment
@@ -19,16 +19,21 @@
 # cone: MASQUERADE keeps the source port, hole punching opens a direct A-B
 # link and A syncs B's inventory over it. symmetric: --random-fully maps
 # every flow to a new port, the punch fails and nothing syncs over the relay.
+# cone-proxy: cone, with P behind a TCP proxy like Fly's: every inbound TCP
+# peer reaches P from one private address (172.16.0.1) while UDP keeps its
+# real source, and A and B are seeded TCP first, then QUIC, as the dnsaddr
+# TXT lists them. Expected to pass like cone.
 set -euo pipefail
 
-[ $# -eq 3 ] || { echo "usage: $0 BIN_DIR FIXTURE_DIR cone|symmetric" >&2; exit 2; }
+usage="usage: $0 BIN_DIR FIXTURE_DIR cone|symmetric|cone-proxy"
+[ $# -eq 3 ] || { echo "$usage" >&2; exit 2; }
 bin=$(cd "$1" && pwd)
 fixture=$(cd "$2" && pwd)
 mode=$3
 case $mode in
-cone) masquerade=(-j MASQUERADE) ;;
+cone | cone-proxy) masquerade=(-j MASQUERADE) ;;
 symmetric) masquerade=(-j MASQUERADE --random-fully) ;;
-*) echo "mode must be cone or symmetric" >&2; exit 2 ;;
+*) echo "$usage" >&2; exit 2 ;;
 esac
 
 # The namespace names are fixed and a run clears leftovers: one run at a time.
@@ -145,6 +150,9 @@ topology() {
     at b ip route add default via 192.168.2.1
     nat nat-a
     nat nat-b
+    if [ "$mode" = cone-proxy ]; then
+        at p iptables -t nat -A INPUT -i eth0 -p tcp --dport 28332 -j SNAT --to-source 172.16.0.1
+    fi
     at a ping -c 1 -W 2 "$P_IP" >/dev/null
     at b ping -c 1 -W 2 "$P_IP" >/dev/null
 }
@@ -310,9 +318,12 @@ for node in "${NODES[@]}"; do
     cp -R --preserve=mode "$fixture/$node/." "$work/$node/"
 done
 serve p --urma-announce "/ip4/$P_IP/tcp/28332" --urma-announce "/ip4/$P_IP/udp/28332/quic-v1"
-seed=/ip4/$P_IP/tcp/28332/p2p/${id[p]}
-serve a --urma-seed "$seed"
-serve b --urma-seed "$seed"
+seeds=(--urma-seed "/ip4/$P_IP/tcp/28332/p2p/${id[p]}")
+if [ "$mode" = cone-proxy ]; then
+    seeds+=(--urma-seed "/ip4/$P_IP/udp/28332/quic-v1/p2p/${id[p]}")
+fi
+serve a "${seeds[@]}"
+serve b "${seeds[@]}"
 sample &
 sampler=$!
 sealed
@@ -335,7 +346,7 @@ wait_for 180 "A learns B's circuit address through P" circuit a b p
 wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p direct'
 
 case $mode in
-cone)
+cone | cone-proxy)
     wait_for 240 "direct A-B link, hole punch success, A synced B's inventory" cone_events
     book_b a clean || { echo "A blames B in its book after the sync" >&2; exit 1; }
     echo "ok: B's entry in A's book is clean"
