@@ -53,6 +53,9 @@ diagnose() {
         control "$node" overlay-book || true
         echo "--- $node log"
         tail -n 150 "$work/$node.log" || true
+        echo "--- $node timeline (changes only)"
+        awk '{k = $0; sub(/^\{"t":[0-9]+,/, "{", k); if (k != last) print; last = k}' \
+            "$work/$node.timeline" 2>/dev/null || true
     done
     for router in nat-a nat-b; do
         echo "--- $router nat"
@@ -63,6 +66,7 @@ diagnose() {
 
 cleanup() {
     rc=$?
+    [ -n "${sampler:-}" ] && kill "$sampler" 2>/dev/null || true
     [ "$rc" -eq 0 ] || diagnose
     for node in "${NODES[@]}"; do
         [ -n "${pid[$node]:-}" ] && kill -TERM "${pid[$node]}" 2>/dev/null || true
@@ -162,6 +166,23 @@ serve() {
 }
 
 up() { status "$1" | jq -e .overlay.peer_id >/dev/null; }
+
+# Overlay state of every node every 2 s, for the diagnostics.
+sample() {
+    local node
+    trap - EXIT INT TERM
+    while :; do
+        for node in "${NODES[@]}"; do
+            status "$node" 2>/dev/null | jq -c --argjson t "$SECONDS" '{t: $t} + (.overlay | {
+                reachability, relays: [.relays[]? | .[-6:]], connected,
+                peers: [.peers[] | {id: .label[-6:], link, synced_through}],
+                hole_punch: (.hole_punch | {attempts, successes, last_error}),
+                book: .discovery.book, gossip: .discovery.gossip})' \
+                >>"$work/$node.timeline" || true
+        done
+        sleep 2
+    done
+}
 
 # wait_for SECONDS WHAT COMMAND...
 wait_for() {
@@ -276,6 +297,8 @@ serve p --urma-announce "/ip4/$P_IP/tcp/28332" --urma-announce "/ip4/$P_IP/udp/2
 seed=/ip4/$P_IP/tcp/28332/p2p/${id[p]}
 serve a --urma-seed "$seed"
 serve b --urma-seed "$seed"
+sample &
+sampler=$!
 sealed
 
 wait_for 120 "A reaches P" reached a p
@@ -284,6 +307,14 @@ wait_for 60 "P lists A and B" eval 'listed p a && listed p b'
 wait_for 120 "P public, A and B private" \
     eval 'reachability p public && reachability a private && reachability b private'
 wait_for 120 "A and B reserve on P" eval 'reserved a && reserved b'
+# Reservations are what make A and B reachable: they must outlive idle.
+for _ in $(seq 15); do
+    sleep 2
+    for node in a b; do
+        reserved "$node" || { echo "$node dropped its reservation on P" >&2; exit 1; }
+    done
+done
+echo "ok: A and B hold their reservations for 30 s"
 wait_for 180 "A learns B's circuit address through P" circuit a b p
 wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p direct'
 
