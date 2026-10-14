@@ -57,7 +57,7 @@ impl Classes {
         guard(&self.0).get(&id).copied()
     }
 
-    fn set(&self, id: ConnectionId, class: Class) {
+    pub(crate) fn set(&self, id: ConnectionId, class: Class) {
         guard(&self.0).insert(id, class);
     }
 

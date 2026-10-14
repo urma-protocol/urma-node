@@ -10,17 +10,21 @@
 //! peer never proves it speaks this protocol on our chain is released the same
 //! way. A demoted link we dialed whose peer did prove it takes a data slot
 //! back once one is free; inbound slots go to newcomers. Misbehaviour still
-//! disconnects outright.
+//! disconnects outright. Shutdown closes everything (`close_all`).
 use crate::{
     peer_gossip::Shared, peer_limits::Class, peer_reach::Remotes, peer_transport::Behaviour,
 };
-use libp2p::{PeerId, Swarm};
+use libp2p::{PeerId, Swarm, futures::StreamExt};
 use std::time::Duration;
 
 /// How long a data connection may stay open without the peer proving its
 /// chain, and how long a demoted connection waits before taking a slot back.
 const UNPROVEN: Duration = Duration::from_secs(60);
 const DEMOTED: Duration = Duration::from_secs(60);
+/// How long shutdown waits for its connections to close, then for the QUIC
+/// endpoint to send the close frames.
+const DRAIN: Duration = Duration::from_millis(500);
+const FLUSH: Duration = Duration::from_millis(100);
 
 pub(crate) fn release(
     (swarm, remotes): (&mut Swarm<Behaviour>, &mut Remotes),
@@ -51,4 +55,27 @@ pub(crate) fn maintain((swarm, remotes): (&mut Swarm<Behaviour>, &mut Remotes), 
             shared.reclassed(peer, outbound, (Class::Demoted, Class::Data));
         }
     }
+}
+
+/// Shutdown closes every connection and waits, bounded, for the closes to
+/// go out, so peers learn now instead of at their idle timeout: a QUIC socket
+/// that just disappears tells the other end nothing, and a peer that still
+/// holds our dead link refuses our next one (a reservation, a punch).
+pub(crate) async fn close_all(swarm: &mut Swarm<Behaviour>) {
+    let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+    for peer in peers {
+        if swarm.disconnect_peer_id(peer).is_err() {
+            tracing::debug!(%peer, "peer left before shutdown closed it");
+        }
+    }
+    let closed = tokio::time::timeout(DRAIN, async {
+        while swarm.network_info().num_peers() > 0 {
+            swarm.select_next_some().await;
+        }
+    })
+    .await;
+    if closed.is_err() {
+        tracing::debug!("shutdown left connections closing");
+    }
+    tokio::time::sleep(FLUSH).await;
 }

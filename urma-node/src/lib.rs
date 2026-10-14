@@ -27,6 +27,7 @@ pub mod peer_live;
 pub mod peer_nat;
 mod peer_parent;
 pub mod peer_protocol;
+mod peer_punch;
 mod peer_rate;
 mod peer_reach;
 mod peer_release;

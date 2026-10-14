@@ -204,6 +204,12 @@ impl SyncPeers {
         })
     }
 
+    /// Hole punches attempted and succeeded since start.
+    pub fn hole_punches(&self) -> (u64, u64) {
+        let punch = self.link.shared.nat.hole_punch();
+        (punch.attempts, punch.successes)
+    }
+
     /// Reachability, this node's relays and hole punch counters.
     pub(crate) fn nat_status(&self, status: &mut OverlayStatus) {
         let nat = &self.link.shared.nat;

@@ -14,12 +14,12 @@ use crate::{
     peer_fence::{Candidates, Fenced},
     peer_limits::{Classes, Limits},
     peer_protocol::PROTOCOL,
+    peer_punch::Punches,
     peer_rewaken::Rewaken,
 };
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identify,
-    identity::Keypair, multiaddr::Protocol, noise, quic, relay, request_response,
-    swarm::NetworkBehaviour, tcp, yamux,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, autonat, identify, identity::Keypair,
+    multiaddr::Protocol, noise, quic, relay, request_response, swarm::NetworkBehaviour, tcp, yamux,
 };
 use std::{
     num::{NonZeroU8, NonZeroUsize},
@@ -42,7 +42,7 @@ pub(crate) struct Behaviour {
     pub(crate) autonat_server: Fenced<autonat::v2::server::Behaviour>,
     pub(crate) relay: Rewaken<relay::Behaviour>,
     pub(crate) relay_client: relay::client::Behaviour,
-    pub(crate) dcutr: dcutr::Behaviour,
+    pub(crate) dcutr: Punches,
 }
 
 impl Behaviour {
@@ -76,8 +76,9 @@ impl relay::RateLimiter for RelayGate {
 }
 
 /// §3.3 limits. libp2p denies a new reservation or circuit only when the
-/// peer already holds MORE than the per-peer maximum, so 0 admits one
-/// reservation per peer and 3 admits four circuits.
+/// peer already holds MORE than the per-peer maximum, so 1 admits two
+/// reservations per peer (a restarted peer's new one beside the stale one we
+/// hold until its old connection times out) and 3 admits four circuits.
 fn relay_config(open: &Arc<AtomicBool>, local: PeerId) -> relay::Config {
     let gate = || RelayGate {
         open: Arc::clone(open),
@@ -85,7 +86,7 @@ fn relay_config(open: &Arc<AtomicBool>, local: PeerId) -> relay::Config {
     };
     let mut config = relay::Config {
         max_reservations: 128,
-        max_reservations_per_peer: 0,
+        max_reservations_per_peer: 1,
         max_circuits: 16,
         max_circuits_per_peer: 3,
         max_circuit_duration: Duration::from_secs(2 * 60),
@@ -163,7 +164,7 @@ fn behaviour(
             relay_config(&wiring.relay_open, local),
         )),
         relay_client,
-        dcutr: dcutr::Behaviour::new(local),
+        dcutr: Punches::new(local),
     }
 }
 

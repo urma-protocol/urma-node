@@ -1,3 +1,5 @@
+use std::io::ErrorKind;
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
@@ -43,6 +45,13 @@ impl std::fmt::Display for DialLimit {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // A socket read timeout surfaces as EAGAIN (`WouldBlock`) on Unix.
+            Self::Io(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                write!(
+                    f,
+                    "timed out: no answer in time, the other side may be busy ({e})"
+                )
+            }
             Self::Io(e) => write!(f, "archive I/O: {e}"),
             Self::Database(e) => write!(f, "archive database: {e}"),
             Self::Json(e) => write!(f, "archive encoding: {e}"),
@@ -95,5 +104,24 @@ impl From<urma_node_client::Error> for Error {
             urma_node_client::Error::Invalid(message) => Self::Invalid(message),
             urma_node_client::Error::Busy(message) => Self::Busy(message),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::io::{self, ErrorKind};
+
+    #[test]
+    fn a_timeout_reads_as_timed_out_not_archive_io() {
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            let error = Error::from(urma_node_client::Error::Io(io::Error::from(kind)));
+            let shown = error.to_string();
+            assert!(matches!(error, Error::Io(_)), "the typed kind is kept");
+            assert!(shown.starts_with("timed out"), "{shown}");
+            assert!(!shown.contains("archive I/O"), "{shown}");
+        }
+        let refused = Error::from(io::Error::from(ErrorKind::ConnectionRefused));
+        assert!(refused.to_string().starts_with("archive I/O"));
     }
 }

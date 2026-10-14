@@ -14,7 +14,7 @@ mod discovery_host;
 mod nat_peer;
 use common::{MemorySource, config, witness_block};
 use discovery_host::{
-    Node, PUBLIC, bare, discover, host, node, offline, report, run, stage, until,
+    Node, PUBLIC, bare, discover, host, node, offline, report, run, stage, tcp_and_quic, until,
 };
 use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
 use nat_peer::NatPeer;
@@ -68,7 +68,10 @@ fn chained(root: &Path, name: &str) -> Arc<Engine> {
 }
 
 fn forced_on(engine: Arc<Engine>, ip: &str, reachability: Reachability) -> Node {
-    let key = Keypair::generate_ed25519();
+    forced_as(engine, ip, reachability, Keypair::generate_ed25519())
+}
+
+fn forced_as(engine: Arc<Engine>, ip: &str, reachability: Reachability, key: Keypair) -> Node {
     let id = key.public().to_peer_id();
     let port = TcpListener::bind((ip, 0))
         .unwrap()
@@ -447,6 +450,79 @@ fn punch(root: &Path) -> Value {
     json!({"direct":direct,"served":served})
 }
 
+fn punches(node: &Node) -> (u64, u64) {
+    node.network.sync_peers(Vec::new()).hole_punches()
+}
+
+/// Both ends of a punch count it: A (a real node here) dialed the circuit,
+/// B answered it.
+fn punch_counts(root: &Path) -> Value {
+    let p = forced(root, "p", PUBLIC[1], Reachability::Public);
+    let b = forced(root, "b", PUBLIC[0], Reachability::Private);
+    let circuit = reserved(root, &p, &b);
+    stage(root, "A learns its address from P, then dials B through P");
+    let a = forced(root, "a", PUBLIC[0], Reachability::Private);
+    assert_eq!(a.dial(p.listening()), p.id);
+    thread::sleep(Duration::from_secs(3));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let dialed = a
+        .network
+        .dial_any(circuit, &AtomicBool::new(false), deadline);
+    stage(root, "both ends count the punch");
+    let counted = until(PROBE, || punches(&a).1 >= 1 && punches(&b).1 >= 1);
+    json!({"dialed":dialed.is_ok(),"counted":counted,"a":punches(&a),"b":punches(&b)})
+}
+
+/// A restarted node (same key) reserves again while the relay still holds
+/// the reservation of its old process.
+fn restart(root: &Path) -> Value {
+    let p = forced(root, "p", PUBLIC[0], Reachability::Public);
+    let key = Keypair::generate_ed25519();
+    let old = forced_as(
+        offline(root, "b1"),
+        PUBLIC[1],
+        Reachability::Private,
+        key.clone(),
+    );
+    reserved(root, &p, &old);
+    stage(
+        root,
+        "the same identity starts again beside its stale reservation",
+    );
+    let new = forced_as(offline(root, "b2"), PUBLIC[1], Reachability::Private, key);
+    // P admits the new link beside the stale one as auxiliary: no records
+    // run on it, so the chain probe fails, but the reservation does not.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let probed = new
+        .network
+        .dial(p.listening(), &AtomicBool::new(false), deadline);
+    let held = until(Duration::from_secs(20), || {
+        new.network.relays() == vec![p.id]
+    });
+    json!({"held":held,"probed":probed.is_ok()})
+}
+
+/// Shutdown closes QUIC links at once instead of leaving them to the peer's
+/// idle timeout.
+fn shutdown(root: &Path) -> Value {
+    let p = forced(root, "p", PUBLIC[0], Reachability::Public);
+    let a = forced(root, "a", PUBLIC[1], Reachability::Public);
+    let quic = tcp_and_quic(&p.listening())[1]
+        .clone()
+        .with(Protocol::P2p(p.id));
+    assert_eq!(a.dial(quic), p.id);
+    let linked = until(Duration::from_secs(5), || p.connected().contains(&a.id));
+    stage(root, "A shuts down; P sees the QUIC link close");
+    let Node { network, id, .. } = a;
+    let started = Instant::now();
+    let shut = match Arc::try_unwrap(network) {
+        Ok(network) => network.shutdown().is_ok(),
+        Err(_shared) => false,
+    };
+    let gone = until(Duration::from_secs(3), || !p.connected().contains(&id));
+    json!({"linked":linked,"shut":shut,"gone":gone,"ms":started.elapsed().as_millis()})
+}
+
 #[test]
 #[ignore = "owned namespaced subprocess host, invoked only by the NAT cases"]
 fn peer_nat_host() {
@@ -460,6 +536,9 @@ fn peer_nat_host() {
         "holders" => holders(&root),
         "daemon" => daemon(&root),
         "unproven" => unproven(&root),
+        "punch_counts" => punch_counts(&root),
+        "restart" => restart(&root),
+        "shutdown" => shutdown(&root),
         _ => panic!("unknown owned scenario"),
     };
     report(&root, &scenario, checks);
@@ -546,4 +625,25 @@ fn dcutr_upgrades_a_relayed_contact_to_a_direct_data_link() {
     let checks = run(HOST, "punch");
     assert_eq!(checks["direct"], true);
     assert_eq!(checks["served"], true);
+}
+
+#[test]
+fn both_ends_of_a_hole_punch_count_it() {
+    let checks = run(HOST, "punch_counts");
+    assert_eq!(checks["dialed"], true, "{checks}");
+    assert_eq!(checks["counted"], true, "{checks}");
+}
+
+#[test]
+fn a_restarted_node_reserves_beside_its_stale_reservation() {
+    let checks = run(HOST, "restart");
+    assert_eq!(checks["held"], true, "{checks}");
+}
+
+#[test]
+fn shutdown_closes_quic_links_instead_of_leaving_them_to_idle_out() {
+    let checks = run(HOST, "shutdown");
+    assert_eq!(checks["linked"], true, "{checks}");
+    assert_eq!(checks["shut"], true, "{checks}");
+    assert_eq!(checks["gone"], true, "{checks}");
 }

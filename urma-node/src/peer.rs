@@ -15,7 +15,7 @@ use crate::{
     peer_protocol::{GossipPeer, InventoryPage, Kind, Reply, Request, Response, VERSION},
     peer_rate::{Bucket, Count, peer_rate},
     peer_reach::{Reach, Remotes, validate_announce},
-    peer_release::{maintain as release_idle, release},
+    peer_release::{close_all, maintain as release_idle, release},
     peer_transport::{Wiring, swarm},
     peerbook::PeerAddress,
 };
@@ -562,6 +562,7 @@ async fn run(
             .fail(Error::Busy("peer network stopped".into()));
     }
     dials.close();
+    close_all(&mut swarm).await;
     // Drop channels before joining: the archive reader must not wait for a
     // consumer which is already shutting down. No socket belongs to that reader.
     drop(swarm);

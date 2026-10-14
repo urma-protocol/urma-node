@@ -87,23 +87,33 @@ impl Remotes {
             .is_some_and(|remote| remote.outbound && remote.class != Class::Relayed)
     }
 
-    /// A relay circuit has no use once the peer holds a direct data link
-    /// (§3.4): the circuits to retire after `id` was admitted as `class`.
+    /// What connection `id` of `peer`, admitted as `class`, retires. A direct
+    /// data link retires the peer's circuits (§3.4). A circuit the peer dialed
+    /// retires our direct links to it instead: a peer dials a circuit only
+    /// while it holds no connection to us, so those links are stale (its
+    /// process restarted) and would refuse the punch as a duplicate. A circuit
+    /// we dialed beside a direct data link is itself redundant.
     pub(crate) fn superseded(
         &self,
         id: ConnectionId,
         peer: PeerId,
         class: Class,
     ) -> Vec<ConnectionId> {
-        let direct = self
-            .0
-            .values()
-            .any(|remote| remote.peer == peer && remote.class == Class::Data);
+        let inbound = self.0.get(&id).is_some_and(|remote| !remote.outbound);
         match class {
             Class::Data => self.relayed_of(peer),
-            Class::Relayed if direct => vec![id],
+            Class::Relayed if inbound => self.direct_of(peer),
+            Class::Relayed if self.has_data(peer) => vec![id],
             Class::Relayed | Class::Auxiliary | Class::Holder | Class::Demoted => Vec::new(),
         }
+    }
+
+    fn direct_of(&self, peer: PeerId) -> Vec<ConnectionId> {
+        self.0
+            .iter()
+            .filter(|(_, remote)| remote.peer == peer && remote.class != Class::Relayed)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Holders admitted at least `grace` ago and links demoted at least
@@ -263,11 +273,24 @@ pub(crate) struct Reach {
     quic: bool,
     reservations: HashMap<ListenerId, PeerId>,
     backoff: HashMap<PeerId, Instant>,
+    failures: HashMap<PeerId, u32>,
     circuits: HashMap<PeerId, u32>,
+}
+
+/// How long a relay rests after `failures` failed reservations in a row:
+/// `RETRY` doubling up to `BACKOFF`. The first retry comes soon because the
+/// usual refusal is our own stale reservation from before a restart, which
+/// the relay drops once it notices the old connection is gone.
+fn retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    Reach::RETRY
+        .saturating_mul(1 << doublings)
+        .min(Reach::BACKOFF)
 }
 
 impl Reach {
     const RESERVATIONS: usize = 2;
+    const RETRY: Duration = Duration::from_secs(30);
     const BACKOFF: Duration = Duration::from_secs(10 * 60);
     const HOLDER_GRACE: Duration = Duration::from_secs(10);
 
@@ -287,8 +310,15 @@ impl Reach {
             quic: false,
             reservations: HashMap::new(),
             backoff: HashMap::new(),
+            failures: HashMap::new(),
             circuits: HashMap::new(),
         }
+    }
+
+    fn back_off(&mut self, relay: PeerId, now: Instant) {
+        let failures = self.failures.entry(relay).or_default();
+        *failures = failures.saturating_add(1);
+        self.backoff.insert(relay, now + retry_delay(*failures));
     }
 
     /// Public with an announced or AutoNAT-confirmed direct address, private
@@ -328,10 +358,10 @@ impl Reach {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => self.relay_server(&event, nat),
             SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
-                Self::relay_client(&event, nat)
+                self.relay_client(&event, nat)
             }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
-                Self::dcutr(swarm, remotes, event, nat)
+                Self::dcutr(swarm, remotes, event)
             }
             SwarmEvent::ExternalAddrConfirmed { address } => self.external(address, true, nat),
             SwarmEvent::ExternalAddrExpired { address } => self.external(address, false, nat),
@@ -493,28 +523,43 @@ impl Reach {
         }
     }
 
-    pub(crate) fn relay_client(event: &relay::client::Event, nat: &Nat) {
+    /// An accepted reservation clears the relay's failure count.
+    pub(crate) fn relay_client(&mut self, event: &relay::client::Event, nat: &Nat) {
         if let relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } = event {
             nat.set_relay(*relay_peer_id, true);
+            self.failures.remove(relay_peer_id);
         }
     }
 
-    /// A punched direct link retires the circuit; a failure is recorded and
-    /// the next relayed contact tries again.
-    pub(crate) fn dcutr(
-        swarm: &mut Swarm<Behaviour>,
-        remotes: &Remotes,
-        event: dcutr::Event,
-        nat: &Nat,
-    ) {
+    /// A punched direct link retires the circuit where DCUtR reports it;
+    /// `punches` counts outcomes on both ends.
+    pub(crate) fn dcutr(swarm: &mut Swarm<Behaviour>, remotes: &Remotes, event: dcutr::Event) {
         match event.result {
             Ok(_direct) => {
-                nat.punch_succeeded();
                 for id in remotes.relayed_of(event.remote_peer_id) {
                     swarm.close_connection(id);
                 }
             }
-            Err(error) => nat.punch_failed(format!("{}: {error}", event.remote_peer_id)),
+            Err(error) => {
+                tracing::debug!(peer = %event.remote_peer_id, %error, "hole punch failed")
+            }
+        }
+    }
+
+    /// Finished hole punches, whichever end dialed the circuit: a success
+    /// retires the peer's circuits, a failure is recorded and the next
+    /// relayed contact tries again.
+    fn punches(swarm: &mut Swarm<Behaviour>, remotes: &Remotes, nat: &Nat) {
+        for (peer, outcome) in swarm.behaviour_mut().dcutr.drain(Instant::now()) {
+            match outcome {
+                Ok(()) => {
+                    nat.punch_succeeded();
+                    for id in remotes.relayed_of(peer) {
+                        swarm.close_connection(id);
+                    }
+                }
+                Err(error) => nat.punch_failed(format!("{peer}: {error}")),
+            }
         }
     }
 
@@ -555,8 +600,9 @@ impl Reach {
             return;
         };
         nat.set_relay(relay, false);
-        if reason.is_err() {
-            self.backoff.insert(relay, Instant::now() + Self::BACKOFF);
+        if let Err(error) = reason {
+            tracing::debug!(%relay, %error, "relay reservation ended; retrying after backoff");
+            self.back_off(relay, Instant::now());
         }
     }
 
@@ -591,6 +637,7 @@ impl Reach {
     /// While private, holds up to two reservations on public peers we dialed
     /// (seeds first), skipping relays that recently failed; otherwise none.
     pub(crate) fn maintain(&mut self, swarm: &mut Swarm<Behaviour>, remotes: &Remotes, nat: &Nat) {
+        Self::punches(swarm, remotes, nat);
         self.retire_holders(swarm, remotes, nat);
         if nat.reachability() != Reachability::Private {
             for (id, _) in self.reservations.drain() {
@@ -617,9 +664,80 @@ impl Reach {
                 }
                 Err(error) => {
                     tracing::warn!(%error, %relay, "relay reservation not attempted");
-                    self.backoff.insert(relay, now + Self::BACKOFF);
+                    self.back_off(relay, now);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Remotes, retry_delay};
+    use crate::peer_limits::{Class, Classes};
+    use libp2p::{
+        Multiaddr, PeerId,
+        core::{ConnectedPoint, Endpoint, transport::PortUse},
+        swarm::ConnectionId,
+    };
+
+    #[test]
+    fn a_failed_reservation_retries_after_thirty_seconds_doubling_to_ten_minutes() {
+        let delays = [1, 2, 3, 4, 5, 6, 40].map(|failures| retry_delay(failures).as_secs());
+        assert_eq!(delays, [30, 60, 120, 240, 480, 600, 600]);
+    }
+
+    fn admit(
+        (remotes, classes): (&mut Remotes, &Classes),
+        (id, peer): (usize, PeerId),
+        (class, outbound): (Class, bool),
+    ) -> ConnectionId {
+        let id = ConnectionId::new_unchecked(id);
+        classes.set(id, class);
+        let address: Multiaddr = "/ip4/11.0.0.1/udp/1/quic-v1".parse().unwrap();
+        let endpoint = match outbound {
+            true => ConnectedPoint::Dialer {
+                address,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            false => ConnectedPoint::Listener {
+                local_addr: address.clone(),
+                send_back_addr: address,
+            },
+        };
+        remotes.admit((id, peer), &endpoint, classes);
+        id
+    }
+
+    #[test]
+    fn a_circuit_the_peer_dialed_retires_our_stale_direct_links_not_itself() {
+        let (mut remotes, classes) = (Remotes::default(), Classes::default());
+        let (peer, bystander) = (PeerId::random(), PeerId::random());
+        let mut set = |entry, kind| admit((&mut remotes, &classes), entry, kind);
+        let stale = set((1, peer), (Class::Data, true));
+        let holder = set((2, peer), (Class::Holder, false));
+        set((3, bystander), (Class::Data, true));
+        let circuit = set((4, peer), (Class::Relayed, false));
+        let mut retired = remotes.superseded(circuit, peer, Class::Relayed);
+        retired.sort();
+        assert_eq!(
+            retired,
+            vec![stale, holder],
+            "the peer dialed: ours are stale"
+        );
+        remotes.remove(stale);
+        remotes.remove(holder);
+        let punched = admit((&mut remotes, &classes), (5, peer), (Class::Data, true));
+        assert_eq!(
+            remotes.superseded(punched, peer, Class::Data),
+            vec![circuit]
+        );
+        let ours = admit((&mut remotes, &classes), (6, peer), (Class::Relayed, true));
+        assert_eq!(
+            remotes.superseded(ours, peer, Class::Relayed),
+            vec![ours],
+            "a circuit we dialed beside a data link is redundant"
+        );
     }
 }
