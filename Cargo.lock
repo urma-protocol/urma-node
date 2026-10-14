@@ -6113,7 +6113,7 @@ dependencies = [
 
 [[package]]
 name = "urma-node"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -6144,7 +6144,7 @@ dependencies = [
 
 [[package]]
 name = "urma-node-app"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "serde",
