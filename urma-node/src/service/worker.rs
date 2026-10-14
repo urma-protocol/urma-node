@@ -70,6 +70,7 @@ impl Service {
     }
 
     fn maintenance_round(&self) {
+        self.probe_commit_sources();
         // Discovery keeps connections and the book fresh before inventory
         // sync uses them; both are independent of the sync thread.
         self.discover_peers();
@@ -116,6 +117,20 @@ impl Service {
             .engine
             .retain_next_object(&sources, *slice, scratch, &self.stop);
         record(&self.retention_error, &result);
+    }
+
+    /// Commit-source liveness for status, at each source's own cadence and
+    /// bound; only a broken status table is worth a dependency error here.
+    fn probe_commit_sources(&self) {
+        let Some(sources) = &self.commit_sources else {
+            return;
+        };
+        if self.stopped() {
+            return;
+        }
+        if let Err(error) = sources.probe() {
+            record(&self.dependency_error, &Err::<(), _>(error));
+        }
     }
 
     fn acquire_next_dependency(&self) {

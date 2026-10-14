@@ -4,6 +4,8 @@ use crate::{
     recorded::RecordedError,
 };
 use bitcoin::{BlockHash, Txid, block::Header};
+use rpc::{Answer, Rpc};
+use serde_json::{Value, json};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -15,9 +17,11 @@ use std::{
 };
 use urma_chain::{decode, observation::Chain};
 use urma_runtime::{
-    node::{Node, NodeConfig},
+    node::Node,
     p2p::{Anchor, HeaderBootstrap, P2pProvider},
 };
+
+mod rpc;
 
 /// Port implemented by a chain verifier, not by an untrusted remote JSON API.
 /// The implementation owns header difficulty, PoW and branch selection. Bodies
@@ -46,8 +50,9 @@ pub trait ChainSource: Send + Sync {
 pub trait CommitSource {
     fn chain(&self) -> Chain;
     fn fetch(&self, txid: Txid, cancelled: &AtomicBool) -> Result<Option<Vec<u8>>, Error>;
-    /// A liveness check for status, rate-limited by the source itself. `None`
-    /// when no fresh check ran (or the source has none); otherwise its result.
+    /// A bounded liveness check, rate-limited by the source itself and run by
+    /// the maintenance thread, never by status. `None` when no fresh check
+    /// ran (or the source has none); otherwise its result.
     fn probe(&self) -> Option<Result<(), Error>> {
         None
     }
@@ -99,20 +104,28 @@ impl CommitSource for RuntimeCommitSource {
     }
 }
 
-/// Optional local Litecoin Core: it may start, stop or restart at any time.
-/// Holds only the URL and cookie path; every lookup and probe reads the cookie,
-/// and a node is rebuilt and its txindex verified whenever the cookie changes.
+/// Optional local Litecoin Core: it may start, stop, restart or hang at any
+/// time. Holds only the URL and cookie path; every lookup and probe reads the
+/// cookie, and the chain and txindex are verified again whenever it changes.
+/// Every RPC is bounded (see `rpc`), so a stopped or hung Core costs a lookup
+/// at most its budget before the next source is tried.
 pub struct LocalRpcCommitSource {
     chain: Chain,
     rpc_url: String,
     cookie_file: PathBuf,
     probe_interval: Duration,
-    verified: Mutex<Option<(Vec<u8>, Arc<Node>)>>,
+    probe_budget: Duration,
+    fetch_budget: Duration,
+    verified: Mutex<Option<(Vec<u8>, Arc<Rpc>)>>,
     probed: Mutex<Option<Instant>>,
 }
 
 impl LocalRpcCommitSource {
     pub const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+    /// Total time one probe RPC may take after connecting.
+    pub const PROBE_BUDGET: Duration = Duration::from_secs(3);
+    /// Total time one lookup RPC may take after connecting.
+    pub const FETCH_BUDGET: Duration = Duration::from_secs(15);
 
     pub fn new(chain: Chain, rpc_url: String, cookie_file: PathBuf) -> Self {
         Self {
@@ -120,6 +133,8 @@ impl LocalRpcCommitSource {
             rpc_url,
             cookie_file,
             probe_interval: Self::PROBE_INTERVAL,
+            probe_budget: Self::PROBE_BUDGET,
+            fetch_budget: Self::FETCH_BUDGET,
             verified: Mutex::new(None),
             probed: Mutex::new(None),
         }
@@ -130,29 +145,50 @@ impl LocalRpcCommitSource {
         self
     }
 
-    fn node(&self) -> Result<Arc<Node>, Error> {
+    pub fn with_budgets(mut self, probe: Duration, fetch: Duration) -> Self {
+        self.probe_budget = probe;
+        self.fetch_budget = fetch;
+        self
+    }
+
+    /// The verified RPC for the current cookie; verification RPCs use `budget`
+    /// each and never run under the lock.
+    fn rpc(&self, budget: Duration) -> Result<Arc<Rpc>, Error> {
         let cookie = std::fs::read(&self.cookie_file).map_err(|_| {
             Error::CommitSource("cookie file missing: litecoind not running?".into())
         })?;
-        let mut verified = self
-            .verified
-            .lock()
-            .map_err(|_| Error::Invalid("local RPC commit source poisoned".into()))?;
-        if let Some((seen, node)) = verified.as_ref() {
+        if let Some((seen, rpc)) = self.verified()?.as_ref() {
             if *seen == cookie {
-                return Ok(Arc::clone(node));
+                return Ok(Arc::clone(rpc));
             }
         }
-        *verified = None;
-        let node = Node::connect(NodeConfig {
-            chain: self.chain,
-            rpc_url: self.rpc_url.clone(),
-            cookie_file: self.cookie_file.clone(),
-        })
-        .and_then(|node| node.require_txindex().map(|()| Arc::new(node)))
-        .map_err(|error| Error::CommitSource(error.to_string()))?;
-        *verified = Some((cookie, Arc::clone(&node)));
-        Ok(node)
+        let rpc = Arc::new(Rpc::new(&self.rpc_url, &cookie)?);
+        let genesis = rpc.value("getblockhash", json!([0]), budget)?;
+        let expected = self
+            .chain
+            .genesis()
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .0
+            .to_string();
+        if genesis.as_str() != Some(expected.as_str()) {
+            return Err(Error::CommitSource(
+                "RPC genesis does not match selected chain".into(),
+            ));
+        }
+        let indexes = rpc.value("getindexinfo", json!(["txindex"]), budget)?;
+        if indexes["txindex"]["synced"] != true {
+            return Err(Error::CommitSource(
+                "parent lookups require synchronized txindex=1 on the local node".into(),
+            ));
+        }
+        *self.verified()? = Some((cookie, Arc::clone(&rpc)));
+        Ok(rpc)
+    }
+
+    fn verified(&self) -> Result<MutexGuard<'_, Option<(Vec<u8>, Arc<Rpc>)>>, Error> {
+        self.verified
+            .lock()
+            .map_err(|_| Error::Invalid("local RPC commit source poisoned".into()))
     }
 
     fn probe_due(&self) -> Result<bool, Error> {
@@ -173,19 +209,26 @@ impl CommitSource for LocalRpcCommitSource {
         self.chain
     }
 
+    /// Code -5 is Core's "no such mempool or blockchain transaction": absent.
     fn fetch(&self, txid: Txid, cancelled: &AtomicBool) -> Result<Option<Vec<u8>>, Error> {
         check_cancelled(cancelled)?;
-        let node = self.node()?;
-        fetch_from_node(&node, txid)
+        let budget = self.fetch_budget;
+        let rpc = self.rpc(budget)?;
+        match rpc.call("getrawtransaction", json!([txid, false]), budget)? {
+            Answer::Value(result) => transaction_hex(&result).map(Some),
+            Answer::Failed { code: -5, .. } => Ok(None),
+            Answer::Failed { code, message } => Err(Error::CommitSource(format!(
+                "JSON-RPC getrawtransaction error {code}: {message}"
+            ))),
+        }
     }
 
     fn probe(&self) -> Option<Result<(), Error>> {
         match self.probe_due() {
             Ok(false) => None,
-            Ok(true) => Some(self.node().and_then(|node| {
-                node.call("getblockcount", &[])
-                    .map(|_| ())
-                    .map_err(|error| Error::CommitSource(error.to_string()))
+            Ok(true) => Some(self.rpc(self.probe_budget).and_then(|rpc| {
+                rpc.value("getblockcount", json!([]), self.probe_budget)
+                    .map(|_count| ())
             })),
             Err(error) => Some(Err(error)),
         }
@@ -201,6 +244,11 @@ fn fetch_from_node(node: &Node, txid: Txid) -> Result<Option<Vec<u8>>, Error> {
         Err(error) if error.is_missing_transaction() => return Ok(None),
         Err(error) => return Err(Error::CommitSource(error.to_string())),
     };
+    transaction_hex(&result).map(Some)
+}
+
+/// The 16M-character/8M-byte admission cap, on hex as the source returned it.
+fn transaction_hex(result: &Value) -> Result<Vec<u8>, Error> {
     let encoded = result
         .as_str()
         .ok_or_else(|| Error::Invalid("commit source must return transaction hex".into()))?;
@@ -211,7 +259,7 @@ fn fetch_from_node(node: &Node, txid: Txid) -> Result<Option<Vec<u8>>, Error> {
     }
     let raw = hex::decode(encoded)
         .map_err(|error| Error::Invalid(format!("commit source hex: {error}")))?;
-    Ok(Some(raw))
+    Ok(raw)
 }
 
 /// Default public providers for one chain, without a light client. Creating
@@ -309,12 +357,19 @@ impl CommitSources {
         self.entries.is_empty()
     }
 
-    pub fn status(&self) -> Result<Vec<CommitSourceStatus>, Error> {
+    /// Run each source's own rate-limited, bounded liveness check and record
+    /// the outcome. The maintenance thread calls this; status never does.
+    pub fn probe(&self) -> Result<(), Error> {
         for (index, entry) in self.entries.iter().enumerate() {
             if let Some(probed) = entry.1.probe() {
                 self.record(index, probed.err().map(|error| RecordedError::now(&error)))?;
             }
         }
+        Ok(())
+    }
+
+    /// Recorded outcomes of the latest lookups and probes; no I/O.
+    pub fn status(&self) -> Result<Vec<CommitSourceStatus>, Error> {
         let errors = self.errors()?;
         Ok(self
             .entries

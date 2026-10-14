@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -73,6 +73,8 @@ pub struct Service {
 }
 
 impl Service {
+    /// Control requests handled at once; more are refused with 503.
+    const CONTROL_REQUESTS: usize = 8;
     const CAPABILITIES: [&str; 9] = [
         "status",
         "header-sync",
@@ -198,7 +200,7 @@ impl Service {
                 scope.spawn(|| self.sync_loop());
                 scope.spawn(|| self.maintenance_loop());
             }
-            let outcome = self.accept_loop();
+            let outcome = self.accept_loop(scope);
             self.stop.store(true, Ordering::Release);
             outcome
         })
@@ -224,12 +226,14 @@ impl Service {
             .clone();
         let (last_cache_error, last_cache_error_at) = RecordedError::split(cache.error);
         let overlay = self.overlay_status()?;
+        let mut status = ServiceStatus::default();
+        // Archive first: a source records a lookup before its parent is
+        // admitted, so a resolved parent's outcome is already in the table.
+        status.archive = self.engine.status()?;
         let mut commit_sources = Vec::new();
         for sources in self.commit_sources.iter() {
             commit_sources.extend(sources.status()?);
         }
-        let mut status = ServiceStatus::default();
-        status.archive = self.engine.status()?;
         status.last_sync_error = last_sync_error;
         status.last_sync_error_at = last_sync_error_at;
         status.last_retention_error = last_retention_error;
@@ -257,7 +261,14 @@ impl Service {
         Ok(status)
     }
 
-    fn accept_loop(&self) -> Result<(), Error> {
+    /// Each request runs on its own scoped thread, so a slow client or handler
+    /// never delays another; past `CONTROL_REQUESTS` in flight, new ones get
+    /// 503 at once. Stop joins the in-flight requests with the scope.
+    fn accept_loop<'scope, 'env>(
+        &'env self,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+    ) -> Result<(), Error> {
+        let in_flight = Arc::new(AtomicUsize::new(0));
         while !self.stop.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((mut stream, peer)) => {
@@ -266,8 +277,18 @@ impl Service {
                     }
                     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-                    // A malformed or disconnected client never stops the service.
-                    let _ = self.request(&mut stream);
+                    if in_flight.fetch_add(1, Ordering::AcqRel) >= Self::CONTROL_REQUESTS {
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                        // Best effort: a busy reply that cannot be written is moot.
+                        let _ = respond(&mut stream, 503, json!({"error":"control service busy"}));
+                        continue;
+                    }
+                    let in_flight = Arc::clone(&in_flight);
+                    scope.spawn(move || {
+                        // A malformed or disconnected client never stops the service.
+                        let _ = self.request(&mut stream);
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(50))

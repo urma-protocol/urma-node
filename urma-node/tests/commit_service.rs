@@ -535,7 +535,9 @@ fn answer(
     stream.flush()
 }
 
+// One probe round, as the maintenance thread runs it, then the recorded state.
 fn local_error(sources: &CommitSources) -> Option<String> {
+    sources.probe().unwrap();
     sources.status().unwrap()[0].last_error.clone()
 }
 
@@ -595,15 +597,13 @@ fn service_status_flips_local_rpc_within_one_probe() {
         .with_probe_interval(Duration::from_millis(100));
     let mut sources = CommitSources::new(Chain::BitcoinRegtest);
     sources.push("local-rpc".into(), Box::new(local));
-    let running = Running::with_sources(engine, Some(sources), false);
+    // Probes run on the maintenance thread, so the service synchronizes.
+    let running = Running::with_sources(engine, Some(sources), true);
     let entry = |s: &Value| field(s, "commit_sources")[0].clone();
-    let first = status(running.address);
+    let first = poll(running.address, "local-rpc cookie missing", |s| {
+        entry(s)["last_error"] == json!(MISSING_COOKIE)
+    });
     assert_eq!(entry(&first)["label"], json!("local-rpc"), "{first}");
-    assert_eq!(
-        entry(&first)["last_error"],
-        json!(MISSING_COOKIE),
-        "{first}"
-    );
     fs::write(&cookie, COOKIE).unwrap();
     poll(running.address, "local-rpc ok", |s| {
         entry(s)["last_error"].is_null()
@@ -649,4 +649,92 @@ fn wrong_chain_commit_source_is_refused_at_configuration_without_fetching() {
         Arc::into_inner(engine).is_some(),
         "refused Service kept Engine"
     );
+}
+
+// Accepts connections into its backlog and never answers: a stopped (SIGSTOP)
+// or hung litecoind looks exactly like this from the client side.
+fn hung_core() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    (listener, url)
+}
+
+#[test]
+fn hung_core_costs_a_lookup_its_budget_and_the_next_source_serves() {
+    let pair = profile();
+    let parent = pair.commit.compute_txid();
+    let (_core, url) = hung_core();
+    let directory = tempfile::tempdir().unwrap();
+    let cookie = directory.path().join("rpc.cookie");
+    fs::write(&cookie, COOKIE).unwrap();
+    let budget = Duration::from_millis(500);
+    let local = LocalRpcCommitSource::new(Chain::BitcoinRegtest, url, cookie)
+        .with_probe_interval(Duration::ZERO)
+        .with_budgets(budget, budget);
+    let backup = Recording::new(Chain::BitcoinRegtest, &pair.raw_commit, 0);
+    let mut sources = CommitSources::new(Chain::BitcoinRegtest);
+    sources.push("local-rpc".into(), Box::new(local));
+    sources.push(LABEL.into(), Box::new(backup.clone()));
+    let started = Instant::now();
+    let fetched = sources.fetch(parent, &AtomicBool::new(false)).unwrap();
+    assert!(
+        started.elapsed() < budget * 3,
+        "lookup took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(fetched, Some(pair.raw_commit.clone()));
+    assert_eq!(backup.requests(), vec![parent]);
+    let recorded = sources.status().unwrap()[0].last_error.clone().unwrap();
+    assert!(recorded.contains("timed out"), "{recorded}");
+    let started = Instant::now();
+    let probed = local_error(&sources).unwrap();
+    assert!(
+        started.elapsed() < budget * 3,
+        "probe took {:?}",
+        started.elapsed()
+    );
+    assert!(probed.contains("getblockhash timed out"), "{probed}");
+}
+
+#[test]
+fn status_stays_fast_while_core_hangs_and_an_idle_client_waits() {
+    let pair = profile();
+    let (_core, url) = hung_core();
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, _chain) = fixture(&directory.path().join("archive"), &pair, 0);
+    let cookie = directory.path().join("rpc.cookie");
+    fs::write(&cookie, COOKIE).unwrap();
+    let local = LocalRpcCommitSource::new(Chain::BitcoinRegtest, url, cookie)
+        .with_probe_interval(Duration::from_millis(100))
+        .with_budgets(Duration::from_secs(2), Duration::from_secs(2));
+    let mut sources = CommitSources::new(Chain::BitcoinRegtest);
+    sources.push("local-rpc".into(), Box::new(local));
+    let running = Running::with_sources(engine, Some(sources), true);
+    // A client that connects and never sends holds its request for the read
+    // timeout; other control requests must not queue behind it.
+    let idle = TcpStream::connect(running.address).unwrap();
+    let recorded = |s: &Value| field(s, "commit_sources")[0]["last_error"].clone();
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let asked = Instant::now();
+        let current = status(running.address);
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "status took {:?}",
+            asked.elapsed()
+        );
+        if recorded(&current)
+            .as_str()
+            .is_some_and(|e| e.contains("timed out"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no probe timeout recorded: {current}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(idle);
+    running.finish();
 }
