@@ -17,7 +17,7 @@ use bitcoin::BlockHash;
 use common::{FIRST_HEIGHT, MemorySource, config, profile, witness_block};
 use discovery_host::{
     Node, PUBLIC, bare, discover, entry_of, host, node, node_on, now, report, rounds, run,
-    saved_book, stage,
+    saved_book, stage, tcp_and_quic,
 };
 use inventory_peer::RawPeer;
 use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
@@ -145,7 +145,7 @@ fn discovers(root: &Path) -> Value {
     let saved = saved_book(&path, &a);
     let learned = entry_of(&saved, c.id);
     assert_eq!(learned.origin, Origin::Gossip);
-    assert_eq!(learned.addrs, vec![bare(&c.listening())]);
+    assert_eq!(learned.addrs, tcp_and_quic(&c.listening()));
     assert!(learned.last_success.is_some());
     assert_eq!(
         entry_of(&saved, b.id).origin,

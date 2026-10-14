@@ -47,6 +47,21 @@ pub fn bare(address: &Multiaddr) -> Multiaddr {
         .collect()
 }
 
+/// A node's advertised pair: its TCP listener and the QUIC listener on the
+/// same port.
+pub fn tcp_and_quic(listening: &Multiaddr) -> Vec<Multiaddr> {
+    let tcp = bare(listening);
+    let quic = tcp
+        .iter()
+        .map(|part| match part {
+            Protocol::Tcp(port) => Protocol::Udp(port),
+            other => other,
+        })
+        .chain([Protocol::QuicV1])
+        .collect();
+    vec![tcp, quic]
+}
+
 /// Poll `ready` every 50 ms until it holds or `bound` passes.
 pub fn until(bound: Duration, mut ready: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + bound;

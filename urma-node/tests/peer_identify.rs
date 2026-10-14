@@ -14,7 +14,7 @@ mod discovery_host;
 mod inventory_peer;
 use discovery_host::{
     PUBLIC, announcing_node, bare, discover, entry_of, host, node, report, rounds, run, saved_book,
-    stage, until,
+    stage, tcp_and_quic, until,
 };
 use inventory_peer::RawPeer;
 use serde_json::{Value, json};
@@ -79,7 +79,7 @@ fn identified(root: &Path) -> Value {
     assert!(learned, "Y never stored X");
     let entry = entry_of(&saved_book(&path, &y), x.id);
     assert_eq!(entry.origin, Origin::Gossip);
-    assert_eq!(entry.addrs, vec![bare(&x.listening())]);
+    assert_eq!(entry.addrs, tcp_and_quic(&x.listening()));
     stage(root, "Y's Peers answer never names Y itself");
     let client = RawPeer::start(None);
     let to = PeerAddress::new(y.id, y.listening()).unwrap();
