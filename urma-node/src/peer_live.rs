@@ -94,6 +94,12 @@ impl PeerSource {
     pub(crate) fn disconnect(&self) {
         let _ = self.link.commands.try_send(Command::Disconnect(self.peer));
     }
+
+    /// Sync no longer needs this peer: its data slot is freed, but a link
+    /// carrying a relay reservation stays (`peer_release`).
+    pub(crate) fn release(&self) {
+        let _ = self.link.commands.try_send(Command::Release(self.peer));
+    }
 }
 
 impl RecordSource for PeerSource {

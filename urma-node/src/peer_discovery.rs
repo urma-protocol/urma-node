@@ -345,8 +345,10 @@ impl Discovery {
     /// before `gossip_error` is taken; the two are never held together.
     fn ask_for_peers(&self, omitting: &[String], budget: &mut Budget) -> Result<bool, Error> {
         let connected: Vec<PeerId> = self
-            .direct_peers()
+            .network
+            .connected_peer_ids()
             .into_iter()
+            .filter(|peer| self.network.can_gossip(*peer))
             .filter(|peer| !omitting.contains(&peer.to_string()))
             .collect();
         let Some(peer) = connected.choose(&mut rand::thread_rng()).copied() else {

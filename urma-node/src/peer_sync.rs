@@ -390,7 +390,7 @@ impl Scheduler {
             return Ok(());
         }
         peer.idle_turns.store(0, Ordering::Relaxed);
-        peer.source.disconnect();
+        peer.source.release();
         peer.hold_off(now, Self::IDLE_BACKOFF)
     }
 
@@ -424,7 +424,7 @@ impl Scheduler {
         let Some((victim, _progress)) = oldest else {
             return Ok(false);
         };
-        victim.source.disconnect();
+        victim.source.release();
         victim.hold_off(now, Self::IDLE_BACKOFF)?;
         Ok(victim.wait_closed(stop, deadline))
     }

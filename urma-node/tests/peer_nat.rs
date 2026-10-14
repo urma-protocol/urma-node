@@ -12,6 +12,7 @@ mod discovery_host;
 #[allow(dead_code)]
 #[path = "common/nat_peer.rs"]
 mod nat_peer;
+use common::{MemorySource, config, witness_block};
 use discovery_host::{
     Node, PUBLIC, bare, discover, host, node, offline, report, run, stage, until,
 };
@@ -19,6 +20,7 @@ use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
 use nat_peer::NatPeer;
 use serde_json::{Value, json};
 use std::{
+    fs,
     net::TcpListener,
     path::Path,
     sync::{Arc, atomic::AtomicBool},
@@ -26,6 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 use urma_node::{
+    engine::Engine,
+    model::Retention,
     peer::{DnsMode, PeerLink, PeerNetwork, ReachMode, Reachability},
     peer_protocol::{Kind, Reply},
     peer_sync::{OverlayInfo, PeerSync},
@@ -43,7 +47,23 @@ const IDLE: Duration = Duration::from_secs(45);
 /// A node whose reachability is fixed. A public one announces its listener,
 /// as AutoNAT would have confirmed it: relay reservations carry that address.
 fn forced(root: &Path, name: &str, ip: &str, reachability: Reachability) -> Node {
-    let engine = offline(root, name);
+    forced_on(offline(root, name), ip, reachability)
+}
+
+/// An archive with headers selected on the one-block chain `offline` names:
+/// inventory sync contacts its peers instead of skipping every step.
+fn chained(root: &Path, name: &str) -> Arc<Engine> {
+    let directory = root.join(name);
+    fs::create_dir_all(&directory).unwrap();
+    let block = witness_block(&[], None, 1);
+    let source = Arc::new(MemorySource::new(std::slice::from_ref(&block)));
+    let config = config(&block, Retention::Unpruned);
+    let engine = Engine::open(&directory, config, Some(source)).unwrap();
+    engine.synchronize_headers().unwrap();
+    Arc::new(engine)
+}
+
+fn forced_on(engine: Arc<Engine>, ip: &str, reachability: Reachability) -> Node {
     let key = Keypair::generate_ed25519();
     let id = key.public().to_peer_id();
     let port = TcpListener::bind((ip, 0))
@@ -218,11 +238,12 @@ fn holders(root: &Path) -> Value {
 }
 
 /// B runs as the daemon does (service with inventory sync and discovery) with
-/// only P as its seed. Once B reserves on P, the reservation must hold across
-/// sync steps: releasing an idle sync peer must not drop the relay connection.
+/// only P as its seed, both on one selected chain, so sync asks P, hears
+/// nothing new and releases it as idle. The release frees P's data slot but
+/// keeps the connection that carries B's reservation.
 fn daemon(root: &Path) -> Value {
-    let p = forced(root, "p", PUBLIC[0], Reachability::Public);
-    let b = forced(root, "b", PUBLIC[1], Reachability::Private);
+    let p = forced_on(chained(root, "p"), PUBLIC[0], Reachability::Public);
+    let b = forced_on(chained(root, "b"), PUBLIC[1], Reachability::Private);
     let mut book = PeerBook::empty(b.genesis());
     book.add(p.listening(), Origin::Seed).unwrap();
     let (discovery, _) = discover(root, "b", &b, book);
@@ -237,16 +258,24 @@ fn daemon(root: &Path) -> Value {
         peers: b.network.sync_peers(Vec::new()),
         info,
     };
-    let service = Service::bind("127.0.0.1:0".parse().unwrap(), TOKEN.into(), b.engine.clone())
-        .unwrap()
-        .with_peer_sync(sync)
-        .unwrap()
-        .with_discovery(discovery)
-        .unwrap();
+    let service = Service::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN.into(),
+        b.engine.clone(),
+    )
+    .unwrap()
+    .with_peer_sync(sync)
+    .unwrap()
+    .with_discovery(discovery)
+    .unwrap();
     let handle = service.shutdown_handle();
     let worker = thread::spawn(move || service.run(true));
     stage(root, "the daemon reaches P and reserves on it");
     let reserved = until(Duration::from_secs(30), || b.network.relays() == vec![p.id]);
+    stage(root, "idle sync releases P's data slot, not its connection");
+    let demoted = until(Duration::from_secs(30), || {
+        !b.network.has_direct(p.id) && b.connected().contains(&p.id)
+    });
     stage(root, "the reservation holds across sync steps");
     let held = (0..60).all(|_| {
         thread::sleep(Duration::from_millis(500));
@@ -254,7 +283,7 @@ fn daemon(root: &Path) -> Value {
     });
     handle.request();
     assert!(worker.join().unwrap().is_ok());
-    json!({"reserved":reserved,"held":held})
+    json!({"reserved":reserved,"demoted":demoted,"held":held})
 }
 
 /// P relays for B; returns B's circuit address through P.
@@ -359,6 +388,7 @@ fn peer_nat_host() {
 fn a_daemon_keeps_its_reservation_across_sync_steps() {
     let checks = run(HOST, "daemon");
     assert_eq!(checks["reserved"], true, "{checks}");
+    assert_eq!(checks["demoted"], true, "{checks}");
     assert_eq!(checks["held"], true, "{checks}");
 }
 

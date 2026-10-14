@@ -41,6 +41,9 @@ pub(crate) enum Class {
     Data,
     Auxiliary,
     Holder,
+    /// A data connection released while it carries a relay reservation: off
+    /// the data budget like a holder, but its record handlers stay.
+    Demoted,
     Relayed,
 }
 
@@ -138,6 +141,38 @@ impl Limits {
         }
     }
 
+    /// A released data connection that carries a relay reservation stays
+    /// open, demoted: it frees its data slot.
+    pub(crate) fn demote(&mut self, id: ConnectionId) -> bool {
+        self.reclass(id, Class::Data, Class::Demoted)
+    }
+
+    /// A demoted connection takes a data slot again while one is free and its
+    /// peer holds no other data connection.
+    pub(crate) fn promote(&mut self, id: ConnectionId) -> bool {
+        let Some(&(peer, direction, _)) = self.established.get(&id) else {
+            return false;
+        };
+        let held = self.held(id, peer, direction);
+        let peer_data = self.established.iter().any(|(known, (other, _, class))| {
+            *known != id && *other == peer && *class == Class::Data
+        });
+        let room = held.data < ESTABLISHED_TOTAL && held.data_direction < ESTABLISHED_PER_DIRECTION;
+        room && !peer_data && self.reclass(id, Class::Demoted, Class::Data)
+    }
+
+    fn reclass(&mut self, id: ConnectionId, from: Class, to: Class) -> bool {
+        let Some(entry) = self.established.get_mut(&id) else {
+            return false;
+        };
+        if entry.2 != from {
+            return false;
+        }
+        entry.2 = to;
+        self.classes.set(id, to);
+        true
+    }
+
     fn remove_pending(&mut self, id: ConnectionId) {
         self.pending_in.remove(&id);
         self.pending_out.remove(&id);
@@ -160,7 +195,7 @@ impl Limits {
                     held.data_direction += usize::from(*held_direction == direction);
                     held.peer_direct |= same;
                 }
-                Class::Holder => {
+                Class::Holder | Class::Demoted => {
                     held.holders += 1;
                     held.peer_direct |= same;
                 }
@@ -598,6 +633,54 @@ mod tests {
         }
         let outbound = admit(&mut limits, id(51), PeerId::random(), Direction::Outbound);
         assert!(outbound.is_err(), "we never dial past the data budget");
+    }
+
+    #[test]
+    fn a_demoted_connection_frees_its_data_slot_and_takes_one_back_only_when_free() {
+        let mut limits = Limits::default();
+        let kept = PeerId::random();
+        admit(&mut limits, id(0), kept, Direction::Outbound).unwrap();
+        established(&mut limits, id(0), kept, Direction::Outbound);
+        for value in 1..ESTABLISHED_PER_DIRECTION {
+            let peer = PeerId::random();
+            admit(&mut limits, id(value), peer, Direction::Outbound).unwrap();
+            established(&mut limits, id(value), peer, Direction::Outbound);
+        }
+        assert!(admit(&mut limits, id(20), PeerId::random(), Direction::Outbound).is_err());
+        assert!(limits.demote(id(0)));
+        assert!(!limits.demote(id(0)), "only a data connection is demoted");
+        assert_eq!(class(&limits, id(0)), Class::Demoted);
+        let newcomer = PeerId::random();
+        admit(&mut limits, id(20), newcomer, Direction::Outbound).unwrap();
+        established(&mut limits, id(20), newcomer, Direction::Outbound);
+        assert_eq!(
+            class(&limits, id(20)),
+            Class::Data,
+            "the freed slot is reused"
+        );
+        assert!(!limits.promote(id(0)), "no data slot is free");
+        close(&mut limits, id(20), newcomer, Direction::Outbound);
+        assert!(limits.promote(id(0)));
+        assert_eq!(class(&limits, id(0)), Class::Data);
+        assert!(
+            !limits.promote(id(0)),
+            "only a demoted connection is promoted"
+        );
+    }
+
+    #[test]
+    fn a_demoted_peer_is_still_direct_for_admission() {
+        let mut limits = Limits::default();
+        let peer = PeerId::random();
+        admit(&mut limits, id(1), peer, Direction::Outbound).unwrap();
+        established(&mut limits, id(1), peer, Direction::Outbound);
+        assert!(limits.demote(id(1)));
+        assert!(
+            admit(&mut limits, id(2), peer, Direction::Outbound).is_err(),
+            "a second direct dial is a duplicate, not a new data connection"
+        );
+        admit(&mut limits, id(3), peer, Direction::Inbound).unwrap();
+        assert_eq!(class(&limits, id(3)), Class::Auxiliary);
     }
 
     #[test]

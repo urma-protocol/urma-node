@@ -15,6 +15,7 @@ use crate::{
     peer_protocol::{GossipPeer, InventoryPage, Kind, Reply, Request, Response, VERSION},
     peer_rate::{Bucket, Count, peer_rate},
     peer_reach::{Reach, Remotes, validate_announce},
+    peer_release::{maintain as release_idle, release},
     peer_transport::{Wiring, swarm},
     peerbook::PeerAddress,
 };
@@ -70,6 +71,8 @@ pub(crate) enum Command {
     Fetch(Fetch),
     /// Fire and forget: frees the slot held by a peer whose reply was rejected.
     Disconnect(PeerId),
+    /// Fire and forget: sync no longer needs the peer (`peer_release`).
+    Release(PeerId),
     Dial(Dial),
 }
 
@@ -421,18 +424,25 @@ async fn run(
                 for value in pending.values_mut() {
                     if Instant::now() >= value.deadline {
                         value.answer.fail(Error::Busy("peer acquisition deadline".into()));
-                        Reach::release(&mut swarm, value.peer, &shared.nat);
+                        release((&mut swarm, &mut remotes), &shared, value.peer);
                     }
                 }
                 dials.expire();
                 reach.maintain(&mut swarm, &remotes, &shared.nat);
+                release_idle((&mut swarm, &mut remotes), &shared);
             }
             command = commands.recv() => {
                 let command = match command {
                     Some(Command::Fetch(fetch)) => fetch,
                     // A Fetch queued for this peer since the rejection keeps its connection.
                     Some(Command::Disconnect(peer)) => {
-                        if !pending.values().any(|p| p.peer == peer) { Reach::release(&mut swarm, peer, &shared.nat); }
+                        if !pending.values().any(|p| p.peer == peer) && swarm.disconnect_peer_id(peer).is_err() {
+                            tracing::debug!(%peer, "disconnected peer had no connection");
+                        }
+                        continue;
+                    }
+                    Some(Command::Release(peer)) => {
+                        if !pending.values().any(|p| p.peer == peer) { release((&mut swarm, &mut remotes), &shared, peer); }
                         continue;
                     }
                     Some(Command::Dial(dial)) => { dials.start(&mut swarm, dial); continue; }

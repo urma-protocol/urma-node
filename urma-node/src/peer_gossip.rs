@@ -204,6 +204,14 @@ impl Shared {
             .is_some_and(|links| links.data > 0)
     }
 
+    /// Whether the peer can answer Peers gossip: a data connection, or one
+    /// demoted from data that kept its record handlers.
+    pub(crate) fn can_gossip(&self, peer: PeerId) -> bool {
+        guard(&self.connected)
+            .get(&peer)
+            .is_some_and(|links| links.data > 0 || links.demoted > 0)
+    }
+
     /// Connected peers that have a link (`Links::link`), sorted by peer.
     pub(crate) fn links(&self) -> Vec<(PeerId, PeerLink)> {
         guard(&self.connected)
@@ -230,6 +238,20 @@ impl Shared {
         if links.inbound == 0 && links.outbound == 0 {
             connected.remove(&peer);
         }
+    }
+
+    /// One open connection of the peer changed class (a demotion or promotion).
+    pub(crate) fn reclassed(&self, peer: PeerId, outbound: bool, (from, to): (Class, Class)) {
+        if let Some(links) = guard(&self.connected).get_mut(&peer) {
+            links.count(outbound, from, false);
+            links.count(outbound, to, true);
+        }
+    }
+
+    pub(crate) fn is_on_chain(&self, peer: PeerId) -> bool {
+        guard(&self.connected)
+            .get(&peer)
+            .is_some_and(|links| links.on_chain)
     }
 
     /// A message carrying this protocol version and our genesis came from or
@@ -621,6 +643,11 @@ impl PeerNetwork {
     /// carry data.
     pub fn has_direct(&self, peer: PeerId) -> bool {
         self.shared.has_direct(peer)
+    }
+
+    /// Whether Peers gossip can ride an open connection to the peer.
+    pub fn can_gossip(&self, peer: PeerId) -> bool {
+        self.shared.can_gossip(peer)
     }
 
     pub fn reachability(&self) -> Reachability {

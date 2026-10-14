@@ -35,6 +35,7 @@ pub(crate) struct Remote {
     pub(crate) outbound: bool,
     pub(crate) class: Class,
     since: Instant,
+    demoted: Option<Instant>,
 }
 
 /// Live connections by id. The class is kept here because admission forgets
@@ -63,6 +64,7 @@ impl Remotes {
             outbound: endpoint.is_dialer(),
             class,
             since: Instant::now(),
+            demoted: None,
         };
         self.0.insert(id, remote);
         class
@@ -100,7 +102,7 @@ impl Remotes {
         match class {
             Class::Data => self.relayed_of(peer),
             Class::Relayed if direct => vec![id],
-            Class::Relayed | Class::Auxiliary | Class::Holder => Vec::new(),
+            Class::Relayed | Class::Auxiliary | Class::Holder | Class::Demoted => Vec::new(),
         }
     }
 
@@ -111,6 +113,45 @@ impl Remotes {
             .iter()
             .filter(|(_, remote)| remote.class == Class::Holder && remote.since.elapsed() >= grace)
             .map(|(id, remote)| (*id, remote.peer))
+            .collect()
+    }
+
+    /// The peer's data connections, with whether we dialed each.
+    pub(crate) fn data_of(&self, peer: PeerId) -> Vec<(ConnectionId, bool)> {
+        self.0
+            .iter()
+            .filter(|(_, remote)| remote.peer == peer && remote.class == Class::Data)
+            .map(|(id, remote)| (*id, remote.outbound))
+            .collect()
+    }
+
+    pub(crate) fn reclass(&mut self, id: ConnectionId, class: Class) {
+        if let Some(remote) = self.0.get_mut(&id) {
+            remote.class = class;
+            remote.demoted = (class == Class::Demoted).then(Instant::now);
+        }
+    }
+
+    /// Peers whose data connection has been open `grace` without the peer
+    /// proving it speaks this protocol on our chain.
+    pub(crate) fn unproven(&self, grace: Duration, proven: impl Fn(PeerId) -> bool) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = self
+            .0
+            .values()
+            .filter(|remote| remote.class == Class::Data && remote.since.elapsed() >= grace)
+            .map(|remote| remote.peer)
+            .filter(|peer| !proven(*peer))
+            .collect();
+        peers.dedup();
+        peers
+    }
+
+    /// Connections demoted at least `grace` ago, with peer and direction.
+    pub(crate) fn demoted_after(&self, grace: Duration) -> Vec<(ConnectionId, PeerId, bool)> {
+        self.0
+            .iter()
+            .filter(|(_, remote)| remote.demoted.is_some_and(|at| at.elapsed() >= grace))
+            .map(|(id, remote)| (*id, remote.peer, remote.outbound))
             .collect()
     }
 
@@ -128,15 +169,19 @@ impl Remotes {
             .collect()
     }
 
-    /// Public peers we hold an outbound data connection to, oldest first, with
-    /// the address we reached them on (without `/p2p`).
+    fn candidate(remote: &Remote) -> bool {
+        remote.outbound
+            && matches!(remote.class, Class::Data | Class::Demoted)
+            && is_public(&remote.address)
+    }
+
+    /// Public peers we hold an outbound data (or demoted) connection to,
+    /// oldest first, with the address we reached them on (without `/p2p`).
     fn relay_candidates(&self) -> Vec<(PeerId, Multiaddr)> {
         let mut candidates: Vec<(&ConnectionId, &Remote)> = self
             .0
             .iter()
-            .filter(|(_, remote)| {
-                remote.outbound && remote.class == Class::Data && is_public(&remote.address)
-            })
+            .filter(|(_, remote)| Self::candidate(remote))
             .collect();
         candidates.sort_by_key(|(id, _)| **id);
         candidates
@@ -403,24 +448,11 @@ impl Reach {
         }
     }
 
-    /// Closes the connections to `peer` that sync or a stalled request
-    /// released, unless one carries a relay reservation, ours on it or its on
-    /// us: that link outlives idle data (a private node is reachable only
-    /// through it).
-    pub(crate) fn release(swarm: &mut Swarm<Behaviour>, peer: PeerId, nat: &Nat) {
-        if nat.relays().contains(&peer) || nat.reserved_by_others().contains(&peer) {
-            tracing::debug!(%peer, "idle peer kept: it carries a relay reservation");
-            return;
-        }
-        if swarm.disconnect_peer_id(peer).is_err() {
-            tracing::debug!(%peer, "released peer was already disconnected");
-        }
-    }
-
-    /// A connection admitted past the data budget as a reservation holder
-    /// must reserve, or ride a circuit, within the grace period.
+    /// A holder connection, admitted past the data budget, must carry a
+    /// reservation (either way) or ride a circuit within the grace period.
     fn retire_holders(&self, swarm: &mut Swarm<Behaviour>, remotes: &Remotes, nat: &Nat) {
-        let holding = nat.reserved_by_others();
+        let mut holding = nat.reserved_by_others();
+        holding.extend(nat.relays());
         for (id, peer) in remotes.holders_after(Self::HOLDER_GRACE) {
             if !holding.contains(&peer) && !self.circuits.contains_key(&peer) {
                 tracing::debug!(%peer, "reservation holder never reserved; closing");
