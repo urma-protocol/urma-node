@@ -85,8 +85,8 @@ jobs:
           docker run -d --name init --privileged \
             -v "$PWD/bins:/bins:ro" -v "$PWD/.github/scripts:/scripts:ro" \
             ghcr.io/void-linux/void-glibc-full:latest \
-            sh -c '[ -e /var/service ] || ln -s /etc/runit/runsvdir/default /var/service; exec runsvdir -P /var/service'
-          docker exec init sh -c 'command -v sv && command -v chpst && command -v svlogd'
+            sh -c 'rm -f /var/service && ln -s /etc/runit/runsvdir/default /var/service && exec runsvdir -P /var/service'
+          docker exec init sh -c 'command -v sv && command -v chpst && command -v svlogd && ls -la /var/service'
           docker exec init sh /scripts/init-test.sh runit /etc/sv/urma-node/run
 
   nsis:
