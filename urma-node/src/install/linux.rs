@@ -61,6 +61,13 @@ fn foreign() -> Error {
     Error::Failed("the Windows service manager exists only on Windows".into())
 }
 
+fn remove_present(path: &Path) -> Result<(), Error> {
+    if path.is_symlink() || path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn file(path: &str, content: String, mode: u32) -> AdapterFile {
     AdapterFile {
         path: PathBuf::from(path),
@@ -207,7 +214,7 @@ impl<R: Runner> System<R> {
             Init::Openrc => {
                 self.exec("rc-service", &[Account::NAME, "restart"])?;
             }
-            Init::Runit => match self.runit_links().is_empty() {
+            Init::Runit => match self.runit_links()?.is_empty() {
                 true => self.link_runit()?,
                 false => {
                     self.exec("sv", &["restart", Adapter::RUNIT_DIR])?;
@@ -222,7 +229,7 @@ impl<R: Runner> System<R> {
         match init {
             Init::Systemd => {
                 self.exec("systemctl", &["disable", "--now", Adapter::UNIT])?;
-                fs::remove_file(self.at(Path::new(Adapter::SYSTEMD_UNIT)))?;
+                remove_present(&self.at(Path::new(Adapter::SYSTEMD_UNIT)))?;
                 self.exec("systemctl", &["daemon-reload"])?;
             }
             Init::Openrc => {
@@ -230,22 +237,25 @@ impl<R: Runner> System<R> {
                 if self.at(Path::new(Adapter::OPENRC_ENABLED)).is_symlink() {
                     self.exec("rc-update", &["del", Account::NAME, "default"])?;
                 }
-                fs::remove_file(self.at(Path::new(Adapter::OPENRC_SCRIPT)))?;
+                remove_present(&self.at(Path::new(Adapter::OPENRC_SCRIPT)))?;
             }
             Init::Runit => {
                 let supervised = self.at(Path::new(Adapter::RUNIT_SUPERVISED)).exists();
                 if supervised {
                     self.exec("sv", &["-w", "30", "down", Adapter::RUNIT_DIR])?;
                 }
-                for link in self.runit_links() {
-                    fs::remove_file(link)?;
+                for link in self.runit_links()? {
+                    remove_present(&link)?;
                 }
                 if supervised {
                     self.query("sv", &["exit", Adapter::RUNIT_LOG_SERVICE])?;
                     self.query("sv", &["exit", Adapter::RUNIT_DIR])?;
                     self.await_runsv_exit()?;
                 }
-                fs::remove_dir_all(self.at(Path::new(Adapter::RUNIT_DIR)))?;
+                let dir = self.at(Path::new(Adapter::RUNIT_DIR));
+                if dir.is_dir() && !dir.is_symlink() {
+                    fs::remove_dir_all(dir)?;
+                }
             }
             Init::Windows => return Err(foreign()),
         }
@@ -269,12 +279,23 @@ impl<R: Runner> System<R> {
         )))
     }
 
-    fn runit_links(&self) -> Vec<PathBuf> {
-        Adapter::RUNIT_SERVICE_DIRS
-            .iter()
-            .map(|dir| self.at(&Path::new(dir).join(Account::NAME)))
+    fn runit_links(&self) -> Result<Vec<PathBuf>, Error> {
+        let mut parents: Vec<PathBuf> = Vec::new();
+        for dir in Adapter::RUNIT_SERVICE_DIRS {
+            let active = self.at(Path::new(dir));
+            if !active.is_dir() {
+                continue;
+            }
+            let parent = fs::canonicalize(&active)?;
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+        Ok(parents
+            .into_iter()
+            .map(|parent| parent.join(Account::NAME))
             .filter(|link| link.is_symlink())
-            .collect()
+            .collect())
     }
 
     fn link_runit(&self) -> Result<(), Error> {
@@ -309,7 +330,7 @@ impl<R: Runner> System<R> {
             Init::Runit => {
                 let status = self.query("sv", &["status", Adapter::RUNIT_DIR])?;
                 (
-                    !self.runit_links().is_empty(),
+                    !self.runit_links()?.is_empty(),
                     status.stdout.starts_with("run:"),
                 )
             }

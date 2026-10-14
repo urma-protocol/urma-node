@@ -465,6 +465,40 @@ fn the_windows_adapter_is_refused_before_any_change() -> Result<(), Error> {
 }
 
 #[test]
+fn aliased_runit_service_dirs_are_unlinked_once_and_uninstall_repeats() -> Result<(), Error> {
+    let lab = Lab::new(&["run/runit", "etc/runit/runsvdir/default"], &RUNIT)?;
+    fs::create_dir_all(lab.path("var"))?;
+    symlink("../etc/runit/runsvdir/default", lab.path("var/service"))?;
+    let mut system = lab.system(NOBODY, "")?;
+    install(&mut system)?;
+    let link = lab.path("etc/runit/runsvdir/default/urma-node");
+    assert!(link.is_symlink());
+    fs::create_dir_all(lab.path("etc/sv/urma-node/supervise"))?;
+    fs::write(lab.path("etc/sv/urma-node/supervise/ok"), "")?;
+    for _ in 0..2 {
+        system.execute(Action::Uninstall { purge: false }, &mut Vec::new())?;
+        assert!(!link.is_symlink());
+        assert!(!lab.path("etc/sv/urma-node").exists());
+        assert_eq!(system.registration()?, Registration::Absent);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_second_uninstall_succeeds() -> Result<(), Error> {
+    let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
+    let mut system = lab.system(NOBODY, "")?;
+    install(&mut system)?;
+    for purge in [false, false, true, true] {
+        system.execute(Action::Uninstall { purge }, &mut Vec::new())?;
+        assert_eq!(system.registration()?, Registration::Absent);
+        assert!(!lab.path("etc/systemd/system/urma-node.service").exists());
+    }
+    assert!(!lab.path("var/lib/urma-node").exists());
+    Ok(())
+}
+
+#[test]
 fn update_without_a_registration_fails() -> Result<(), Error> {
     let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
     let mut system = lab.system(NOBODY, "")?;
