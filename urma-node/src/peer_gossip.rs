@@ -7,6 +7,7 @@ use crate::{
         Answer, Behaviour, CALL_TIMEOUT, Command, PeerNetwork, Pending, bind_response, request,
     },
     peer_limits::LimitDenied,
+    peer_nat::{HolePunch, Nat, PeerLink, Reachability},
     peer_protocol::{
         GossipPeer, Kind, PEER_ADDRESSES_MAX, PEERS_LIMIT, PEERS_MAX, Reply, Response,
     },
@@ -39,18 +40,30 @@ pub(crate) struct Shared {
     connected: Mutex<BTreeMap<PeerId, Links>>,
     identified: Mutex<VecDeque<(PeerId, Vec<Multiaddr>)>>,
     listening: Mutex<Vec<Multiaddr>>,
+    pub(crate) nat: Nat,
 }
 
-/// Established connections of one peer by direction, and whether it has
-/// spoken this protocol version on our chain over any of them.
+/// Established connections of one peer by direction, how many of them ride a
+/// relay circuit, and whether it has spoken this protocol version on our
+/// chain over any of them.
 #[derive(Default)]
 struct Links {
     inbound: u32,
     outbound: u32,
+    relayed: u32,
     on_chain: bool,
 }
 
-fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+impl Links {
+    fn link(&self) -> PeerLink {
+        match self.inbound + self.outbound > self.relayed {
+            true => PeerLink::Direct,
+            false => PeerLink::Relayed,
+        }
+    }
+}
+
+pub(crate) fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     match lock.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -123,6 +136,7 @@ impl Shared {
             connected: Mutex::new(BTreeMap::new()),
             identified: Mutex::new(VecDeque::new()),
             listening: Mutex::new(Vec::new()),
+            nat: Nat::default(),
         }
     }
 
@@ -198,17 +212,37 @@ impl Shared {
             .collect()
     }
 
-    pub(crate) fn opened(&self, peer: PeerId, outbound: bool) {
+    /// Whether one of the peer's connections is direct. Only such peers may
+    /// carry records, inventory, parents or objects.
+    pub(crate) fn has_direct(&self, peer: PeerId) -> bool {
+        guard(&self.connected)
+            .get(&peer)
+            .is_some_and(|links| links.link() == PeerLink::Direct)
+    }
+
+    /// Every connected peer with its link (direct when any connection is,
+    /// relayed when all ride a circuit), sorted by peer.
+    pub(crate) fn links(&self) -> Vec<(PeerId, PeerLink)> {
+        guard(&self.connected)
+            .iter()
+            .map(|(peer, links)| (*peer, links.link()))
+            .collect()
+    }
+
+    pub(crate) fn opened(&self, peer: PeerId, outbound: bool, link: PeerLink) {
         let mut connected = guard(&self.connected);
         let links = connected.entry(peer).or_default();
         match outbound {
             true => links.outbound += 1,
             false => links.inbound += 1,
         }
+        if link == PeerLink::Relayed {
+            links.relayed += 1;
+        }
     }
 
     /// The peer leaves with its last connection, chain proof included.
-    pub(crate) fn closed(&self, peer: PeerId, outbound: bool) {
+    pub(crate) fn closed(&self, peer: PeerId, outbound: bool, link: PeerLink) {
         let mut connected = guard(&self.connected);
         let Some(links) = connected.get_mut(&peer) else {
             return;
@@ -216,6 +250,9 @@ impl Shared {
         match outbound {
             true => links.outbound = links.outbound.saturating_sub(1),
             false => links.inbound = links.inbound.saturating_sub(1),
+        }
+        if link == PeerLink::Relayed && links.relayed > 0 {
+            links.relayed -= 1;
         }
         if links.inbound == 0 && links.outbound == 0 {
             connected.remove(&peer);
@@ -579,6 +616,45 @@ impl PeerNetwork {
     /// Peers with at least one established connection right now, sorted.
     pub fn connected_peer_ids(&self) -> Vec<PeerId> {
         self.shared.connected()
+    }
+
+    /// Connected peers with their link, sorted by peer.
+    pub fn peer_links(&self) -> Vec<(PeerId, PeerLink)> {
+        self.shared.links()
+    }
+
+    /// Whether the peer holds a direct connection; relayed-only peers never
+    /// carry data.
+    pub fn has_direct(&self, peer: PeerId) -> bool {
+        self.shared.has_direct(peer)
+    }
+
+    pub fn reachability(&self) -> Reachability {
+        self.shared.nat.reachability()
+    }
+
+    /// Addresses advertised to peers: AutoNAT-confirmed or announced.
+    pub fn external_addresses(&self) -> Vec<Multiaddr> {
+        self.shared.nat.external()
+    }
+
+    /// Relays holding an active reservation for this node.
+    pub fn relays(&self) -> Vec<PeerId> {
+        self.shared.nat.relays()
+    }
+
+    /// Peers holding an active reservation on this node's relay server.
+    pub fn reserved_by_others(&self) -> Vec<PeerId> {
+        self.shared.nat.reserved_by_others()
+    }
+
+    /// This node's `/p2p-circuit` listen addresses through its relays.
+    pub fn circuit_addresses(&self) -> Vec<Multiaddr> {
+        self.shared.nat.circuits()
+    }
+
+    pub(crate) fn hole_punch(&self) -> HolePunch {
+        self.shared.nat.hole_punch()
     }
 
     /// Connected peers' own literal public addresses learned through identify

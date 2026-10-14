@@ -12,6 +12,7 @@ use crate::{
     peer_inventory::{lookup, validate_inventory},
     peer_limits::LimitDenied,
     peer_live::Link,
+    peer_nat::PeerLink,
     peer_parent::{Parent, validate_parent},
     peer_protocol::{GossipPeer, InventoryPage, Kind, Reply, Request, Response, VERSION},
     peer_rate::{Bucket, Count, peer_rate},
@@ -460,14 +461,14 @@ async fn run(
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
                     remotes.0.insert(connection_id, (endpoint.get_remote_address().clone(), endpoint.is_dialer()));
                     dials.established(connection_id, peer_id);
-                    shared.opened(peer_id, endpoint.is_dialer());
+                    shared.opened(peer_id, endpoint.is_dialer(), PeerLink::of(endpoint.get_remote_address()));
                     if num_established.get() == 1 {
                         connected.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, num_established, .. } => {
                     remotes.0.remove(&connection_id);
-                    shared.closed(peer_id, endpoint.is_dialer());
+                    shared.closed(peer_id, endpoint.is_dialer(), PeerLink::of(endpoint.get_remote_address()));
                     if num_established == 0 {
                         connected.fetch_sub(1, Ordering::Relaxed);
                     }
