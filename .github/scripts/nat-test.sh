@@ -40,7 +40,7 @@ control() {
 status() { control "$1" status; }
 
 diagnose() {
-    echo "--- diagnostics ($mode)"
+    echo "--- diagnostics ($mode), events seen: ${!seen[*]}"
     for node in "${NODES[@]}"; do
         echo "--- $node ${id[$node]:-} status (pid ${pid[$node]:-none})"
         kill -0 "${pid[$node]:-}" 2>/dev/null || echo "$node is not running"
@@ -211,6 +211,17 @@ nothing_synced() { [ "$(peer a b | jq .synced_through)" = null ]; }
 
 either() { "$1" a || "$1" b; }
 
+# A direct A-B link may be released once sync idles: latch every event
+# the moment one poll sees it.
+declare -A seen
+cone_events() {
+    linked a b direct && seen[a-b]=1
+    linked b a direct && seen[b-a]=1
+    either punched && seen[punched]=1
+    synced && seen[synced]=1
+    [ "${#seen[@]}" -eq 4 ]
+}
+
 topology
 for node in "${NODES[@]}"; do
     mkdir -m 700 "$work/$node"
@@ -232,17 +243,17 @@ wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p
 
 case $mode in
 cone)
-    wait_for 180 "direct A-B link" eval 'linked a b direct && linked b a direct'
-    wait_for 60 "hole punch success recorded" either punched
-    wait_for 120 "A syncs B's inventory over the direct link" synced
+    wait_for 240 "direct A-B link, hole punch success, A synced B's inventory" cone_events
     ;;
 symmetric)
     wait_for 180 "hole punch failure recorded" either punch_failed
-    sleep 30
-    if linked a b direct || linked b a direct; then
-        echo "direct A-B link through symmetric NAT" >&2
-        exit 1
-    fi
+    for _ in $(seq 15); do
+        if linked a b direct || linked b a direct; then
+            echo "direct A-B link through symmetric NAT" >&2
+            exit 1
+        fi
+        sleep 2
+    done
     nothing_synced || { echo "A synced from B without a direct link" >&2; exit 1; }
     echo "ok: no direct link, nothing synced over the relay"
     ;;
