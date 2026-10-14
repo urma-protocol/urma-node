@@ -6,7 +6,7 @@ use crate::{
     peer::{
         Answer, Behaviour, CALL_TIMEOUT, Command, PeerNetwork, Pending, bind_response, request,
     },
-    peer_limits::LimitDenied,
+    peer_limits::{Class, LimitDenied},
     peer_nat::{HolePunch, Nat, PeerLink, Reachability},
     peer_protocol::{
         GossipPeer, Kind, PEER_ADDRESSES_MAX, PEERS_LIMIT, PEERS_MAX, Reply, Response,
@@ -44,13 +44,14 @@ pub(crate) struct Shared {
 }
 
 /// Established connections of one peer by direction, how many of them ride a
-/// relay circuit, and whether it has spoken this protocol version on our
-/// chain over any of them.
+/// relay circuit and how many may carry data, and whether it has spoken this
+/// protocol version on our chain over any of them.
 #[derive(Default)]
 struct Links {
     inbound: u32,
     outbound: u32,
     relayed: u32,
+    data: u32,
     on_chain: bool,
 }
 
@@ -60,6 +61,28 @@ impl Links {
             true => PeerLink::Direct,
             false => PeerLink::Relayed,
         }
+    }
+
+    fn count(&mut self, outbound: bool, class: Class, opened: bool) {
+        let direction = match outbound {
+            true => &mut self.outbound,
+            false => &mut self.inbound,
+        };
+        step(direction, opened);
+        if class == Class::Relayed {
+            step(&mut self.relayed, opened);
+        }
+        if class == Class::Data {
+            step(&mut self.data, opened);
+        }
+    }
+}
+
+fn step(counter: &mut u32, opened: bool) {
+    match opened {
+        true => *counter += 1,
+        false if *counter > 0 => *counter -= 1,
+        false => (),
     }
 }
 
@@ -212,12 +235,12 @@ impl Shared {
             .collect()
     }
 
-    /// Whether one of the peer's connections is direct. Only such peers may
-    /// carry records, inventory, parents or objects.
+    /// Whether the peer holds a direct data connection: the only kind that
+    /// carries records, inventory, parents or objects (or Peers gossip).
     pub(crate) fn has_direct(&self, peer: PeerId) -> bool {
         guard(&self.connected)
             .get(&peer)
-            .is_some_and(|links| links.link() == PeerLink::Direct)
+            .is_some_and(|links| links.data > 0)
     }
 
     /// Every connected peer with its link (direct when any connection is,
@@ -229,31 +252,21 @@ impl Shared {
             .collect()
     }
 
-    pub(crate) fn opened(&self, peer: PeerId, outbound: bool, link: PeerLink) {
+    pub(crate) fn opened(&self, peer: PeerId, outbound: bool, class: Class) {
         let mut connected = guard(&self.connected);
-        let links = connected.entry(peer).or_default();
-        match outbound {
-            true => links.outbound += 1,
-            false => links.inbound += 1,
-        }
-        if link == PeerLink::Relayed {
-            links.relayed += 1;
-        }
+        connected
+            .entry(peer)
+            .or_default()
+            .count(outbound, class, true);
     }
 
     /// The peer leaves with its last connection, chain proof included.
-    pub(crate) fn closed(&self, peer: PeerId, outbound: bool, link: PeerLink) {
+    pub(crate) fn closed(&self, peer: PeerId, outbound: bool, class: Class) {
         let mut connected = guard(&self.connected);
         let Some(links) = connected.get_mut(&peer) else {
             return;
         };
-        match outbound {
-            true => links.outbound = links.outbound.saturating_sub(1),
-            false => links.inbound = links.inbound.saturating_sub(1),
-        }
-        if link == PeerLink::Relayed && links.relayed > 0 {
-            links.relayed -= 1;
-        }
+        links.count(outbound, class, false);
         if links.inbound == 0 && links.outbound == 0 {
             connected.remove(&peer);
         }

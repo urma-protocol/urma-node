@@ -1,7 +1,14 @@
 //! Fixed connection admission limits for the public record transport.
 //! Compose this behaviour before request-response so denial precedes its setup.
 //! Only pending and established connection IDs are retained, never peer history.
-use crate::DialLimit;
+//!
+//! Every admitted connection gets a class. Data connections (one per peer,
+//! 8 per direction, 16 in total) are the only ones that carry records. The
+//! others have their own budgets and never carry data: one relay circuit per
+//! peer, one auxiliary second direct connection per peer (AutoNAT dial-backs,
+//! crossing hole punch dials), and reservation holders admitted inbound past
+//! the data budget while this node's relay server is open.
+use crate::{DialLimit, peer_gossip::guard, peer_nat::PeerLink};
 use libp2p::{
     Multiaddr, PeerId,
     core::{ConnectedPoint, Endpoint, transport::PortUse},
@@ -14,12 +21,69 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     fmt,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 
 const PENDING_PER_DIRECTION: usize = 4;
 pub(crate) const ESTABLISHED_PER_DIRECTION: usize = 8;
 const ESTABLISHED_TOTAL: usize = 16;
+const RELAYED_MAX: usize = 8;
+const AUXILIARY_MAX: usize = 8;
+const HOLDERS_MAX: usize = 128;
+
+/// What an admitted connection may carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Class {
+    Data,
+    Auxiliary,
+    Holder,
+    Relayed,
+}
+
+impl Class {
+    pub(crate) fn link(self) -> PeerLink {
+        match self {
+            Self::Relayed => PeerLink::Relayed,
+            Self::Data | Self::Auxiliary | Self::Holder => PeerLink::Direct,
+        }
+    }
+}
+
+/// The class of every admitted connection, shared with the behaviours that
+/// fence protocols by it and with the network loop.
+#[derive(Clone, Default)]
+pub(crate) struct Classes(Arc<Mutex<HashMap<ConnectionId, Class>>>);
+
+impl Classes {
+    pub(crate) fn of(&self, id: ConnectionId) -> Option<Class> {
+        guard(&self.0).get(&id).copied()
+    }
+
+    fn set(&self, id: ConnectionId, class: Class) {
+        guard(&self.0).insert(id, class);
+    }
+
+    fn remove(&self, id: ConnectionId) {
+        guard(&self.0).remove(&id);
+    }
+}
+
+/// Classes already held, counted for one admission.
+#[derive(Default)]
+struct Held {
+    data: usize,
+    data_direction: usize,
+    relayed: usize,
+    auxiliary: usize,
+    holders: usize,
+    peer_direct: bool,
+    peer_auxiliary: bool,
+    peer_relayed: bool,
+}
 
 /// Typed local admission refusal, recognisable by downcast instead of text.
 #[derive(Debug)]
@@ -43,7 +107,9 @@ enum Direction {
 pub(crate) struct Limits {
     pending_in: HashSet<ConnectionId>,
     pending_out: HashSet<ConnectionId>,
-    established: HashMap<ConnectionId, (PeerId, Direction)>,
+    established: HashMap<ConnectionId, (PeerId, Direction, Class)>,
+    classes: Classes,
+    relay_open: Arc<AtomicBool>,
 }
 
 fn denied(limit: DialLimit) -> ConnectionDenied {
@@ -60,35 +126,108 @@ fn reserve(pending: &mut HashSet<ConnectionId>, id: ConnectionId) -> Result<(), 
     Ok(())
 }
 
+/// How a connection reached admission: its direction, whether it rides a
+/// relay circuit, and whether we dialed it from a fresh port (AutoNAT
+/// dial-backs do; regular and hole punch dials reuse the listener's).
+#[derive(Clone, Copy)]
+struct Arrival {
+    direction: Direction,
+    link: PeerLink,
+    fresh_port: bool,
+}
+
 impl Limits {
+    /// `relay_open` admits reservation holders past the data budget; the
+    /// network loop sets it while this node's relay server runs.
+    pub(crate) fn new(classes: Classes, relay_open: Arc<AtomicBool>) -> Self {
+        Self {
+            classes,
+            relay_open,
+            ..Self::default()
+        }
+    }
+
     fn remove_pending(&mut self, id: ConnectionId) {
         self.pending_in.remove(&id);
         self.pending_out.remove(&id);
+    }
+
+    fn forget(&mut self, id: ConnectionId) {
+        self.remove_pending(id);
+        self.established.remove(&id);
+        self.classes.remove(id);
+    }
+
+    fn held(&self, id: ConnectionId, peer: PeerId, direction: Direction) -> Held {
+        let mut held = Held::default();
+        let others = self.established.iter().filter(|(known, _)| **known != id);
+        for (held_peer, held_direction, class) in others.map(|(_, value)| value) {
+            let same = *held_peer == peer;
+            match class {
+                Class::Data => {
+                    held.data += 1;
+                    held.data_direction += usize::from(*held_direction == direction);
+                    held.peer_direct |= same;
+                }
+                Class::Holder => {
+                    held.holders += 1;
+                    held.peer_direct |= same;
+                }
+                Class::Auxiliary => {
+                    held.auxiliary += 1;
+                    held.peer_auxiliary |= same;
+                }
+                Class::Relayed => {
+                    held.relayed += 1;
+                    held.peer_relayed |= same;
+                }
+            }
+        }
+        held
+    }
+
+    fn classify(&self, id: ConnectionId, peer: PeerId, arrival: Arrival) -> Result<Class, DialLimit> {
+        let held = self.held(id, peer, arrival.direction);
+        if arrival.link == PeerLink::Relayed {
+            return match (held.peer_relayed, held.relayed >= RELAYED_MAX) {
+                (true, _) => Err(DialLimit::Duplicate),
+                (false, true) => Err(DialLimit::Established),
+                (false, false) => Ok(Class::Relayed),
+            };
+        }
+        if held.peer_direct {
+            let auxiliary = arrival.direction == Direction::Inbound || arrival.fresh_port;
+            return match (auxiliary && !held.peer_auxiliary, held.auxiliary >= AUXILIARY_MAX) {
+                (false, _) => Err(DialLimit::Duplicate),
+                (true, true) => Err(DialLimit::Established),
+                (true, false) => Ok(Class::Auxiliary),
+            };
+        }
+        if held.data < ESTABLISHED_TOTAL && held.data_direction < ESTABLISHED_PER_DIRECTION {
+            return Ok(Class::Data);
+        }
+        let holder = arrival.direction == Direction::Inbound
+            && self.relay_open.load(Ordering::Acquire)
+            && held.holders < HOLDERS_MAX;
+        match holder {
+            true => Ok(Class::Holder),
+            false => Err(DialLimit::Established),
+        }
     }
 
     fn admit(
         &mut self,
         id: ConnectionId,
         peer: PeerId,
-        direction: Direction,
+        arrival: Arrival,
     ) -> Result<dummy::ConnectionHandler, ConnectionDenied> {
         // Handshake completion ends the pending phase even when admission fails.
         self.remove_pending(id);
-        let others = self.established.iter().filter(|(held, _)| **held != id);
-        let mut total = 0;
-        let mut same_direction = 0;
-        for (_, (held_peer, held_direction)) in others {
-            if *held_peer == peer {
-                return Err(denied(DialLimit::Duplicate));
-            }
-            total += 1;
-            same_direction += usize::from(*held_direction == direction);
-        }
-        if total >= ESTABLISHED_TOTAL || same_direction >= ESTABLISHED_PER_DIRECTION {
-            return Err(denied(DialLimit::Established));
-        }
+        let class = self.classify(id, peer, arrival).map_err(denied)?;
         // A later behaviour can still deny this connection. Count it only when
-        // the Swarm confirms establishment, not while constructing handlers.
+        // the Swarm confirms establishment, not while constructing handlers;
+        // the class is published now so fenced behaviours pick their handler.
+        self.classes.set(id, class);
         Ok(dummy::ConnectionHandler)
     }
 }
@@ -121,21 +260,35 @@ impl NetworkBehaviour for Limits {
         &mut self,
         id: ConnectionId,
         peer: PeerId,
-        _: &Multiaddr,
-        _: &Multiaddr,
+        local: &Multiaddr,
+        remote: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        self.admit(id, peer, Direction::Inbound)
+        let relayed = PeerLink::of(local) == PeerLink::Relayed;
+        let arrival = Arrival {
+            direction: Direction::Inbound,
+            link: match relayed {
+                true => PeerLink::Relayed,
+                false => PeerLink::of(remote),
+            },
+            fresh_port: false,
+        };
+        self.admit(id, peer, arrival)
     }
 
     fn handle_established_outbound_connection(
         &mut self,
         id: ConnectionId,
         peer: PeerId,
-        _: &Multiaddr,
+        address: &Multiaddr,
         _: Endpoint,
-        _: PortUse,
+        port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        self.admit(id, peer, Direction::Outbound)
+        let arrival = Arrival {
+            direction: Direction::Outbound,
+            link: PeerLink::of(address),
+            fresh_port: port_use == PortUse::New,
+        };
+        self.admit(id, peer, arrival)
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
@@ -146,22 +299,16 @@ impl NetworkBehaviour for Limits {
                     ConnectedPoint::Listener { .. } => Direction::Inbound,
                     ConnectedPoint::Dialer { .. } => Direction::Outbound,
                 };
+                let Some(class) = self.classes.of(event.connection_id) else {
+                    return;
+                };
                 self.established
                     .entry(event.connection_id)
-                    .or_insert((event.peer_id, direction));
+                    .or_insert((event.peer_id, direction, class));
             }
-            FromSwarm::ConnectionClosed(event) => {
-                self.remove_pending(event.connection_id);
-                self.established.remove(&event.connection_id);
-            }
-            FromSwarm::DialFailure(event) => {
-                self.remove_pending(event.connection_id);
-                self.established.remove(&event.connection_id);
-            }
-            FromSwarm::ListenFailure(event) => {
-                self.remove_pending(event.connection_id);
-                self.established.remove(&event.connection_id);
-            }
+            FromSwarm::ConnectionClosed(event) => self.forget(event.connection_id),
+            FromSwarm::DialFailure(event) => self.forget(event.connection_id),
+            FromSwarm::ListenFailure(event) => self.forget(event.connection_id),
             _ => {}
         }
     }
