@@ -424,7 +424,9 @@ impl Discovery {
         let mut keep = Vec::new();
         let mut changed = false;
         for entry in waiting {
-            let direct = self.network.has_direct(entry.peer);
+            // A punched link released unproven before its probe is demoted,
+            // not gone: the probe still rides it and proves the chain.
+            let direct = self.network.can_gossip(entry.peer);
             let verdict = settle(
                 direct,
                 connected.contains(&entry.peer),
@@ -508,7 +510,12 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::{Discovery, Settle, names_connected, settle};
-    use crate::{Error, error::DialLimit, peer_gossip::probe_closes};
+    use crate::{
+        Error,
+        error::DialLimit,
+        peer_gossip::{Shared, probe_closes},
+        peer_limits::Class,
+    };
     use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
     use std::time::Duration;
 
@@ -558,6 +565,21 @@ mod tests {
         let late = Discovery::CIRCUIT_WAIT + Duration::from_secs(1);
         assert_eq!(settle(true, true, Duration::ZERO), Settle::Probe);
         assert_eq!(settle(true, false, late), Settle::Probe);
+    }
+
+    #[test]
+    fn a_punched_link_demoted_before_its_probe_is_still_probed() {
+        let shared = Shared::new(peer());
+        let remote = peer();
+        shared.opened(remote, false, Class::Relayed);
+        shared.opened(remote, true, Class::Data);
+        shared.reclassed(remote, true, (Class::Data, Class::Demoted));
+        assert!(!shared.has_direct(remote));
+        let late = Discovery::CIRCUIT_WAIT + Duration::from_secs(1);
+        assert_eq!(
+            settle(shared.can_gossip(remote), shared.is_connected(remote), late),
+            Settle::Probe
+        );
     }
 
     #[test]

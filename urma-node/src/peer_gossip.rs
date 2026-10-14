@@ -732,7 +732,7 @@ impl PeerNetwork {
                 }
             }
         };
-        if circuit && !self.has_direct(peer) {
+        if circuit && !self.can_gossip(peer) {
             return Ok(Dialed::Relayed(peer));
         }
         self.probe(peer, cancelled, deadline).map(Dialed::Direct)
