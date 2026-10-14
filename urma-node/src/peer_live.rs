@@ -80,6 +80,11 @@ impl PeerSource {
         self.link.shared.is_connected(self.peer)
     }
 
+    /// Whether it holds a data connection (a slot in our data budget).
+    pub(crate) fn has_data(&self) -> bool {
+        self.link.shared.has_direct(self.peer)
+    }
+
     /// Whether one of its connections is one we dialed.
     pub(crate) fn outbound(&self) -> bool {
         self.link.shared.is_outbound(self.peer)

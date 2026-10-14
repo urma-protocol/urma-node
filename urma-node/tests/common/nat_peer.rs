@@ -45,7 +45,7 @@ type Reported<T> = mpsc::SyncSender<Result<T, String>>;
 
 enum Op {
     Dial(Multiaddr, Reported<PeerId>),
-    Call(PeerId, Kind, Reported<Reply>),
+    Call(PeerId, Kind, Chain, Reported<Reply>),
     Listen(Multiaddr),
 }
 
@@ -128,10 +128,10 @@ fn op(swarm: &mut Swarm<Raw>, waiting: &mut Waiting, op: Op) {
                 Err(error) => drop(answer.try_send(Err(error.to_string()))),
             }
         }
-        Op::Call(peer, kind, answer) => {
+        Op::Call(peer, kind, chain, answer) => {
             let request = Request {
                 version: VERSION,
-                chain_genesis: Chain::BitcoinRegtest.genesis().unwrap().0,
+                chain_genesis: chain.genesis().unwrap().0,
                 kind,
             };
             let id = swarm.behaviour_mut().records.send_request(&peer, request);
@@ -296,8 +296,16 @@ impl NatPeer {
     }
 
     pub fn call(&self, peer: PeerId, kind: Kind) -> Result<Reply, String> {
+        self.call_on(peer, kind, Chain::BitcoinRegtest)
+    }
+
+    /// A request naming `chain`'s genesis: another chain never proves this
+    /// peer speaks ours.
+    pub fn call_on(&self, peer: PeerId, kind: Kind, chain: Chain) -> Result<Reply, String> {
         let (answer, receiver) = mpsc::sync_channel(1);
-        self.ops.try_send(Op::Call(peer, kind, answer)).unwrap();
+        self.ops
+            .try_send(Op::Call(peer, kind, chain, answer))
+            .unwrap();
         receiver.recv_timeout(BOUND).unwrap()
     }
 }

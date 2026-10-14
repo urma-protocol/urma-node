@@ -93,11 +93,11 @@ impl Peer {
         Ok(())
     }
 
-    /// Wait for an evicted connection to close so its slot is really free,
+    /// Wait for an evicted peer's data slot to be freed (demoted or closed),
     /// bounded by `EVICT_WAIT`, the step deadline and cancellation.
     fn wait_closed(&self, stop: &AtomicBool, deadline: Instant) -> bool {
         let until = deadline.min(Instant::now() + Scheduler::EVICT_WAIT);
-        while self.source.connected() {
+        while self.source.has_data() {
             if stop.load(Ordering::Acquire) || Instant::now() >= until {
                 return false;
             }

@@ -141,18 +141,26 @@ impl Limits {
         }
     }
 
-    /// A released data connection that carries a relay reservation stays
-    /// open, demoted: it frees its data slot.
+    /// A released data connection frees its data slot and counts as a holder
+    /// instead; refused (false) once the holder budget is spent.
     pub(crate) fn demote(&mut self, id: ConnectionId) -> bool {
-        self.reclass(id, Class::Data, Class::Demoted)
+        let Some(&(peer, direction, _)) = self.established.get(&id) else {
+            return false;
+        };
+        self.held(id, peer, direction).holders < HOLDERS_MAX
+            && self.reclass(id, Class::Data, Class::Demoted)
     }
 
-    /// A demoted connection takes a data slot again while one is free and its
-    /// peer holds no other data connection.
+    /// A demoted connection we dialed takes a data slot again while one is
+    /// free and its peer holds no other data connection. One that dialed us
+    /// never does: inbound slots go to newcomers.
     pub(crate) fn promote(&mut self, id: ConnectionId) -> bool {
         let Some(&(peer, direction, _)) = self.established.get(&id) else {
             return false;
         };
+        if direction != Direction::Outbound {
+            return false;
+        }
         let held = self.held(id, peer, direction);
         let peer_data = self.established.iter().any(|(known, (other, _, class))| {
             *known != id && *other == peer && *class == Class::Data
@@ -665,6 +673,29 @@ mod tests {
         assert!(
             !limits.promote(id(0)),
             "only a demoted connection is promoted"
+        );
+    }
+
+    #[test]
+    fn demotion_is_capped_by_the_holder_budget_and_inbound_never_returns() {
+        let relay_open = Arc::new(AtomicBool::new(true));
+        let mut limits = Limits::new(Classes::default(), relay_open);
+        for value in 0..HOLDERS_MAX {
+            let (id, peer) = (id(1000 + value), PeerId::random());
+            limits
+                .established
+                .insert(id, (peer, Direction::Inbound, Class::Holder));
+        }
+        let peer = PeerId::random();
+        admit(&mut limits, id(1), peer, Direction::Inbound).unwrap();
+        established(&mut limits, id(1), peer, Direction::Inbound);
+        assert!(!limits.demote(id(1)), "the holder budget is spent");
+        assert_eq!(class(&limits, id(1)), Class::Data);
+        limits.forget(id(1000));
+        assert!(limits.demote(id(1)));
+        assert!(
+            !limits.promote(id(1)),
+            "an inbound demoted link never takes a data slot back"
         );
     }
 

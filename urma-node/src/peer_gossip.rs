@@ -204,9 +204,19 @@ impl Shared {
             .is_some_and(|links| links.data > 0)
     }
 
-    /// Whether the peer can answer Peers gossip: a data connection, or one
-    /// demoted from data that kept its record handlers.
+    /// Whether discovery's uniform pick may ask the peer for Peers: a data
+    /// connection, or one we dialed that was demoted (it kept its record
+    /// handlers). Inbound demoted links are cheap to hold, so they never steer
+    /// what the book learns.
     pub(crate) fn can_gossip(&self, peer: PeerId) -> bool {
+        guard(&self.connected)
+            .get(&peer)
+            .is_some_and(|links| links.data > 0 || links.outbound_demoted > 0)
+    }
+
+    /// Whether the peer holds any direct connection that carries records:
+    /// data, or demoted from data.
+    pub(crate) fn any_direct(&self, peer: PeerId) -> bool {
         guard(&self.connected)
             .get(&peer)
             .is_some_and(|links| links.data > 0 || links.demoted > 0)
@@ -650,6 +660,11 @@ impl PeerNetwork {
         self.shared.can_gossip(peer)
     }
 
+    /// Whether a direct connection that carries records is open to the peer.
+    pub fn any_direct(&self, peer: PeerId) -> bool {
+        self.shared.any_direct(peer)
+    }
+
     pub fn reachability(&self) -> Reachability {
         self.shared.nat.reachability()
     }
@@ -732,7 +747,7 @@ impl PeerNetwork {
                 }
             }
         };
-        if circuit && !self.can_gossip(peer) {
+        if circuit && !self.any_direct(peer) {
             return Ok(Dialed::Relayed(peer));
         }
         self.probe(peer, cancelled, deadline).map(Dialed::Direct)

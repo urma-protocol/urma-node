@@ -30,6 +30,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use urma_chain::observation::Chain;
 use urma_node::{
     engine::Engine,
     model::Retention,
@@ -293,15 +294,39 @@ fn daemon(root: &Path) -> Value {
     json!({"reserved":reserved,"demoted":demoted,"held":held})
 }
 
-/// P's eight inbound data slots hold seven proven peers (private, so they
-/// reserve too), kept busy with Peers requests, and one that reserves but
-/// never speaks the records
-/// protocol. Past the data budget a newcomer is only a holder. Once the
-/// unproven grace passes, the reserving peer is demoted: its reservation and
-/// connection stay, and the slot it held takes the next newcomer as data.
+/// Fillers ask P for Peers every 5 s, proving their chain; the sybil keeps
+/// its link busy with requests for another chain, which prove nothing.
+fn keep_busy(
+    stop: &Arc<AtomicBool>,
+    fillers: &[Node],
+    sybil: &Arc<NatPeer>,
+    p: PeerId,
+) -> thread::JoinHandle<()> {
+    let networks: Vec<Arc<PeerNetwork>> = fillers.iter().map(|f| Arc::clone(&f.network)).collect();
+    let (stop, sybil) = (Arc::clone(stop), Arc::clone(sybil));
+    thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            for network in &networks {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                assert!(network.peers_of(p, 0, &stop, deadline).is_ok());
+            }
+            let foreign = sybil.call_on(p, Kind::Peers { limit: 0 }, Chain::LitecoinTestnet);
+            drop(foreign);
+            thread::sleep(Duration::from_secs(5));
+        }
+    })
+}
+
+/// P's eight inbound data slots hold six proven peers (private, so they
+/// reserve too), one that reserves but never speaks the records protocol, and
+/// a sybil that neither reserves nor proves its chain but keeps its link busy.
+/// Past the data budget a newcomer is only a holder. Once the unproven grace
+/// passes both are demoted: the reserving peer keeps its connection, the sybil
+/// is closed after the holder grace however busy, and a freed slot takes the
+/// next newcomer as data.
 fn unproven(root: &Path) -> Value {
     let p = forced(root, "p", PUBLIC[0], Reachability::Public);
-    let fillers: Vec<Node> = (0..7).map(|n| node(root, &format!("f{n}"), None)).collect();
+    let fillers: Vec<Node> = (0..6).map(|n| node(root, &format!("f{n}"), None)).collect();
     for filler in &fillers {
         assert_eq!(filler.dial(p.listening()), p.id);
     }
@@ -311,38 +336,24 @@ fn unproven(root: &Path) -> Value {
     let reserved = until(Duration::from_secs(5), || {
         p.network.reserved_by_others().contains(&reserving.id)
     });
-    let stop = Arc::new(AtomicBool::new(false));
-    let busy = {
-        let (stop, networks, target) = (
-            Arc::clone(&stop),
-            fillers
-                .iter()
-                .map(|f| Arc::clone(&f.network))
-                .collect::<Vec<_>>(),
-            p.id,
-        );
-        thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                for network in &networks {
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    assert!(network.peers_of(target, 0, &stop, deadline).is_ok());
-                }
-                thread::sleep(Duration::from_secs(5));
-            }
-        })
-    };
+    let sybil = Arc::new(NatPeer::start(None, false));
+    assert_eq!(sybil.dial(p.listening()), Ok(p.id));
     stage(root, "past the data budget a newcomer is only a holder");
     let early = NatPeer::start(None, false);
     assert_eq!(early.dial(p.listening()), Ok(p.id));
     let full = until(Duration::from_secs(2), || p.connected().contains(&early.id))
         && !p.network.has_direct(early.id);
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = keep_busy(&stop, &fillers, &sybil, p.id);
     stage(root, "the unproven reserving peer is demoted, not closed");
     let demoted = until(Duration::from_secs(80), || {
         !p.network.has_direct(reserving.id)
     });
     let kept =
         reserving.connections(p.id) == 1 && p.network.reserved_by_others().contains(&reserving.id);
-    stage(root, "its data slot takes the next newcomer");
+    stage(root, "the busy sybil is closed, never promoted back");
+    let sybil_closed = until(Duration::from_secs(20), || sybil.connections(p.id) == 0);
+    stage(root, "a freed data slot takes the next newcomer");
     let late = NatPeer::start(None, false);
     assert_eq!(late.dial(p.listening()), Ok(p.id));
     let reused = until(Duration::from_secs(5), || p.network.has_direct(late.id));
@@ -351,7 +362,7 @@ fn unproven(root: &Path) -> Value {
     busy.join().unwrap();
     json!({
         "reserved":reserved,"full":full,"demoted":demoted,"kept":kept,
-        "reused":reused,"fillers_kept":fillers_kept,
+        "sybil_closed":sybil_closed,"reused":reused,"fillers_kept":fillers_kept,
     })
 }
 
@@ -463,13 +474,14 @@ fn a_daemon_keeps_its_reservation_across_sync_steps() {
 }
 
 #[test]
-fn an_unproven_reserving_peer_is_demoted_and_its_data_slot_reused() {
+fn unproven_peers_are_demoted_only_a_reserving_one_is_kept_and_slots_are_reused() {
     let checks = run(HOST, "unproven");
     for check in [
         "reserved",
         "full",
         "demoted",
         "kept",
+        "sybil_closed",
         "reused",
         "fillers_kept",
     ] {

@@ -14,6 +14,7 @@ pub(crate) struct Links {
     pub(crate) data: u32,
     pub(crate) outbound_data: u32,
     pub(crate) demoted: u32,
+    pub(crate) outbound_demoted: u32,
     pub(crate) on_chain: bool,
 }
 
@@ -45,6 +46,9 @@ impl Links {
         }
         if class == Class::Demoted {
             step(&mut self.demoted, opened);
+        }
+        if class == Class::Demoted && outbound {
+            step(&mut self.outbound_demoted, opened);
         }
     }
 }
@@ -124,6 +128,17 @@ mod tests {
         shared.closed(remote, true, Class::Demoted);
         assert!(!shared.can_gossip(remote));
         assert!(!shared.is_connected(remote));
+    }
+
+    #[test]
+    fn an_inbound_demoted_peer_is_direct_but_never_asked_for_gossip() {
+        let shared = Shared::new(peer());
+        let remote = peer();
+        shared.opened(remote, false, Class::Data);
+        shared.reclassed(remote, false, (Class::Data, Class::Demoted));
+        assert!(shared.any_direct(remote));
+        assert!(!shared.can_gossip(remote));
+        assert!(!shared.has_direct(remote));
     }
 
     #[test]

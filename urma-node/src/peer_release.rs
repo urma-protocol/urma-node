@@ -1,14 +1,16 @@
 //! Soft release: what sync, an idle slot or a stalled request asks of a peer's
-//! connections. The peer loses its data slot but not its connection: data
-//! connections are demoted, so they are neither live nor counted, while Peers
-//! gossip still rides them. The connection then lives exactly as long as a
-//! protocol holds it (a relay reservation either way, an AutoNAT dial-back,
-//! a circuit) and closes on the idle timeout otherwise. Closing it here would
-//! cut a reservation or a probe whose dial-back outlasts the sync idle window
-//! behind a NAT that drops unsolicited packets. A data connection whose peer
-//! never proves it speaks this protocol on our chain is released the same way,
-//! and a demoted peer that did prove it takes a data slot back once one is
-//! free. Misbehaviour still disconnects outright.
+//! connections. The peer loses its data slot, unblamed: data connections are
+//! demoted into the holder budget (closed outright once it is spent), so they
+//! are neither live nor counted. A demoted link then lives only while it
+//! carries a relay reservation either way or a circuit, or, while this node
+//! still seeks reachability or relays, is one of the few public peers it
+//! dialed; `Reach` retires every other one after the holder grace. That grace
+//! outlasts an AutoNAT dial-back, which behind a NAT that drops unsolicited
+//! packets takes longer than the sync idle window. A data connection whose
+//! peer never proves it speaks this protocol on our chain is released the same
+//! way. A demoted link we dialed whose peer did prove it takes a data slot
+//! back once one is free; inbound slots go to newcomers. Misbehaviour still
+//! disconnects outright.
 use crate::{
     peer_gossip::Shared, peer_limits::Class, peer_reach::Remotes, peer_transport::Behaviour,
 };
@@ -30,6 +32,9 @@ pub(crate) fn release(
             remotes.reclass(id, Class::Demoted);
             shared.reclassed(peer, outbound, (Class::Data, Class::Demoted));
             tracing::debug!(%peer, "released peer demoted");
+        } else {
+            tracing::debug!(%peer, "holder budget spent; released link closed");
+            swarm.close_connection(id);
         }
     }
 }

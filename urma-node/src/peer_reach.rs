@@ -19,7 +19,7 @@ use libp2p::{
     swarm::{ConnectionId, SwarmEvent},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     sync::{
         Arc,
@@ -106,14 +106,25 @@ impl Remotes {
         }
     }
 
-    /// Connections admitted past the data budget as reservation holders,
-    /// open for at least `grace`.
-    fn holders_after(&self, grace: Duration) -> Vec<(ConnectionId, PeerId)> {
-        self.0
+    /// Holders admitted at least `grace` ago and links demoted at least
+    /// `grace` ago, oldest first, with whether each is a demoted link we
+    /// dialed to a public peer (an AutoNAT server or relay candidate).
+    fn retirable(&self, grace: Duration) -> Vec<(ConnectionId, PeerId, bool)> {
+        let mut retirable: Vec<(ConnectionId, PeerId, bool)> = self
+            .0
             .iter()
-            .filter(|(_, remote)| remote.class == Class::Holder && remote.since.elapsed() >= grace)
-            .map(|(id, remote)| (*id, remote.peer))
-            .collect()
+            .filter(|(_, remote)| match remote.class {
+                Class::Holder => remote.since.elapsed() >= grace,
+                Class::Demoted => remote.demoted.is_some_and(|at| at.elapsed() >= grace),
+                Class::Data | Class::Auxiliary | Class::Relayed => false,
+            })
+            .map(|(id, remote)| {
+                let seeker = remote.class == Class::Demoted && Self::candidate(remote);
+                (*id, remote.peer, seeker)
+            })
+            .collect();
+        retirable.sort_by_key(|(id, ..)| *id);
+        retirable
     }
 
     /// The peer's data connections, with whether we dialed each.
@@ -134,16 +145,17 @@ impl Remotes {
 
     /// Peers whose data connection has been open `grace` without the peer
     /// proving it speaks this protocol on our chain.
-    pub(crate) fn unproven(&self, grace: Duration, proven: impl Fn(PeerId) -> bool) -> Vec<PeerId> {
-        let mut peers: Vec<PeerId> = self
-            .0
+    pub(crate) fn unproven(
+        &self,
+        grace: Duration,
+        proven: impl Fn(PeerId) -> bool,
+    ) -> HashSet<PeerId> {
+        self.0
             .values()
             .filter(|remote| remote.class == Class::Data && remote.since.elapsed() >= grace)
             .map(|remote| remote.peer)
             .filter(|peer| !proven(*peer))
-            .collect();
-        peers.dedup();
-        peers
+            .collect()
     }
 
     /// Connections demoted at least `grace` ago, with peer and direction.
@@ -452,16 +464,32 @@ impl Reach {
         }
     }
 
-    /// A holder connection, admitted past the data budget, must carry a
-    /// reservation (either way) or ride a circuit within the grace period.
+    /// A holder (admitted past the data budget, or demoted from data) must
+    /// carry a reservation either way or a circuit within the grace period.
+    /// While this node's reachability is unknown, or it is private with relays
+    /// missing, the oldest few demoted links it dialed to public peers stay
+    /// too: AutoNAT and reservations need them, and they are ours, not cheap
+    /// inbound links.
     fn retire_holders(&self, swarm: &mut Swarm<Behaviour>, remotes: &Remotes, nat: &Nat) {
+        let relays = nat.relays();
+        let seeking = match nat.reachability() {
+            Reachability::Public => 0,
+            Reachability::Unknown => Self::RESERVATIONS,
+            Reachability::Private => Self::RESERVATIONS.saturating_sub(relays.len()),
+        };
         let mut holding = nat.reserved_by_others();
-        holding.extend(nat.relays());
-        for (id, peer) in remotes.holders_after(Self::HOLDER_GRACE) {
-            if !holding.contains(&peer) && !self.circuits.contains_key(&peer) {
-                tracing::debug!(%peer, "reservation holder never reserved; closing");
-                swarm.close_connection(id);
+        holding.extend(relays);
+        let mut kept = 0;
+        for (id, peer, seeker) in remotes.retirable(Self::HOLDER_GRACE) {
+            if holding.contains(&peer) || self.circuits.contains_key(&peer) {
+                continue;
             }
+            if seeker && kept < seeking {
+                kept += 1;
+                continue;
+            }
+            tracing::debug!(%peer, "holder carries no reservation or circuit; closing");
+            swarm.close_connection(id);
         }
     }
 

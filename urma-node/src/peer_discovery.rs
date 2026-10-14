@@ -426,7 +426,7 @@ impl Discovery {
         for entry in waiting {
             // A punched link released unproven before its probe is demoted,
             // not gone: the probe still rides it and proves the chain.
-            let direct = self.network.can_gossip(entry.peer);
+            let direct = self.network.any_direct(entry.peer);
             let verdict = settle(
                 direct,
                 connected.contains(&entry.peer),
@@ -577,7 +577,7 @@ mod tests {
         assert!(!shared.has_direct(remote));
         let late = Discovery::CIRCUIT_WAIT + Duration::from_secs(1);
         assert_eq!(
-            settle(shared.can_gossip(remote), shared.is_connected(remote), late),
+            settle(shared.any_direct(remote), shared.is_connected(remote), late),
             Settle::Probe
         );
     }
