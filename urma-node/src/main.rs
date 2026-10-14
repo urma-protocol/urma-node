@@ -122,6 +122,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Serve(serve) => {
             let data = required(args.data, "--data")?;
             let config = required(args.config, "--config")?;
+            #[cfg(not(windows))]
+            log_to_stderr()?;
             daemon::serve(
                 serve_options(data, config, *serve),
                 signals,
@@ -131,6 +133,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Service {
             action: ServiceCommand::Run { settings },
         } => {
+            #[cfg(not(windows))]
+            log_to_stderr()?;
             daemon::run_service(&settings, signals, &mut io::stderr())?;
         }
         Command::Service {
@@ -148,6 +152,25 @@ fn status(data: &Path, config: &Path) -> Result<(), Box<dyn std::error::Error>> 
     let engine = Engine::open(data, daemon::read_archive_config(config)?, None)?;
     println!("{}", serde_json::to_string_pretty(&engine.status()?)?);
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn log_to_stderr() -> Result<(), urma_node::Error> {
+    let Some(directives) = env::var_os("RUST_LOG") else {
+        return Ok(());
+    };
+    let directives = directives
+        .to_str()
+        .ok_or(urma_node::Error::Invalid(format!(
+            "RUST_LOG is not UTF-8: {directives:?}"
+        )))?;
+    let filter = tracing_subscriber::EnvFilter::try_new(directives)
+        .map_err(|error| urma_node::Error::Invalid(format!("RUST_LOG: {error}")))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .try_init()
+        .map_err(|error| urma_node::Error::Invalid(error.to_string()))
 }
 
 /// Only the binary owns process signals: SIGINT, SIGTERM and SIGHUP (and the
