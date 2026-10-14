@@ -389,6 +389,10 @@ impl Reach {
             swarm.remove_external_address(&stale);
             self.external(stale, false, nat);
         }
+        if self.externals.flooded(witness) {
+            tracing::debug!(%witness, "witness reports too many addresses; ignored");
+            return;
+        }
         swarm.behaviour_mut().candidates.offer(observed);
     }
 

@@ -4,15 +4,40 @@
 //! report the address: a peer could otherwise name any victim address and
 //! "confirm" it. Addresses this node is bound to are exempt, since no peer can
 //! make us bind an IP. libp2p's client tests an address once, so a rejected
-//! confirmation is retried once under the equivalent `/p2p/<self>` form.
+//! confirmation is retried once under the equivalent `/p2p/<self>` form. If
+//! the retry also lands on the witness the address stays unconfirmed: an
+//! address only one witness ever reports and tests is unconfirmable by design.
 //! A confirmed address goes stale when two peers we dialed both see us at one
-//! other address of the same transport: the mapping changed.
+//! other address of the same transport and IP family: the mapping changed.
+//! Reports are kept per witness: a peer reporting more than a handful of
+//! addresses is flooding, its reports stop counting and it confirms nothing.
 use crate::peer_reach::{direct_shape, without_peer};
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
+
+/// One witness: when we first heard from it and what it reported when.
+struct Witness {
+    first: Instant,
+    reports: Vec<(Multiaddr, Instant)>,
+    flooded: bool,
+}
+
+impl Witness {
+    fn reported(&self, address: &Multiaddr) -> bool {
+        self.flooded || self.reports.iter().any(|(known, _)| known == address)
+    }
+
+    fn recently(&self, address: &Multiaddr, now: Instant) -> bool {
+        !self.flooded
+            && self
+                .reports
+                .iter()
+                .any(|(known, at)| known == address && now.duration_since(*at) <= Externals::WINDOW)
+    }
+}
 
 /// What one successful AutoNAT result means for our advertised addresses.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,7 +51,7 @@ pub(crate) struct Externals {
     local: PeerId,
     announce: Vec<Multiaddr>,
     bound: HashSet<Multiaddr>,
-    witnesses: HashMap<Multiaddr, HashMap<PeerId, Instant>>,
+    witnesses: HashMap<PeerId, Witness>,
     retried: HashSet<Multiaddr>,
 }
 
@@ -34,8 +59,18 @@ fn is_quic(address: &Multiaddr) -> bool {
     address.iter().any(|part| part == Protocol::QuicV1)
 }
 
+fn is_ipv4(address: &Multiaddr) -> bool {
+    matches!(address.iter().next(), Some(Protocol::Ip4(_)))
+}
+
+/// Same transport and IP family: one NAT mapping.
+fn same_mapping(a: &Multiaddr, b: &Multiaddr) -> bool {
+    is_quic(a) == is_quic(b) && is_ipv4(a) == is_ipv4(b)
+}
+
 impl Externals {
-    const WITNESSED_MAX: usize = 16;
+    const REPORTS_MAX: usize = 4;
+    const WITNESSES_MAX: usize = 256;
     const MOVED: usize = 2;
     const WINDOW: Duration = Duration::from_secs(10 * 60);
 
@@ -68,10 +103,53 @@ impl Externals {
         Some(bare)
     }
 
+    /// Whether the witness reported more addresses than `REPORTS_MAX`: its
+    /// reports are no AutoNAT candidates and count toward nothing.
+    pub(crate) fn flooded(&self, witness: PeerId) -> bool {
+        self.witnesses
+            .get(&witness)
+            .is_some_and(|known| known.flooded)
+    }
+
+    /// Records the report under its witness. A new witness past
+    /// `WITNESSES_MAX` evicts the one first heard longest ago.
+    fn record(&mut self, observed: &Multiaddr, witness: PeerId, now: Instant) {
+        if !self.witnesses.contains_key(&witness) && self.witnesses.len() >= Self::WITNESSES_MAX {
+            let oldest = self
+                .witnesses
+                .iter()
+                .min_by_key(|(_, known)| known.first)
+                .map(|(peer, _)| *peer);
+            if let Some(oldest) = oldest {
+                self.witnesses.remove(&oldest);
+            }
+        }
+        let entry = self.witnesses.entry(witness).or_insert(Witness {
+            first: now,
+            reports: Vec::new(),
+            flooded: false,
+        });
+        if entry.flooded {
+            return;
+        }
+        if let Some(known) = entry
+            .reports
+            .iter_mut()
+            .find(|(known, _)| known == observed)
+        {
+            known.1 = now;
+        } else if entry.reports.len() >= Self::REPORTS_MAX {
+            entry.flooded = true;
+            entry.reports.clear();
+        } else {
+            entry.reports.push((observed.clone(), now));
+        }
+    }
+
     /// `witness`, a peer we dialed directly, sees us at `observed` at `now`.
     /// Returns the confirmed addresses this shows stale: two witnesses within
     /// the window, both still holding a data connection (`data`), agree on
-    /// another address of the same transport.
+    /// another address of the same transport and IP family.
     pub(crate) fn witnessed(
         &mut self,
         observed: &Multiaddr,
@@ -79,17 +157,11 @@ impl Externals {
         externals: &[Multiaddr],
         data: impl Fn(&PeerId) -> bool,
     ) -> Vec<Multiaddr> {
-        let full = self.witnesses.len() >= Self::WITNESSED_MAX;
-        if full && !self.witnesses.contains_key(observed) {
-            if let Some(evicted) = self.witnesses.keys().next().cloned() {
-                self.witnesses.remove(&evicted);
-            }
-        }
-        let seen = self.witnesses.entry(observed.clone()).or_default();
-        seen.insert(witness, now);
-        let recent = seen
+        self.record(observed, witness, now);
+        let recent = self
+            .witnesses
             .iter()
-            .filter(|(peer, at)| now.duration_since(**at) <= Self::WINDOW && data(peer))
+            .filter(|(peer, known)| known.recently(observed, now) && data(peer))
             .count();
         if recent < Self::MOVED || self.announced() {
             return Vec::new();
@@ -97,9 +169,7 @@ impl Externals {
         externals
             .iter()
             .filter(|known| {
-                *known != observed
-                    && is_quic(known) == is_quic(observed)
-                    && !self.bound.contains(*known)
+                *known != observed && same_mapping(known, observed) && !self.bound.contains(*known)
             })
             .cloned()
             .collect()
@@ -112,8 +182,8 @@ impl Externals {
         }
         let witnessed = self
             .witnesses
-            .get(&bare)
-            .is_some_and(|seen| seen.contains_key(&server));
+            .get(&server)
+            .is_some_and(|known| known.reported(&bare));
         if !witnessed || self.bound.contains(&bare) {
             return Verdict::Confirm(bare);
         }
@@ -238,6 +308,82 @@ mod tests {
         assert!(gone.is_empty(), "b no longer holds a data connection");
         let both = externals.witnessed(&moved, (c, later), &confirmed, |_| true);
         assert_eq!(both, vec![old]);
+    }
+
+    #[test]
+    fn a_liar_cannot_flush_its_own_report_before_confirming_it() {
+        let (local, liar, honest) = (peer(), peer(), peer());
+        let mut externals = Externals::new(local, Vec::new());
+        let victim = address("/ip4/1.2.3.4/tcp/28332");
+        saw(&mut externals, &victim, liar, &[]);
+        for port in 1..=Externals::REPORTS_MAX {
+            let junk = address(&format!("/ip4/9.9.9.9/tcp/{port}"));
+            saw(&mut externals, &junk, liar, &[]);
+        }
+        assert!(externals.flooded(liar));
+        assert_eq!(
+            externals.verdict(&victim, liar),
+            Verdict::Retry(victim.clone().with(Protocol::P2p(local)))
+        );
+        let honest_victim = address("/ip4/5.6.7.8/tcp/28332");
+        assert_eq!(
+            externals.verdict(&honest_victim, liar),
+            Verdict::Retry(honest_victim.clone().with(Protocol::P2p(local))),
+            "a flooding witness confirms nothing"
+        );
+        assert_eq!(externals.verdict(&victim, honest), Verdict::Confirm(victim));
+    }
+
+    #[test]
+    fn a_flooding_witness_counts_toward_no_moved_mapping() {
+        let mut externals = Externals::new(peer(), Vec::new());
+        let old = address("/ip4/1.2.3.4/tcp/40000");
+        let moved = address("/ip4/1.2.3.4/tcp/40001");
+        let (liar, honest) = (peer(), peer());
+        for port in 1..=Externals::REPORTS_MAX {
+            saw(
+                &mut externals,
+                &address(&format!("/ip4/9.9.9.9/tcp/{port}")),
+                liar,
+                &[],
+            );
+        }
+        saw(&mut externals, &moved, liar, &[old.clone()]);
+        assert!(saw(&mut externals, &moved, honest, &[old]).is_empty());
+    }
+
+    #[test]
+    fn a_full_table_evicts_the_witness_heard_first() {
+        let mut externals = Externals::new(peer(), Vec::new());
+        let start = Instant::now();
+        let first = peer();
+        let observed = address("/ip4/1.2.3.4/tcp/40001");
+        externals.witnessed(&observed, (first, start), &[], |_| true);
+        for n in 1..Externals::WITNESSES_MAX {
+            let at = start + Duration::from_millis(u64::try_from(n).unwrap());
+            externals.witnessed(&observed, (peer(), at), &[], |_| true);
+        }
+        assert!(externals.witnesses.contains_key(&first));
+        externals.witnessed(
+            &observed,
+            (peer(), start + Duration::from_secs(1)),
+            &[],
+            |_| true,
+        );
+        assert_eq!(externals.witnesses.len(), Externals::WITNESSES_MAX);
+        assert!(!externals.witnesses.contains_key(&first));
+    }
+
+    #[test]
+    fn a_moved_mapping_retires_only_the_same_ip_family() {
+        let mut externals = Externals::new(peer(), Vec::new());
+        let v4 = address("/ip4/1.2.3.4/tcp/40000");
+        let v6 = address("/ip6/2001:db8::1/tcp/40000");
+        let moved = address("/ip4/1.2.3.4/tcp/40001");
+        let confirmed = [v4.clone(), v6];
+        let (a, b) = (peer(), peer());
+        saw(&mut externals, &moved, a, &confirmed);
+        assert_eq!(saw(&mut externals, &moved, b, &confirmed), vec![v4]);
     }
 
     #[test]
