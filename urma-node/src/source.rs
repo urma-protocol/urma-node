@@ -4,7 +4,7 @@ use crate::{
     recorded::RecordedError,
 };
 use bitcoin::{BlockHash, Txid, block::Header};
-use rpc::{Answer, Rpc};
+use rpc::{Answer, Deadline, Rpc};
 use serde_json::{Value, json};
 use std::{
     net::SocketAddr,
@@ -122,10 +122,12 @@ pub struct LocalRpcCommitSource {
 
 impl LocalRpcCommitSource {
     pub const PROBE_INTERVAL: Duration = Duration::from_secs(10);
-    /// Total time one probe RPC may take after connecting.
+    /// Total time one probe may take, cookie verification included.
     pub const PROBE_BUDGET: Duration = Duration::from_secs(3);
-    /// Total time one lookup RPC may take after connecting.
+    /// Total time one lookup may take, cookie verification included.
     pub const FETCH_BUDGET: Duration = Duration::from_secs(15);
+    /// Core's cookie is `__cookie__:` plus 64 hex characters.
+    const COOKIE_LIMIT: usize = 1024;
 
     pub fn new(chain: Chain, rpc_url: String, cookie_file: PathBuf) -> Self {
         Self {
@@ -151,19 +153,34 @@ impl LocalRpcCommitSource {
         self
     }
 
-    /// The verified RPC for the current cookie; verification RPCs use `budget`
-    /// each and never run under the lock.
-    fn rpc(&self, budget: Duration) -> Result<Arc<Rpc>, Error> {
-        let cookie = std::fs::read(&self.cookie_file).map_err(|_| {
-            Error::CommitSource("cookie file missing: litecoind not running?".into())
-        })?;
+    /// The cookie as a bounded, non-blocking read of a regular file: a FIFO
+    /// or device in its place is refused instead of blocking the worker.
+    fn cookie(&self) -> Result<Vec<u8>, Error> {
+        match urma_io::read_regular(&self.cookie_file, Self::COOKIE_LIMIT) {
+            Ok(cookie) => Ok(cookie.to_vec()),
+            Err(error) => match std::fs::symlink_metadata(&self.cookie_file) {
+                Err(_absent) => Err(Error::CommitSource(
+                    "cookie file missing: litecoind not running?".into(),
+                )),
+                Ok(_present) => Err(Error::CommitSource(format!(
+                    "cookie file unreadable: {error}"
+                ))),
+            },
+        }
+    }
+
+    /// The verified RPC for the current cookie. A new cookie's verification
+    /// RPCs spend the caller's `deadline`, so the whole operation stays within
+    /// one budget; they never run under the lock.
+    fn rpc(&self, deadline: Deadline) -> Result<Arc<Rpc>, Error> {
+        let cookie = self.cookie()?;
         if let Some((seen, rpc)) = self.verified()?.as_ref() {
             if *seen == cookie {
                 return Ok(Arc::clone(rpc));
             }
         }
         let rpc = Arc::new(Rpc::new(&self.rpc_url, &cookie)?);
-        let genesis = rpc.value("getblockhash", json!([0]), budget)?;
+        let genesis = rpc.value("getblockhash", json!([0]), deadline)?;
         let expected = self
             .chain
             .genesis()
@@ -175,7 +192,7 @@ impl LocalRpcCommitSource {
                 "RPC genesis does not match selected chain".into(),
             ));
         }
-        let indexes = rpc.value("getindexinfo", json!(["txindex"]), budget)?;
+        let indexes = rpc.value("getindexinfo", json!(["txindex"]), deadline)?;
         if indexes["txindex"]["synced"] != true {
             return Err(Error::CommitSource(
                 "parent lookups require synchronized txindex=1 on the local node".into(),
@@ -212,9 +229,9 @@ impl CommitSource for LocalRpcCommitSource {
     /// Code -5 is Core's "no such mempool or blockchain transaction": absent.
     fn fetch(&self, txid: Txid, cancelled: &AtomicBool) -> Result<Option<Vec<u8>>, Error> {
         check_cancelled(cancelled)?;
-        let budget = self.fetch_budget;
-        let rpc = self.rpc(budget)?;
-        match rpc.call("getrawtransaction", json!([txid, false]), budget)? {
+        let deadline = Deadline::after(self.fetch_budget);
+        let rpc = self.rpc(deadline)?;
+        match rpc.call("getrawtransaction", json!([txid, false]), deadline)? {
             Answer::Value(result) => transaction_hex(&result).map(Some),
             Answer::Failed { code: -5, .. } => Ok(None),
             Answer::Failed { code, message } => Err(Error::CommitSource(format!(
@@ -226,10 +243,13 @@ impl CommitSource for LocalRpcCommitSource {
     fn probe(&self) -> Option<Result<(), Error>> {
         match self.probe_due() {
             Ok(false) => None,
-            Ok(true) => Some(self.rpc(self.probe_budget).and_then(|rpc| {
-                rpc.value("getblockcount", json!([]), self.probe_budget)
-                    .map(|_count| ())
-            })),
+            Ok(true) => {
+                let deadline = Deadline::after(self.probe_budget);
+                Some(self.rpc(deadline).and_then(|rpc| {
+                    rpc.value("getblockcount", json!([]), deadline)
+                        .map(|_count| ())
+                }))
+            }
             Err(error) => Some(Err(error)),
         }
     }
