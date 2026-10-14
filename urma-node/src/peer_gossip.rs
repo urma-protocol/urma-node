@@ -426,6 +426,14 @@ pub fn validate_gossip_address(address: &Multiaddr) -> Result<Option<PeerId>, Er
     }
 }
 
+/// Whether a failed chain probe closes the peer's connections: only when it
+/// answered for another chain, version or protocol. Busy, transport and
+/// admission failures say nothing about the peer, and its other connections
+/// (a relay reservation among them) stay.
+pub(crate) fn probe_closes(error: &Error) -> bool {
+    matches!(error, Error::Invalid(_))
+}
+
 /// Dial targets: any direct address shape, or a circuit that names its
 /// target. Returns the named identity.
 pub fn validate_dial(address: &Multiaddr) -> Result<Option<PeerId>, Error> {
@@ -703,23 +711,22 @@ impl PeerNetwork {
         self.probe(peer, cancelled, deadline).map(Dialed::Direct)
     }
 
-    /// The chain probe: a zero-limit Peers request over a direct link. Busy
-    /// keeps the connection; any other failure closes it (another chain, or
-    /// not this protocol).
+    /// The chain probe: a zero-limit Peers request over a direct link. Only a
+    /// peer proven to be elsewhere (`probe_closes`) loses its connections.
     pub fn probe(
         &self,
         peer: PeerId,
         cancelled: &AtomicBool,
         deadline: Instant,
     ) -> Result<PeerId, Error> {
-        match self.peers_of(peer, 0, cancelled, deadline) {
-            Ok(_) => Ok(peer),
-            Err(busy @ (Error::Busy(_) | Error::PeerBusy)) => Err(busy),
-            Err(error) => {
-                let _ = self.commands.try_send(Command::Disconnect(peer));
-                Err(error)
-            }
+        let error = match self.peers_of(peer, 0, cancelled, deadline) {
+            Ok(_) => return Ok(peer),
+            Err(error) => error,
+        };
+        if probe_closes(&error) {
+            let _ = self.commands.try_send(Command::Disconnect(peer));
         }
+        Err(error)
     }
 
     /// One bounded Peers request over an existing connection (or addresses the

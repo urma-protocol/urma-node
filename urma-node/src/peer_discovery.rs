@@ -91,6 +91,12 @@ fn names_self(address: &Multiaddr, local: &Protocol) -> bool {
     literal || address.iter().any(|part| part == *local)
 }
 
+/// A seed already connected (relayed connections included) is never
+/// re-dialed: the dial would only re-run the chain probe over a live link.
+fn names_connected(address: &Multiaddr, connected: &[PeerId]) -> bool {
+    matches!(address.iter().last(), Some(Protocol::P2p(peer)) if connected.contains(&peer))
+}
+
 fn poisoned() -> Error {
     Error::Invalid("peer discovery state poisoned".into())
 }
@@ -281,7 +287,8 @@ impl Discovery {
         let backoff_at = if startup { None } else { Some(now()?) };
         let mut seeds = self.lock()?.seeds(omitting, backoff_at);
         let own = self.own()?.clone();
-        seeds.retain(|seed| !own.contains(seed));
+        let connected = self.network.connected_peer_ids();
+        seeds.retain(|seed| !own.contains(seed) && !names_connected(seed, &connected));
         let mut dialed = false;
         let mut error = None;
         let mut reached = false;
@@ -498,8 +505,51 @@ impl Discovery {
 
 #[cfg(test)]
 mod tests {
-    use super::{Discovery, Settle, settle};
+    use super::{Discovery, Settle, names_connected, settle};
+    use crate::{Error, error::DialLimit, peer_gossip::probe_closes};
+    use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
     use std::time::Duration;
+
+    fn peer() -> PeerId {
+        Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    #[test]
+    fn only_a_peer_on_another_chain_loses_its_connections_to_a_failed_probe() {
+        assert!(probe_closes(&Error::Invalid(
+            "peer response network mismatch".into()
+        )));
+        let kept = [
+            Error::Busy("peer dial deadline".into()),
+            Error::PeerBusy,
+            Error::Transport("Timeout".into()),
+            Error::Transport("Failed to dial the requested peer".into()),
+            Error::DialDenied(DialLimit::Duplicate),
+        ];
+        for error in kept {
+            assert!(!probe_closes(&error), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_connected_seed_is_not_dialed_again() {
+        let (seed, other) = (peer(), peer());
+        let named: Multiaddr = format!("/ip4/11.0.0.1/tcp/28332/p2p/{seed}")
+            .parse()
+            .unwrap();
+        assert!(names_connected(&named, &[other, seed]));
+        assert!(!names_connected(&named, &[other]));
+        let unnamed: Multiaddr = "/dnsaddr/seed.example".parse().unwrap();
+        assert!(
+            !names_connected(&unnamed, &[seed]),
+            "an unidentified seed is dialed"
+        );
+        let circuit = named
+            .clone()
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(other));
+        assert!(names_connected(&circuit, &[other]));
+    }
 
     #[test]
     fn a_punched_peer_is_probed_whatever_its_relay_does() {
