@@ -8,7 +8,7 @@ use crate::{
     },
     peer_address::{AddressKind, Dialed, is_circuit, parse, relay},
     peer_limits::{Class, LimitDenied},
-    peer_nat::{HolePunch, Nat, PeerLink, Reachability},
+    peer_nat::{Nat, PeerLink, Reachability},
     peer_protocol::{
         GossipPeer, Kind, PEER_ADDRESSES_MAX, PEERS_LIMIT, PEERS_MAX, Reply, Response,
     },
@@ -680,10 +680,6 @@ impl PeerNetwork {
     /// This node's `/p2p-circuit` listen addresses through its relays.
     pub fn circuit_addresses(&self) -> Vec<Multiaddr> {
         self.shared.nat.circuits()
-    }
-
-    pub(crate) fn hole_punch(&self) -> HolePunch {
-        self.shared.nat.hole_punch()
     }
 
     /// Connected peers' own literal public addresses learned through identify

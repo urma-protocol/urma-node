@@ -9,7 +9,6 @@ use crate::{
     model::{BookEntry, DiscoveryStatus},
     peer::PeerNetwork,
     peer_address::Dialed,
-    peer_nat::PeerLink,
     peer_protocol::GossipPeer,
     peerbook::PeerBook,
     recorded::{RecordedError, read, unix_seconds as now},
@@ -367,15 +366,13 @@ impl Discovery {
         Ok(changed)
     }
 
-    /// Peers holding a direct connection. Only these count toward the target
-    /// and carry records/5 (gossip, chain probe); a relayed-only peer doesn't.
+    /// Peers holding a direct data connection. Only these count toward the
+    /// target and carry records/5 (gossip, chain probe); a relayed-only or
+    /// auxiliary-only peer doesn't.
     fn direct_peers(&self) -> Vec<PeerId> {
-        self.network
-            .peer_links()
-            .into_iter()
-            .filter(|(_, link)| *link == PeerLink::Direct)
-            .map(|(peer, _)| peer)
-            .collect()
+        let mut peers = self.network.connected_peer_ids();
+        peers.retain(|peer| self.network.has_direct(*peer));
+        peers
     }
 
     fn relayed(&self) -> Result<MutexGuard<'_, Vec<Relayed>>, Error> {
@@ -442,7 +439,8 @@ impl Discovery {
     }
 
     /// The chain probe over a punched connection; false while the peer is
-    /// busy, so the contact waits for the next round.
+    /// busy or the request found no data connection yet (Transport), so the
+    /// contact waits, at most until the circuit expires.
     fn probe_relayed(&self, entry: &Relayed, stop: &AtomicBool) -> Result<bool, Error> {
         let deadline = Instant::now() + Self::OPERATION_TIME;
         let outcome = self.network.probe(entry.peer, stop, deadline);
@@ -450,7 +448,7 @@ impl Discovery {
         let local = self.network.peer_id();
         match outcome {
             Ok(peer) => self.lock()?.succeeded(&entry.address, peer, local, at),
-            Err(Error::Busy(_) | Error::PeerBusy) => return Ok(false),
+            Err(Error::Busy(_) | Error::PeerBusy | Error::Transport(_)) => return Ok(false),
             Err(_failure) => self.lock()?.failed(&entry.address, at),
         }
         Ok(true)
