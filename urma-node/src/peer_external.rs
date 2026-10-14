@@ -70,6 +70,7 @@ fn same_mapping(a: &Multiaddr, b: &Multiaddr) -> bool {
 
 impl Externals {
     const REPORTS_MAX: usize = 4;
+    const REPORTS_KEPT: usize = 16;
     const WITNESSES_MAX: usize = 256;
     const MOVED: usize = 2;
     const WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -103,8 +104,12 @@ impl Externals {
         Some(bare)
     }
 
-    /// Whether the witness reported more addresses than `REPORTS_MAX`: its
-    /// reports are no AutoNAT candidates and count toward nothing.
+    /// Whether the witness flooded: more than `REPORTS_MAX` distinct addresses
+    /// within the window, or more than `REPORTS_KEPT` ever (older reports stay
+    /// for the exclusion check, so a mapping that changes over a long uptime
+    /// does not flood). Its reports are no AutoNAT candidates and count toward
+    /// nothing, and that never expires: waiting out the window after flooding
+    /// must not let it confirm what it reported.
     pub(crate) fn flooded(&self, witness: PeerId) -> bool {
         self.witnesses
             .get(&witness)
@@ -132,17 +137,22 @@ impl Externals {
         if entry.flooded {
             return;
         }
-        if let Some(known) = entry
+        match entry
             .reports
             .iter_mut()
             .find(|(known, _)| known == observed)
         {
-            known.1 = now;
-        } else if entry.reports.len() >= Self::REPORTS_MAX {
+            Some(known) => known.1 = now,
+            None => entry.reports.push((observed.clone(), now)),
+        }
+        let recent = entry
+            .reports
+            .iter()
+            .filter(|(_, at)| now.duration_since(*at) <= Self::WINDOW)
+            .count();
+        if recent > Self::REPORTS_MAX || entry.reports.len() > Self::REPORTS_KEPT {
             entry.flooded = true;
             entry.reports.clear();
-        } else {
-            entry.reports.push((observed.clone(), now));
         }
     }
 
@@ -330,6 +340,69 @@ mod tests {
             externals.verdict(&honest_victim, liar),
             Verdict::Retry(honest_victim.clone().with(Protocol::P2p(local))),
             "a flooding witness confirms nothing"
+        );
+        assert_eq!(externals.verdict(&victim, honest), Verdict::Confirm(victim));
+    }
+
+    /// `witness` reports `count` distinct addresses at `at`, ports from `from`.
+    fn reports(
+        externals: &mut Externals,
+        witness: PeerId,
+        (from, count): (usize, usize),
+        at: Instant,
+    ) {
+        for port in from..from + count {
+            let reported = address(&format!("/ip4/9.9.9.9/tcp/{port}"));
+            externals.witnessed(&reported, (witness, at), &[], |_| true);
+        }
+    }
+
+    #[test]
+    fn a_seed_seeing_our_mapping_change_over_a_long_uptime_never_floods() {
+        let (local, seed) = (peer(), peer());
+        let mut externals = Externals::new(local, Vec::new());
+        let start = Instant::now();
+        let rounds = Externals::REPORTS_KEPT / Externals::REPORTS_MAX;
+        for round in 0..rounds {
+            let later = Externals::WINDOW * u32::try_from(round).unwrap() + Duration::from_secs(1);
+            let at = start + later + Duration::from_secs(u64::try_from(round).unwrap());
+            reports(
+                &mut externals,
+                seed,
+                (round * Externals::REPORTS_MAX, Externals::REPORTS_MAX),
+                at,
+            );
+        }
+        assert!(
+            !externals.flooded(seed),
+            "aged reports do not count toward flooding"
+        );
+        let first = address("/ip4/9.9.9.9/tcp/0");
+        assert_eq!(
+            externals.verdict(&first, seed),
+            Verdict::Retry(first.clone().with(Protocol::P2p(local))),
+            "an aged report still excludes its witness"
+        );
+        let end = start + Externals::WINDOW * u32::try_from(rounds + 1).unwrap();
+        reports(&mut externals, seed, (Externals::REPORTS_KEPT, 1), end);
+        assert!(externals.flooded(seed), "past the hard cap of kept reports");
+    }
+
+    #[test]
+    fn a_flooded_witness_stays_flooded_after_the_window() {
+        let (local, liar, honest) = (peer(), peer(), peer());
+        let mut externals = Externals::new(local, Vec::new());
+        let victim = address("/ip4/1.2.3.4/tcp/28332");
+        let start = Instant::now();
+        externals.witnessed(&victim, (liar, start), &[], |_| true);
+        reports(&mut externals, liar, (1, Externals::REPORTS_MAX), start);
+        assert!(externals.flooded(liar));
+        let later = start + Externals::WINDOW * 3;
+        externals.witnessed(&victim, (liar, later), &[], |_| true);
+        assert!(externals.flooded(liar));
+        assert_ne!(
+            externals.verdict(&victim, liar),
+            Verdict::Confirm(victim.clone())
         );
         assert_eq!(externals.verdict(&victim, honest), Verdict::Confirm(victim));
     }
