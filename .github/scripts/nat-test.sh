@@ -31,6 +31,10 @@ symmetric) masquerade=(-j MASQUERADE --random-fully) ;;
 *) echo "mode must be cone or symmetric" >&2; exit 2 ;;
 esac
 
+# The namespace names are fixed and a run clears leftovers: one run at a time.
+exec 9>/run/urmanat.lock
+flock -n 9 || { echo "waiting for another nat-test run" >&2; flock 9; }
+
 P_IP=11.0.1.10
 NODES=(p a b)
 NAMESPACES=(inet p nat-a nat-b a b)
@@ -82,6 +86,7 @@ cleanup() {
     if [ -n "${NAT_KEEP:-}" ]; then
         mkdir -p "$NAT_KEEP/$mode"
         cp "$work"/*.log "$work"/*.timeline "$NAT_KEEP/$mode/" 2>/dev/null || true
+        chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$NAT_KEEP"
     fi
     rm -rf "$work"
     exit "$rc"
