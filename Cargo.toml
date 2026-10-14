@@ -3,7 +3,7 @@ resolver = "3"
 members = ["urma-node", "urma-node-app/src-tauri"]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 license = "0BSD"
 authors = ["Cristian Zmole <urma@rosint.org>"]
