@@ -121,6 +121,9 @@ nat() {
     at "$1" iptables -P FORWARD DROP
     at "$1" iptables -A FORWARD -i lan -o wan -j ACCEPT
     at "$1" iptables -A FORWARD -i wan -o lan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # Unsolicited inbound to the WAN address is dropped, never answered with a
+    # RST or port unreachable: a refused punch dial would end DCUtR at once.
+    at "$1" iptables -A INPUT -i wan -m conntrack --ctstate NEW,INVALID -j DROP
 }
 
 topology() {
