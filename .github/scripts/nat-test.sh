@@ -39,7 +39,8 @@ P_IP=11.0.1.10
 NODES=(p a b)
 NAMESPACES=(inet p nat-a nat-b a b)
 work=$(mktemp -d)
-declare -A pid id
+declare -A pid=() id=() seen=()
+exec 7>&1 8>&2
 
 at() { ip netns exec "urmanat-$1" "${@:2}"; }
 
@@ -73,6 +74,7 @@ diagnose() {
 
 cleanup() {
     rc=$?
+    exec 1>&7 2>&8
     [ -n "${sampler:-}" ] && kill "$sampler" 2>/dev/null || true
     [ "$rc" -eq 0 ] || diagnose
     for node in "${NODES[@]}"; do
@@ -119,6 +121,9 @@ nat() {
     at "$1" iptables -P FORWARD DROP
     at "$1" iptables -A FORWARD -i lan -o wan -j ACCEPT
     at "$1" iptables -A FORWARD -i wan -o lan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # Unsolicited inbound to the WAN address is dropped, never answered with a
+    # RST or port unreachable: a refused punch dial would end DCUtR at once.
+    at "$1" iptables -A INPUT -i wan -m conntrack --ctstate NEW,INVALID -j DROP
 }
 
 topology() {
@@ -265,7 +270,6 @@ either() { "$1" a || "$1" b; }
 
 # A direct A-B link may be released once sync idles: latch every event
 # the moment one poll sees it.
-declare -A seen
 cone_events() {
     linked a b direct && seen[a-b]=1
     linked b a direct && seen[b-a]=1
