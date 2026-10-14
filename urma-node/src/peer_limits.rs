@@ -238,8 +238,10 @@ impl Limits {
     }
 
     /// The peer's links that dialed us from `remote`, the very address this
-    /// new connection `id` comes from: a live peer never dials us twice from
-    /// one socket, while an AutoNAT dial-back comes from a fresh port.
+    /// new connection `id` comes from: a peer redialing from a held link's
+    /// address restarted behind the same mapping (a QUIC peer could open a
+    /// second connection from one socket, but then it only loses its own
+    /// older link), while an AutoNAT dial-back comes from a fresh port.
     fn stale(&self, id: ConnectionId, peer: PeerId, remote: &Multiaddr) -> Vec<ConnectionId> {
         self.established
             .iter()
