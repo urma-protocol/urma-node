@@ -15,6 +15,7 @@ use crate::{
     source::check_cancelled,
 };
 use bitcoin::BlockHash;
+use rand::seq::SliceRandom;
 use libp2p::{
     Multiaddr, PeerId, Swarm,
     multiaddr::Protocol,
@@ -290,9 +291,10 @@ impl Shared {
         }
     }
 
-    /// Answer a Peers request from the snapshot. Only IP-literal addresses are
-    /// forwarded, private and loopback ones only to loopback requesters. Neither
-    /// the requester nor this node is listed; future `last_seen` is clamped.
+    /// Answer a Peers request: peers holding a reservation on this relay
+    /// alternate with the snapshot. Only IP-literal addresses are forwarded,
+    /// private and loopback ones only to loopback requesters. Neither the
+    /// requester nor this node is listed; future `last_seen` is clamped.
     pub(crate) fn serve(&self, requester: PeerId, loopback: bool, limit: u32) -> Reply {
         let Ok(limit) = usize::try_from(limit) else {
             return Reply::Refused;
@@ -300,34 +302,27 @@ impl Shared {
         if limit > usize::try_from(PEERS_MAX).unwrap_or(0) {
             return Reply::Refused;
         }
+        let now = unix_now();
+        let reserved = self.reserved(requester, now);
+        let held: Vec<PeerId> = reserved.iter().map(|peer| peer.peer_id).collect();
         let Ok(snapshot) = self.gossip.lock() else {
             return Reply::Busy;
         };
-        let now = unix_now();
-        let mut peers = Vec::new();
-        let listed = snapshot
+        let mut listed = snapshot
             .iter()
-            .filter(|entry| entry.peer_id != requester && entry.peer_id != self.local);
-        for entry in listed {
-            if peers.len() == limit {
+            .filter(|entry| entry.peer_id != requester && entry.peer_id != self.local)
+            .filter(|entry| !held.contains(&entry.peer_id))
+            .filter_map(|entry| servable(entry, loopback, now));
+        let mut reserved = reserved.into_iter();
+        let mut peers = Vec::new();
+        while peers.len() < limit {
+            let (held, known) = (reserved.next(), listed.next());
+            if held.is_none() && known.is_none() {
                 break;
             }
-            let addrs: Vec<Multiaddr> = entry
-                .addrs
-                .iter()
-                .filter(|address| validate_gossip_address(address).is_ok())
-                .filter(|address| loopback || is_public(address))
-                .take(PEER_ADDRESSES_MAX)
-                .cloned()
-                .collect();
-            if !addrs.is_empty() {
-                peers.push(GossipPeer {
-                    peer_id: entry.peer_id,
-                    addrs,
-                    last_seen: entry.last_seen.min(now),
-                });
-            }
+            peers.extend(held.into_iter().chain(known));
         }
+        peers.truncate(limit);
         loop {
             match serde_json::to_vec(&peers) {
                 Ok(bytes) if bytes.len() + Self::ENVELOPE <= PEERS_LIMIT => break,
@@ -339,6 +334,55 @@ impl Shared {
         }
         Reply::Peers(peers)
     }
+
+    /// Peers holding an active reservation on this node's relay, in random
+    /// order, each with its circuit addresses through this node's public IPv4
+    /// external addresses. Empty while this node has none.
+    fn reserved(&self, requester: PeerId, now: u64) -> Vec<GossipPeer> {
+        let hops: Vec<Multiaddr> = self
+            .nat
+            .external()
+            .into_iter()
+            .map(|external| {
+                external
+                    .with(Protocol::P2p(self.local))
+                    .with(Protocol::P2pCircuit)
+            })
+            .filter(|hop| parse(hop).is_ok())
+            .take(PEER_ADDRESSES_MAX)
+            .collect();
+        if hops.is_empty() {
+            return Vec::new();
+        }
+        let mut holders = self.nat.reserved_by_others();
+        holders.retain(|holder| *holder != requester && *holder != self.local);
+        holders.shuffle(&mut rand::thread_rng());
+        holders
+            .into_iter()
+            .map(|peer_id| GossipPeer {
+                peer_id,
+                addrs: hops.clone(),
+                last_seen: now,
+            })
+            .collect()
+    }
+}
+
+/// A snapshot entry with only the addresses this requester may receive.
+fn servable(entry: &GossipPeer, loopback: bool, now: u64) -> Option<GossipPeer> {
+    let addrs: Vec<Multiaddr> = entry
+        .addrs
+        .iter()
+        .filter(|address| validate_gossip_address(address).is_ok())
+        .filter(|address| loopback || is_public(address))
+        .take(PEER_ADDRESSES_MAX)
+        .cloned()
+        .collect();
+    (!addrs.is_empty()).then(|| GossipPeer {
+        peer_id: entry.peer_id,
+        addrs,
+        last_seen: entry.last_seen.min(now),
+    })
 }
 
 /// Globally routable IP, or a DNS name other than localhost. IPv4-mapped IPv6

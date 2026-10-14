@@ -6158,9 +6158,9 @@ dependencies = [
 
 [[package]]
 name = "urma-node-client"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0d750ef2cf3181cede8701f4dd135b538f65c5b3d3d84c4db2e463f3f3080f4"
+checksum = "b52aa187410bf6d5c4de2ae7c790968ef529457a80a050dd130a851931469391"
 dependencies = [
  "bitcoin",
  "hex",
