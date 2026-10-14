@@ -19,13 +19,13 @@ use serde_json::json;
 use std::{
     fs::File,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use urma_io::Access;
 
@@ -282,12 +282,14 @@ impl Service {
                         in_flight.fetch_sub(1, Ordering::AcqRel);
                         // Best effort: a busy reply that cannot be written is moot.
                         let _ = respond(&mut stream, 503, json!({"error":"control service busy"}));
+                        close_gracefully(&mut stream);
                         continue;
                     }
                     let in_flight = Arc::clone(&in_flight);
                     scope.spawn(move || {
                         // A malformed or disconnected client never stops the service.
                         let _ = self.request(&mut stream);
+                        close_gracefully(&mut stream);
                         in_flight.fetch_sub(1, Ordering::AcqRel);
                     });
                 }
@@ -684,6 +686,33 @@ fn equal_token(left: &str, right: &str) -> bool {
         == 0
 }
 
+/// Closing a socket with unread request bytes makes the kernel send RST and
+/// drop any reply still queued, so a client that sent more than we read (an
+/// oversized header) could lose its 400. Half-close first so the reply ends in
+/// FIN, then drain what the client still sends, bounded in bytes and time.
+fn close_gracefully(stream: &mut TcpStream) {
+    const DRAIN_BYTES: usize = 64 * 1024;
+    const DRAIN_TIME: Duration = Duration::from_millis(200);
+    if stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + DRAIN_TIME;
+    let mut drained = 0;
+    let mut chunk = [0; 4096];
+    while drained < DRAIN_BYTES {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => drained += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_closed_or_timed_out) => return,
+        }
+    }
+}
+
 fn respond(stream: &mut TcpStream, code: u16, body: serde_json::Value) -> Result<(), Error> {
     let body = serde_json::to_vec(&body)?;
     if body.len() > 32 * 1024 * 1024 {
@@ -701,6 +730,7 @@ fn respond(stream: &mut TcpStream, code: u16, body: serde_json::Value) -> Result
         413 => "Content Too Large",
         422 => "Unprocessable Content",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Not Found",
     };
     write!(
