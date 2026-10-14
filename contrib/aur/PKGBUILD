@@ -1,6 +1,6 @@
 # Maintainer: Cristian Zmole <urma@rosint.org>
 pkgname=urma-node
-pkgver=0.7.0
+pkgver=0.7.1
 pkgrel=1
 pkgdesc='URMA archive node: service, control CLI and desktop status app'
 arch=('x86_64')
