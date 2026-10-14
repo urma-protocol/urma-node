@@ -23,7 +23,10 @@ use std::{
     fs,
     net::TcpListener,
     path::Path,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -153,6 +156,9 @@ fn autonat(root: &Path) -> Value {
         root,
         "a node without a listener is private and advertises nothing",
     );
+    // The server is C's only peer: it reported the address C probes (the
+    // witness) and is the server that fails the dial-back. A witness may not
+    // confirm, but its failure still counts toward private.
     let hidden = node(root, "c", None);
     assert_eq!(hidden.dial(server.listening()), server.id);
     let private = until(PROBE, || {
@@ -162,6 +168,7 @@ fn autonat(root: &Path) -> Value {
         "public":confirmed,
         "external":external == vec![bare(&public.listening())],
         "private":private,
+        "witness_only":hidden.connected() == vec![server.id],
         "hidden_external":hidden.network.external_addresses().len(),
     })
 }
@@ -286,6 +293,68 @@ fn daemon(root: &Path) -> Value {
     json!({"reserved":reserved,"demoted":demoted,"held":held})
 }
 
+/// P's eight inbound data slots hold seven proven peers (private, so they
+/// reserve too), kept busy with Peers requests, and one that reserves but
+/// never speaks the records
+/// protocol. Past the data budget a newcomer is only a holder. Once the
+/// unproven grace passes, the reserving peer is demoted: its reservation and
+/// connection stay, and the slot it held takes the next newcomer as data.
+fn unproven(root: &Path) -> Value {
+    let p = forced(root, "p", PUBLIC[0], Reachability::Public);
+    let fillers: Vec<Node> = (0..7).map(|n| node(root, &format!("f{n}"), None)).collect();
+    for filler in &fillers {
+        assert_eq!(filler.dial(p.listening()), p.id);
+    }
+    let reserving = NatPeer::start(None, false);
+    assert_eq!(reserving.dial(p.listening()), Ok(p.id));
+    reserving.listen(p.listening().with(Protocol::P2pCircuit));
+    let reserved = until(Duration::from_secs(5), || {
+        p.network.reserved_by_others().contains(&reserving.id)
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = {
+        let (stop, networks, target) = (
+            Arc::clone(&stop),
+            fillers
+                .iter()
+                .map(|f| Arc::clone(&f.network))
+                .collect::<Vec<_>>(),
+            p.id,
+        );
+        thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                for network in &networks {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    assert!(network.peers_of(target, 0, &stop, deadline).is_ok());
+                }
+                thread::sleep(Duration::from_secs(5));
+            }
+        })
+    };
+    stage(root, "past the data budget a newcomer is only a holder");
+    let early = NatPeer::start(None, false);
+    assert_eq!(early.dial(p.listening()), Ok(p.id));
+    let full = until(Duration::from_secs(2), || p.connected().contains(&early.id))
+        && !p.network.has_direct(early.id);
+    stage(root, "the unproven reserving peer is demoted, not closed");
+    let demoted = until(Duration::from_secs(80), || {
+        !p.network.has_direct(reserving.id)
+    });
+    let kept =
+        reserving.connections(p.id) == 1 && p.network.reserved_by_others().contains(&reserving.id);
+    stage(root, "its data slot takes the next newcomer");
+    let late = NatPeer::start(None, false);
+    assert_eq!(late.dial(p.listening()), Ok(p.id));
+    let reused = until(Duration::from_secs(5), || p.network.has_direct(late.id));
+    let fillers_kept = fillers.iter().all(|f| p.network.has_direct(f.id));
+    stop.store(true, Ordering::Release);
+    busy.join().unwrap();
+    json!({
+        "reserved":reserved,"full":full,"demoted":demoted,"kept":kept,
+        "reused":reused,"fillers_kept":fillers_kept,
+    })
+}
+
 /// P relays for B; returns B's circuit address through P.
 fn reserved(root: &Path, p: &Node, b: &Node) -> Multiaddr {
     stage(root, "a private node reserves on the public peer it dialed");
@@ -379,6 +448,7 @@ fn peer_nat_host() {
         "dialback" => dialback(&root),
         "holders" => holders(&root),
         "daemon" => daemon(&root),
+        "unproven" => unproven(&root),
         _ => panic!("unknown owned scenario"),
     };
     report(&root, &scenario, checks);
@@ -390,6 +460,21 @@ fn a_daemon_keeps_its_reservation_across_sync_steps() {
     assert_eq!(checks["reserved"], true, "{checks}");
     assert_eq!(checks["demoted"], true, "{checks}");
     assert_eq!(checks["held"], true, "{checks}");
+}
+
+#[test]
+fn an_unproven_reserving_peer_is_demoted_and_its_data_slot_reused() {
+    let checks = run(HOST, "unproven");
+    for check in [
+        "reserved",
+        "full",
+        "demoted",
+        "kept",
+        "reused",
+        "fillers_kept",
+    ] {
+        assert_eq!(checks[check], true, "{check}: {checks}");
+    }
 }
 
 #[test]
@@ -423,7 +508,8 @@ fn autonat_confirms_dialable_addresses_and_never_advertises_observations() {
     let checks = run(HOST, "autonat");
     assert_eq!(checks["public"], true, "{checks}");
     assert_eq!(checks["external"], true);
-    assert_eq!(checks["private"], true);
+    assert_eq!(checks["private"], true, "a witness's failed probe counts");
+    assert_eq!(checks["witness_only"], true, "{checks}");
     assert_eq!(checks["hidden_external"], 0);
 }
 
