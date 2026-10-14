@@ -110,9 +110,8 @@ forcibly interrupted. Pruned mode keeps roots and does not automatically
 download leaves or data; they are fetched only when pinned or recovered on demand.
 
 Peer discovery and the soft multipart cache target are described below. The
-daemon targets Linux: `contrib/` holds a user-systemd unit and an operator
-checklist, with no installer. Windows I/O/ACL porting, an installer and Windows
-Service integration are not implemented.
+daemon runs as a system service under systemd, OpenRC, runit or the Windows
+service manager; see [System service](#system-service).
 
 The standalone foreground process handles Linux SIGINT, SIGTERM and SIGHUP as
 cooperative stop requests, like authenticated HTTP shutdown. Inherited ignored
@@ -128,6 +127,27 @@ join. Embedded `Service` users can request its `shutdown_handle()` and wait for
 A [manual user-systemd template](contrib/systemd/README.md) uses this foreground
 process with operator-supplied paths, an offline base invocation and a finite
 supervisor stop timeout. It installs, enables and starts nothing automatically.
+
+## System service
+
+`urma-node service install [--init auto|systemd|openrc|runit|windows]`, run as
+root or Administrator, creates the `urma-node` account and the service files,
+registers `urma-node service run` with the init system and starts it. Running it
+again updates the registration. `update` rewrites the registration and restarts
+the service. `uninstall` removes the registration; `--purge` also removes data,
+configuration, logs and the account. Without a supported init system, install
+exits with code 3 and names the paths to configure by hand.
+
+`urma-node service status` prints one JSON object:
+
+- `init`: `systemd`, `openrc`, `runit` or `windows`.
+- `registered`: the service is registered with that init system.
+- `enabled`: the init system starts it at boot.
+- `running`: the init system's own view. A supervisor that keeps respawning a
+  child which dies before serving still counts as running.
+- `listening`: a TCP connection to the control address in `service.json`
+  (default `127.0.0.1:28331`) succeeded within one second. No token or HTTP is
+  involved; use it to tell a serving node from a respawn loop.
 
 ## Local development
 

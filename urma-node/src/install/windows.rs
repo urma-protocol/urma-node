@@ -212,6 +212,7 @@ impl<R: Runner> System<R> {
             registered: false,
             enabled: false,
             running: false,
+            listening: false,
         };
         for service in Scm::open(&manager)? {
             status.registered = true;

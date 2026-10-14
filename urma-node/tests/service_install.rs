@@ -4,12 +4,14 @@ use std::{
     collections::HashMap,
     fs::{self, OpenOptions, Permissions},
     io::Write,
+    net::{SocketAddr, TcpListener},
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
 use tempfile::TempDir;
-use urma_node::install::{
-    Action, Error, Host, Init, InitChoice, Outcome, Registration, Runner, System,
+use urma_node::{
+    install::{Action, Error, Host, Init, InitChoice, Outcome, Registration, Runner, System},
+    platform::ServiceSettings,
 };
 
 struct Fake {
@@ -182,6 +184,19 @@ fn snapshot(name: &str) -> Result<String, Error> {
         .join("tests/snapshots/install")
         .join(name);
     Ok(fs::read_to_string(path)?)
+}
+
+fn point_control_at(lab: &Lab, address: SocketAddr) -> Result<(), Error> {
+    let path = lab.path("etc/urma-node/service.json");
+    let mut settings = ServiceSettings::read(&path)?;
+    settings.listen = address;
+    fs::write(&path, serde_json::to_vec_pretty(&settings)?)?;
+    Ok(())
+}
+
+fn closed_port() -> Result<SocketAddr, Error> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?)
 }
 
 const HINT: &str = "To read the node token as your desktop user, run: sudo usermod -a -G urma-node <user>, then log in again.\n";
@@ -453,11 +468,15 @@ fn update_without_a_registration_fails() -> Result<(), Error> {
 fn status_reports_json() -> Result<(), Error> {
     let lab = Lab::new(&["run/systemd/system"], &SYSTEMD)?;
     let mut system = lab.system(NOBODY, "")?;
-    assert_eq!(
-        status(&mut system)?,
-        "{\"init\":\"systemd\",\"registered\":false,\"enabled\":false,\"running\":false}\n"
-    );
+    let absent: serde_json::Value = serde_json::from_str(&status(&mut system)?)?;
+    assert_eq!(absent["init"], "systemd");
+    assert_eq!(absent["registered"], false);
+    assert_eq!(absent["enabled"], false);
+    assert_eq!(absent["running"], false);
+    assert!(absent["listening"].is_boolean());
     install(&mut system)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    point_control_at(&lab, listener.local_addr()?)?;
     let answers = [
         (
             "/usr/bin/systemctl is-enabled urma-node.service",
@@ -470,7 +489,13 @@ fn status_reports_json() -> Result<(), Error> {
     }
     assert_eq!(
         status(&mut system)?,
-        "{\"init\":\"systemd\",\"registered\":true,\"enabled\":true,\"running\":true}\n"
+        "{\"init\":\"systemd\",\"registered\":true,\"enabled\":true,\"running\":true,\"listening\":true}\n"
+    );
+    drop(listener);
+    assert_eq!(
+        status(&mut system)?,
+        "{\"init\":\"systemd\",\"registered\":true,\"enabled\":true,\"running\":true,\"listening\":false}\n",
+        "a supervisor that respawns a dead child is running but not listening"
     );
     Ok(())
 }
@@ -576,9 +601,10 @@ fn runit_links_into_the_first_active_service_dir() -> Result<(), Error> {
         "/usr/bin/sv status /etc/sv/urma-node".to_owned(),
         ok("run: /etc/sv/urma-node: (pid 7) 3s\n"),
     );
+    point_control_at(&lab, closed_port()?)?;
     assert_eq!(
         status(&mut system)?,
-        "{\"init\":\"runit\",\"registered\":true,\"enabled\":true,\"running\":true}\n"
+        "{\"init\":\"runit\",\"registered\":true,\"enabled\":true,\"running\":true,\"listening\":false}\n"
     );
     system.runner.calls.clear();
     install(&mut system)?;

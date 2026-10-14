@@ -291,6 +291,7 @@ impl<R: Runner> System<R> {
             registered: true,
             enabled,
             running,
+            listening: false,
         })
     }
 }

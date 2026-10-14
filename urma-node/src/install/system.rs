@@ -1,13 +1,16 @@
 #[cfg(unix)]
 use crate::install::Outcome;
 use crate::{
+    config::SERVICE_LISTEN,
     install::{Action, Commands, Error, Host, InitChoice, Runner},
-    platform::Paths,
+    platform::{Paths, ServiceSettings},
 };
 use serde::Serialize;
 use std::{
-    io::Write,
+    io::{ErrorKind, Write},
+    net::{SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -31,6 +34,7 @@ pub struct Status {
     pub registered: bool,
     pub enabled: bool,
     pub running: bool,
+    pub listening: bool,
 }
 
 pub struct Search;
@@ -168,14 +172,44 @@ impl<R: Runner> System<R> {
     }
 
     fn status(&mut self) -> Result<Status, Error> {
-        match self.registration()? {
-            Registration::Registered(init) => self.state(init),
-            Registration::Absent => Ok(Status {
+        let mut status = match self.registration()? {
+            Registration::Registered(init) => self.state(init)?,
+            Registration::Absent => Status {
                 init: self.detect()?,
                 registered: false,
                 enabled: false,
                 running: false,
-            }),
+                listening: false,
+            },
+        };
+        status.listening = listening(self.control_address()?)?;
+        Ok(status)
+    }
+
+    pub fn control_address(&self) -> Result<SocketAddr, Error> {
+        let settings = self.paths().settings;
+        match settings.try_exists()? {
+            true => Ok(ServiceSettings::read(&settings)?.listen),
+            false => Ok(SERVICE_LISTEN),
         }
+    }
+}
+
+struct Probe;
+
+impl Probe {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+}
+
+fn listening(address: SocketAddr) -> Result<bool, Error> {
+    match TcpStream::connect_timeout(&address, Probe::TIMEOUT) {
+        Ok(stream) => {
+            drop(stream);
+            Ok(true)
+        }
+        Err(error) => match error.kind() {
+            ErrorKind::ConnectionRefused | ErrorKind::TimedOut => Ok(false),
+            _ => Err(error.into()),
+        },
     }
 }
