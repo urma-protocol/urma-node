@@ -1,4 +1,4 @@
-//! Writes the three archives of the CI NAT simulation (.github/scripts/
+//! Writes the three archives of the local NAT simulation (.github/scripts/
 //! nat-test.sh). Not a check: run once with URMA_FIXTURE_DIR set. No network.
 //! P, A and B select one mock Litecoin testnet chain; only B scans it, so
 //! every record A holds came over the overlay and none from P or a scan.
