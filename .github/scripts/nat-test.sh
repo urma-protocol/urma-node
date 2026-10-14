@@ -4,7 +4,10 @@
 #   sudo nat-test.sh BIN_DIR FIXTURE_DIR cone|symmetric
 # BIN_DIR holds urma-node and urma-node-control; FIXTURE_DIR is written by
 #   URMA_FIXTURE_DIR=DIR cargo test -p urma-node --test nat_fixture -- --ignored
-# and copied, never changed. Only B holds records.
+# and copied, never changed. Only B holds records. Optional environment
+# (pass through sudo with `sudo env NAT_LOG=... nat-test.sh ...`):
+#   NAT_LOG   RUST_LOG filter for the three daemons
+#   NAT_KEEP  directory that receives each daemon's log and status timeline
 #
 #   P 11.0.1.10 (seed, relay) ── inet ─┬─ 11.0.2.10 nat-a ── 192.168.1.2 A
 #                                      └─ 11.0.3.10 nat-b ── 192.168.2.2 B
@@ -27,6 +30,10 @@ cone) masquerade=(-j MASQUERADE) ;;
 symmetric) masquerade=(-j MASQUERADE --random-fully) ;;
 *) echo "mode must be cone or symmetric" >&2; exit 2 ;;
 esac
+
+# The namespace names are fixed and a run clears leftovers: one run at a time.
+exec 9>/run/urmanat.lock
+flock -n 9 || { echo "waiting for another nat-test run" >&2; flock 9; }
 
 P_IP=11.0.1.10
 NODES=(p a b)
@@ -53,6 +60,9 @@ diagnose() {
         control "$node" overlay-book || true
         echo "--- $node log"
         tail -n 150 "$work/$node.log" || true
+        echo "--- $node timeline (changes only)"
+        awk '{k = $0; sub(/^\{"t":[0-9]+,/, "{", k); if (k != last) print; last = k}' \
+            "$work/$node.timeline" 2>/dev/null || true
     done
     for router in nat-a nat-b; do
         echo "--- $router nat"
@@ -63,6 +73,7 @@ diagnose() {
 
 cleanup() {
     rc=$?
+    [ -n "${sampler:-}" ] && kill "$sampler" 2>/dev/null || true
     [ "$rc" -eq 0 ] || diagnose
     for node in "${NODES[@]}"; do
         [ -n "${pid[$node]:-}" ] && kill -TERM "${pid[$node]}" 2>/dev/null || true
@@ -72,6 +83,11 @@ cleanup() {
         sleep 0.5
     done
     teardown
+    if [ -n "${NAT_KEEP:-}" ]; then
+        mkdir -p "$NAT_KEEP/$mode"
+        cp "$work"/*.log "$work"/*.timeline "$NAT_KEEP/$mode/" 2>/dev/null || true
+        chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$NAT_KEEP"
+    fi
     rm -rf "$work"
     exit "$rc"
 }
@@ -151,7 +167,7 @@ sealed() {
 # already selected and nothing leaves the topology.
 serve() {
     local node=$1
-    at "$node" "$bin/urma-node" --data "$work/$node/data" --config "$work/$node/config.json" \
+    at "$node" env ${NAT_LOG:+RUST_LOG="$NAT_LOG"} "$bin/urma-node" --data "$work/$node/data" --config "$work/$node/config.json" \
         serve --listen 127.0.0.1:28331 --token-file "$work/$node/service.token" \
         --p2p --no-commit-public --chain-peer 127.0.0.1:9 \
         --peer-key "$work/$node/peer.key" --urma-listen 0.0.0.0:28332 --no-seeds "${@:2}" \
@@ -162,6 +178,23 @@ serve() {
 }
 
 up() { status "$1" | jq -e .overlay.peer_id >/dev/null; }
+
+# Overlay state of every node every 2 s, for the diagnostics.
+sample() {
+    local node
+    trap - EXIT INT TERM
+    while :; do
+        for node in "${NODES[@]}"; do
+            status "$node" 2>/dev/null | jq -c --argjson t "$SECONDS" '{t: $t} + (.overlay | {
+                reachability, relays: [.relays[]? | .[-6:]], connected,
+                peers: [.peers[] | {id: .label[-6:], link, synced_through}],
+                hole_punch: (.hole_punch | {attempts, successes, last_error}),
+                book: .discovery.book, gossip: .discovery.gossip})' \
+                >>"$work/$node.timeline" || true
+        done
+        sleep 2
+    done
+}
 
 # wait_for SECONDS WHAT COMMAND...
 wait_for() {
@@ -276,6 +309,8 @@ serve p --urma-announce "/ip4/$P_IP/tcp/28332" --urma-announce "/ip4/$P_IP/udp/2
 seed=/ip4/$P_IP/tcp/28332/p2p/${id[p]}
 serve a --urma-seed "$seed"
 serve b --urma-seed "$seed"
+sample &
+sampler=$!
 sealed
 
 wait_for 120 "A reaches P" reached a p
@@ -284,6 +319,14 @@ wait_for 60 "P lists A and B" eval 'listed p a && listed p b'
 wait_for 120 "P public, A and B private" \
     eval 'reachability p public && reachability a private && reachability b private'
 wait_for 120 "A and B reserve on P" eval 'reserved a && reserved b'
+# Reservations are what make A and B reachable: they must outlive idle.
+for _ in $(seq 15); do
+    sleep 2
+    for node in a b; do
+        reserved "$node" || { echo "$node dropped its reservation on P" >&2; exit 1; }
+    done
+done
+echo "ok: A and B hold their reservations for 30 s"
 wait_for 180 "A learns B's circuit address through P" circuit a b p
 wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p direct'
 
