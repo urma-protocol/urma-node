@@ -4,7 +4,10 @@
 //! never negotiates it, in either direction. Identify's raw observations
 //! never become address candidates on their own; the network loop offers
 //! only the ones it accepts, through `Candidates`.
-use crate::peer_limits::{Class, Classes};
+use crate::{
+    peer_limits::{Class, Classes},
+    peer_reach::{direct_shape, without_peer},
+};
 use either::Either;
 use libp2p::{
     Multiaddr, PeerId,
@@ -20,6 +23,7 @@ use libp2p::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
+    fmt,
     task::{Context, Poll},
 };
 
@@ -27,6 +31,8 @@ use std::{
 enum Fence {
     DataOnly,
     NoCandidates,
+    NoConfirmations,
+    PublicDialBacks,
 }
 
 pub(crate) struct Fenced<B> {
@@ -35,29 +41,67 @@ pub(crate) struct Fenced<B> {
     classes: Classes,
     outside: HashSet<ConnectionId>,
     inside: HashMap<PeerId, HashSet<ConnectionId>>,
+    dial_backs: HashSet<ConnectionId>,
+}
+
+/// A dial-back target outside the public IPv4 internet, refused before any
+/// connection attempt.
+#[derive(Debug)]
+pub(crate) struct DialBackRefused;
+
+impl fmt::Display for DialBackRefused {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AutoNAT dial-back only reaches public IPv4 addresses")
+    }
+}
+
+impl std::error::Error for DialBackRefused {}
+
+/// `/ip4/<public>/tcp/<port>` or `/ip4/<public>/udp/<port>/quic-v1`, with an
+/// optional `/p2p`: never loopback, private, CGNAT, link-local, reserved or
+/// IPv6, so an outside client cannot aim our dial-back at internal services.
+fn dial_back_allowed(address: &Multiaddr) -> bool {
+    let bare = without_peer(address);
+    matches!(bare.iter().next(), Some(Protocol::Ip4(_))) && direct_shape(&bare)
 }
 
 impl<B> Fenced<B> {
-    /// Runs `inner` only on connections admitted as data connections.
-    pub(crate) fn data_only(inner: B, classes: Classes) -> Self {
+    fn new(inner: B, fence: Fence, classes: Classes) -> Self {
         Self {
             inner,
-            fence: Fence::DataOnly,
+            fence,
             classes,
             outside: HashSet::new(),
             inside: HashMap::new(),
+            dial_backs: HashSet::new(),
         }
+    }
+
+    /// Runs `inner` only on connections admitted as data connections.
+    pub(crate) fn data_only(inner: B, classes: Classes) -> Self {
+        Self::new(inner, Fence::DataOnly, classes)
     }
 
     /// Runs `inner` everywhere but drops the address candidates it reports.
     pub(crate) fn without_candidates(inner: B) -> Self {
-        Self {
-            inner,
-            fence: Fence::NoCandidates,
-            classes: Classes::default(),
-            outside: HashSet::new(),
-            inside: HashMap::new(),
-        }
+        Self::new(inner, Fence::NoCandidates, Classes::default())
+    }
+
+    /// Runs `inner` everywhere but drops the external addresses it confirms:
+    /// the network loop judges each AutoNAT result itself.
+    pub(crate) fn without_confirmations(inner: B) -> Self {
+        Self::new(inner, Fence::NoConfirmations, Classes::default())
+    }
+
+    /// Runs `inner` everywhere but refuses its dials to anything but public
+    /// IPv4 addresses.
+    pub(crate) fn public_dial_backs(inner: B) -> Self {
+        Self::new(inner, Fence::PublicDialBacks, Classes::default())
+    }
+
+    fn refuse_dial_back(&mut self, id: ConnectionId, addresses: &[Multiaddr]) -> bool {
+        self.dial_backs.remove(&id)
+            && (addresses.is_empty() || !addresses.iter().all(dial_back_allowed))
     }
 
     pub(crate) fn inner_mut(&mut self) -> &mut B {
@@ -122,6 +166,9 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Fenced<B> {
         addresses: &[Multiaddr],
         role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        if self.refuse_dial_back(id, addresses) {
+            return Err(ConnectionDenied::new(DialBackRefused));
+        }
         self.inner
             .handle_pending_outbound_connection(id, peer, addresses, role)
     }
@@ -206,6 +253,12 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Fenced<B> {
             match self.inner.poll(cx) {
                 Poll::Ready(ToSwarm::NewExternalAddrCandidate(_))
                     if self.fence == Fence::NoCandidates => {}
+                Poll::Ready(ToSwarm::ExternalAddrConfirmed(_))
+                    if self.fence == Fence::NoConfirmations => {}
+                Poll::Ready(ToSwarm::Dial { opts }) if self.fence == Fence::PublicDialBacks => {
+                    self.dial_backs.insert(opts.connection_id());
+                    return Poll::Ready(ToSwarm::Dial { opts });
+                }
                 Poll::Ready(action) => return Poll::Ready(action.map_in(Either::Left)),
                 Poll::Pending => return Poll::Pending,
             }

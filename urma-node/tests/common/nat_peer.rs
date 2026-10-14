@@ -4,7 +4,7 @@
 //! requests over whatever connections it holds to the peer.
 //! Loaded with #[path]; it is not part of the shared common module.
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, dcutr,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr,
     futures::StreamExt,
     identify,
     identity::Keypair,
@@ -38,6 +38,7 @@ struct Raw {
     identify: identify::Behaviour,
     relay: relay::client::Behaviour,
     dcutr: Toggle<dcutr::Behaviour>,
+    autonat: autonat::v2::client::Behaviour,
 }
 
 type Reported<T> = mpsc::SyncSender<Result<T, String>>;
@@ -52,6 +53,7 @@ pub struct NatPeer {
     ops: async_mpsc::Sender<Op>,
     stop: Arc<AtomicBool>,
     counts: Counts,
+    probes: Probes,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -79,6 +81,7 @@ fn raw_swarm(key: Keypair, punch: bool) -> Swarm<Raw> {
             )),
             relay,
             dcutr: Toggle::from(punch.then(|| dcutr::Behaviour::new(key.public().to_peer_id()))),
+            autonat: autonat::v2::client::Behaviour::default(),
         })
         .unwrap()
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -86,12 +89,15 @@ fn raw_swarm(key: Keypair, punch: bool) -> Swarm<Raw> {
 }
 
 type Counts = Arc<Mutex<HashMap<PeerId, u32>>>;
+/// AutoNAT results: the tested address and whether the server reached it.
+type Probes = Arc<Mutex<Vec<(Multiaddr, bool)>>>;
 
 #[derive(Default)]
 struct Waiting {
     dials: HashMap<ConnectionId, Reported<PeerId>>,
     calls: HashMap<OutboundRequestId, Reported<Reply>>,
     counts: Counts,
+    probes: Probes,
 }
 
 fn serve(swarm: &mut Swarm<Raw>, request: Request, channel: ResponseChannel<Response>) {
@@ -189,6 +195,14 @@ fn event(swarm: &mut Swarm<Raw>, waiting: &mut Waiting, event: SwarmEvent<RawEve
             error,
             ..
         })) => answer(waiting, request_id, Err(error.to_string())),
+        SwarmEvent::Behaviour(RawEvent::Autonat(probe)) => {
+            let reached = probe.result.is_ok();
+            waiting
+                .probes
+                .lock()
+                .unwrap()
+                .push((probe.tested_addr, reached));
+        }
         _ => (),
     }
 }
@@ -202,10 +216,11 @@ fn answer(waiting: &mut Waiting, id: OutboundRequestId, result: Result<Response,
 async fn run(
     mut swarm: Swarm<Raw>,
     mut ops: async_mpsc::Receiver<Op>,
-    (stop, counts): (Arc<AtomicBool>, Counts),
+    (stop, counts, probes): (Arc<AtomicBool>, Counts, Probes),
 ) {
     let mut waiting = Waiting {
         counts,
+        probes,
         ..Waiting::default()
     };
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -230,7 +245,8 @@ impl NatPeer {
         let (ops, receiver) = async_mpsc::channel(4);
         let stop = Arc::new(AtomicBool::new(false));
         let counts = Counts::default();
-        let shared = (stop.clone(), counts.clone());
+        let probes = Probes::default();
+        let shared = (stop.clone(), counts.clone(), probes.clone());
         let worker = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -249,8 +265,14 @@ impl NatPeer {
             ops,
             stop,
             counts,
+            probes,
             worker: Some(worker),
         }
+    }
+
+    /// AutoNAT results so far: tested address and whether it was reached.
+    pub fn probes(&self) -> Vec<(Multiaddr, bool)> {
+        self.probes.lock().unwrap().clone()
     }
 
     /// Connections currently open to `peer`.

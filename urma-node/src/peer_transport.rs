@@ -39,7 +39,7 @@ pub(crate) struct Behaviour {
     pub(crate) identify: Fenced<identify::Behaviour>,
     pub(crate) candidates: Candidates,
     pub(crate) autonat: autonat::v2::client::Behaviour,
-    pub(crate) autonat_server: autonat::v2::server::Behaviour,
+    pub(crate) autonat_server: Fenced<autonat::v2::server::Behaviour>,
     pub(crate) relay: Rewaken<relay::Behaviour>,
     pub(crate) relay_client: relay::client::Behaviour,
     pub(crate) dcutr: dcutr::Behaviour,
@@ -157,7 +157,7 @@ fn behaviour(
         identify: Fenced::without_candidates(identify),
         candidates: Candidates::default(),
         autonat: autonat::v2::client::Behaviour::default(),
-        autonat_server: autonat::v2::server::Behaviour::default(),
+        autonat_server: Fenced::public_dial_backs(autonat::v2::server::Behaviour::default()),
         relay: Rewaken(relay::Behaviour::new(
             local,
             relay_config(&wiring.relay_open, local),

@@ -139,6 +139,50 @@ fn autonat(root: &Path) -> Value {
     })
 }
 
+/// The first AutoNAT result `client` gets, within the probe bound.
+fn probed(client: &NatPeer) -> Option<(Multiaddr, bool)> {
+    until(PROBE, || !client.probes().is_empty());
+    client.probes().into_iter().next()
+}
+
+/// N listens everywhere. A client reaching it over loopback is observed at
+/// 127.0.0.1 and asks for a dial-back there: N refuses before dialing, though
+/// the client listens on that address. A public client is dialed back.
+fn dialback(root: &Path) -> Value {
+    let n = node(root, "n", Some("0.0.0.0"));
+    let port = tcp_port(&n.listening()).expect("TCP listener");
+    let at = |ip: &str| -> Multiaddr {
+        format!("/ip4/{ip}/tcp/{port}/p2p/{}", n.id)
+            .parse()
+            .unwrap()
+    };
+    stage(
+        root,
+        "a dial-back to loopback is refused before any attempt",
+    );
+    let inside = NatPeer::start(Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()), false);
+    assert_eq!(inside.dial(at("127.0.0.1")), Ok(n.id));
+    let refused = probed(&inside);
+    thread::sleep(Duration::from_secs(1));
+    let attempts = inside.connections(n.id);
+    stage(root, "a dial-back to a public address is made");
+    let outside = NatPeer::start(
+        Some(format!("/ip4/{}/tcp/0", PUBLIC[0]).parse().unwrap()),
+        false,
+    );
+    assert_eq!(outside.dial(at(PUBLIC[1])), Ok(n.id));
+    let reached = probed(&outside);
+    let loopback = refused
+        .as_ref()
+        .is_some_and(|(address, _)| address.to_string().starts_with("/ip4/127.0.0.1/"));
+    json!({
+        "loopback_tested":loopback,
+        "loopback_reached":refused.is_some_and(|(_, ok)| ok),
+        "connections":attempts,
+        "public_reached":reached.is_some_and(|(_, ok)| ok),
+    })
+}
+
 /// P relays for B; returns B's circuit address through P.
 fn reserved(root: &Path, p: &Node, b: &Node) -> Multiaddr {
     stage(root, "a private node reserves on the public peer it dialed");
@@ -229,9 +273,19 @@ fn peer_nat_host() {
         "autonat" => autonat(&root),
         "relay" => relay(&root),
         "punch" => punch(&root),
+        "dialback" => dialback(&root),
         _ => panic!("unknown owned scenario"),
     };
     report(&root, &scenario, checks);
+}
+
+#[test]
+fn autonat_dial_backs_reach_only_public_ipv4() {
+    let checks = run(HOST, "dialback");
+    assert_eq!(checks["loopback_tested"], true);
+    assert_eq!(checks["loopback_reached"], false);
+    assert_eq!(checks["connections"], 1, "no dial-back connection was made");
+    assert_eq!(checks["public_reached"], true);
 }
 
 #[test]

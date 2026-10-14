@@ -127,7 +127,7 @@ impl Remotes {
     }
 }
 
-fn without_peer(address: &Multiaddr) -> Multiaddr {
+pub(crate) fn without_peer(address: &Multiaddr) -> Multiaddr {
     address
         .iter()
         .filter(|part| !matches!(part, Protocol::P2p(_)))
