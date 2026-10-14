@@ -114,6 +114,12 @@ impl Remotes {
             .collect()
     }
 
+    fn has_data(&self, peer: PeerId) -> bool {
+        self.0
+            .values()
+            .any(|remote| remote.peer == peer && remote.class == Class::Data)
+    }
+
     fn relayed_of(&self, peer: PeerId) -> Vec<ConnectionId> {
         self.0
             .iter()
@@ -321,16 +327,18 @@ impl Reach {
     /// confirmed address of the same transport no longer maps to us.
     pub(crate) fn observed(
         &mut self,
-        swarm: &mut Swarm<Behaviour>,
+        (swarm, remotes): (&mut Swarm<Behaviour>, &Remotes),
         (observed, witness): (Multiaddr, PeerId),
         nat: &Nat,
     ) {
         if !direct_shape(&observed) {
             return;
         }
+        let reported = (witness, Instant::now());
+        let data = |peer: &PeerId| remotes.has_data(*peer);
         for stale in self
             .externals
-            .witnessed(&observed, witness, &nat.external())
+            .witnessed(&observed, reported, &nat.external(), data)
         {
             tracing::info!(%stale, now = %observed, "external address mapping changed");
             swarm.remove_external_address(&stale);

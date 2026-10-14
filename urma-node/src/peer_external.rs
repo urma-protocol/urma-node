@@ -9,7 +9,10 @@
 //! other address of the same transport: the mapping changed.
 use crate::peer_reach::{direct_shape, without_peer};
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 /// What one successful AutoNAT result means for our advertised addresses.
 #[derive(Debug, PartialEq, Eq)]
@@ -23,7 +26,7 @@ pub(crate) struct Externals {
     local: PeerId,
     announce: Vec<Multiaddr>,
     bound: HashSet<Multiaddr>,
-    witnesses: HashMap<Multiaddr, HashSet<PeerId>>,
+    witnesses: HashMap<Multiaddr, HashMap<PeerId, Instant>>,
     retried: HashSet<Multiaddr>,
 }
 
@@ -34,6 +37,7 @@ fn is_quic(address: &Multiaddr) -> bool {
 impl Externals {
     const WITNESSED_MAX: usize = 16;
     const MOVED: usize = 2;
+    const WINDOW: Duration = Duration::from_secs(10 * 60);
 
     pub(crate) fn new(local: PeerId, announce: Vec<Multiaddr>) -> Self {
         Self {
@@ -64,13 +68,16 @@ impl Externals {
         Some(bare)
     }
 
-    /// `witness`, a peer we dialed directly, sees us at `observed`. Returns
-    /// the confirmed addresses this shows stale.
+    /// `witness`, a peer we dialed directly, sees us at `observed` at `now`.
+    /// Returns the confirmed addresses this shows stale: two witnesses within
+    /// the window, both still holding a data connection (`data`), agree on
+    /// another address of the same transport.
     pub(crate) fn witnessed(
         &mut self,
         observed: &Multiaddr,
-        witness: PeerId,
+        (witness, now): (PeerId, Instant),
         externals: &[Multiaddr],
+        data: impl Fn(&PeerId) -> bool,
     ) -> Vec<Multiaddr> {
         let full = self.witnesses.len() >= Self::WITNESSED_MAX;
         if full && !self.witnesses.contains_key(observed) {
@@ -79,7 +86,12 @@ impl Externals {
             }
         }
         let seen = self.witnesses.entry(observed.clone()).or_default();
-        if !seen.insert(witness) || seen.len() < Self::MOVED || self.announced() {
+        seen.insert(witness, now);
+        let recent = seen
+            .iter()
+            .filter(|(peer, at)| now.duration_since(**at) <= Self::WINDOW && data(peer))
+            .count();
+        if recent < Self::MOVED || self.announced() {
             return Vec::new();
         }
         externals
@@ -101,7 +113,7 @@ impl Externals {
         let witnessed = self
             .witnesses
             .get(&bare)
-            .is_some_and(|seen| seen.contains(&server));
+            .is_some_and(|seen| seen.contains_key(&server));
         if !witnessed || self.bound.contains(&bare) {
             return Verdict::Confirm(bare);
         }
@@ -125,12 +137,22 @@ mod tests {
         text.parse().unwrap()
     }
 
+    /// `witness` reports `observed` now, while every witness holds data.
+    fn saw(
+        externals: &mut Externals,
+        observed: &Multiaddr,
+        witness: PeerId,
+        confirmed: &[Multiaddr],
+    ) -> Vec<Multiaddr> {
+        externals.witnessed(observed, (witness, Instant::now()), confirmed, |_| true)
+    }
+
     #[test]
     fn a_witness_cannot_confirm_what_it_reported_and_gets_one_retry_elsewhere() {
         let (local, liar, honest) = (peer(), peer(), peer());
         let mut externals = Externals::new(local, Vec::new());
         let victim = address("/ip4/1.2.3.4/tcp/28332");
-        externals.witnessed(&victim, liar, &[]);
+        saw(&mut externals, &victim, liar, &[]);
         let retry = victim.clone().with(Protocol::P2p(local));
         assert_eq!(
             externals.verdict(&victim, liar),
@@ -141,12 +163,32 @@ mod tests {
     }
 
     #[test]
+    fn a_retried_confirmation_is_advertised_without_its_p2p_suffix() {
+        let (local, witness, other) = (peer(), peer(), peer());
+        let mut externals = Externals::new(local, Vec::new());
+        let mapped = address("/ip4/1.2.3.4/udp/28332/quic-v1");
+        saw(&mut externals, &mapped, witness, &[]);
+        let Verdict::Retry(retry) = externals.verdict(&mapped, witness) else {
+            panic!("a witness confirmation is retried");
+        };
+        let Verdict::Confirm(advertised) = externals.verdict(&retry, other) else {
+            panic!("another server confirms the retry");
+        };
+        assert_eq!(advertised, mapped);
+        assert!(
+            advertised
+                .iter()
+                .all(|part| !matches!(part, Protocol::P2p(_)))
+        );
+    }
+
+    #[test]
     fn a_bound_address_counts_whoever_confirms_it() {
         let (local, seed) = (peer(), peer());
         let mut externals = Externals::new(local, Vec::new());
         let listener = address("/ip4/1.2.3.4/tcp/28332");
         assert_eq!(externals.bound(&listener), Some(listener.clone()));
-        externals.witnessed(&listener, seed, &[]);
+        saw(&mut externals, &listener, seed, &[]);
         assert_eq!(
             externals.verdict(&listener, seed),
             Verdict::Confirm(listener)
@@ -163,8 +205,8 @@ mod tests {
         assert!(externals.admits(&announce));
         assert!(!externals.admits(&other));
         let (a, b) = (peer(), peer());
-        externals.witnessed(&other, a, &[announce.clone()]);
-        assert!(externals.witnessed(&other, b, &[announce]).is_empty());
+        saw(&mut externals, &other, a, &[announce.clone()]);
+        assert!(saw(&mut externals, &other, b, &[announce]).is_empty());
     }
 
     #[test]
@@ -175,9 +217,27 @@ mod tests {
         let moved = address("/ip4/1.2.3.4/tcp/40001");
         let confirmed = [old.clone(), quic];
         let (a, b) = (peer(), peer());
-        assert!(externals.witnessed(&moved, a, &confirmed).is_empty());
-        assert!(externals.witnessed(&moved, a, &confirmed).is_empty());
-        assert_eq!(externals.witnessed(&moved, b, &confirmed), vec![old]);
+        assert!(saw(&mut externals, &moved, a, &confirmed).is_empty());
+        assert!(saw(&mut externals, &moved, a, &confirmed).is_empty());
+        assert_eq!(saw(&mut externals, &moved, b, &confirmed), vec![old]);
+    }
+
+    #[test]
+    fn only_recent_reports_from_peers_still_holding_data_count() {
+        let mut externals = Externals::new(peer(), Vec::new());
+        let old = address("/ip4/1.2.3.4/tcp/40000");
+        let moved = address("/ip4/1.2.3.4/tcp/40001");
+        let (a, b, c) = (peer(), peer(), peer());
+        let start = Instant::now();
+        let later = start + Externals::WINDOW + Duration::from_secs(1);
+        let confirmed = [old.clone()];
+        externals.witnessed(&moved, (a, start), &confirmed, |_| true);
+        let late = externals.witnessed(&moved, (b, later), &confirmed, |_| true);
+        assert!(late.is_empty(), "a's report fell out of the window");
+        let gone = externals.witnessed(&moved, (c, later), &confirmed, |peer| *peer != b);
+        assert!(gone.is_empty(), "b no longer holds a data connection");
+        let both = externals.witnessed(&moved, (c, later), &confirmed, |_| true);
+        assert_eq!(both, vec![old]);
     }
 
     #[test]
@@ -187,7 +247,7 @@ mod tests {
         externals.bound(&listener);
         let moved = address("/ip4/1.2.3.5/tcp/28332");
         let (a, b) = (peer(), peer());
-        externals.witnessed(&moved, a, &[listener.clone()]);
-        assert!(externals.witnessed(&moved, b, &[listener]).is_empty());
+        saw(&mut externals, &moved, a, &[listener.clone()]);
+        assert!(saw(&mut externals, &moved, b, &[listener]).is_empty());
     }
 }

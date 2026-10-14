@@ -492,7 +492,7 @@ async fn run(
                     // Only peers we dialed directly witness our address, and a
                     // witness only proposes it: AutoNAT confirms what is advertised.
                     if remotes.outbound_direct(connection_id) {
-                        reach.observed(&mut swarm, (info.observed_addr.clone(), peer_id), &shared.nat);
+                        reach.observed((&mut swarm, &remotes), (info.observed_addr.clone(), peer_id), &shared.nat);
                         shared.observe(info.observed_addr, peer_id);
                     }
                     shared.identified(peer_id, info.listen_addrs);
