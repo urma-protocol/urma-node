@@ -4,7 +4,10 @@
 #   sudo nat-test.sh BIN_DIR FIXTURE_DIR cone|symmetric
 # BIN_DIR holds urma-node and urma-node-control; FIXTURE_DIR is written by
 #   URMA_FIXTURE_DIR=DIR cargo test -p urma-node --test nat_fixture -- --ignored
-# and copied, never changed. Only B holds records.
+# and copied, never changed. Only B holds records. Optional environment
+# (pass through sudo with `sudo env NAT_LOG=... nat-test.sh ...`):
+#   NAT_LOG   RUST_LOG filter for the three daemons
+#   NAT_KEEP  directory that receives each daemon's log and status timeline
 #
 #   P 11.0.1.10 (seed, relay) ── inet ─┬─ 11.0.2.10 nat-a ── 192.168.1.2 A
 #                                      └─ 11.0.3.10 nat-b ── 192.168.2.2 B
@@ -76,6 +79,10 @@ cleanup() {
         sleep 0.5
     done
     teardown
+    if [ -n "${NAT_KEEP:-}" ]; then
+        mkdir -p "$NAT_KEEP/$mode"
+        cp "$work"/*.log "$work"/*.timeline "$NAT_KEEP/$mode/" 2>/dev/null || true
+    fi
     rm -rf "$work"
     exit "$rc"
 }
@@ -155,7 +162,7 @@ sealed() {
 # already selected and nothing leaves the topology.
 serve() {
     local node=$1
-    at "$node" "$bin/urma-node" --data "$work/$node/data" --config "$work/$node/config.json" \
+    at "$node" env ${NAT_LOG:+RUST_LOG="$NAT_LOG"} "$bin/urma-node" --data "$work/$node/data" --config "$work/$node/config.json" \
         serve --listen 127.0.0.1:28331 --token-file "$work/$node/service.token" \
         --p2p --no-commit-public --chain-peer 127.0.0.1:9 \
         --peer-key "$work/$node/peer.key" --urma-listen 0.0.0.0:28332 --no-seeds "${@:2}" \
