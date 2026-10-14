@@ -20,9 +20,10 @@ use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
 use nat_peer::NatPeer;
 use serde_json::{Value, json};
 use std::{
-    fs,
+    env, fs,
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -71,14 +72,26 @@ fn forced_on(engine: Arc<Engine>, ip: &str, reachability: Reachability) -> Node 
     forced_as(engine, ip, reachability, Keypair::generate_ed25519())
 }
 
-fn forced_as(engine: Arc<Engine>, ip: &str, reachability: Reachability, key: Keypair) -> Node {
-    let id = key.public().to_peer_id();
+fn free_listener(ip: &str) -> Multiaddr {
     let port = TcpListener::bind((ip, 0))
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    let listen: Multiaddr = format!("/ip4/{ip}/tcp/{port}").parse().unwrap();
+    format!("/ip4/{ip}/tcp/{port}").parse().unwrap()
+}
+
+fn forced_as(engine: Arc<Engine>, ip: &str, reachability: Reachability, key: Keypair) -> Node {
+    forced_at(engine, free_listener(ip), reachability, key)
+}
+
+fn forced_at(
+    engine: Arc<Engine>,
+    listen: Multiaddr,
+    reachability: Reachability,
+    key: Keypair,
+) -> Node {
+    let id = key.public().to_peer_id();
     let announce = match reachability {
         Reachability::Public => vec![listen.clone()],
         Reachability::Private | Reachability::Unknown => Vec::new(),
@@ -523,6 +536,63 @@ fn shutdown(root: &Path) -> Value {
     json!({"linked":linked,"shut":shut,"gone":gone,"ms":started.elapsed().as_millis()})
 }
 
+/// A dies by SIGKILL (no connection closes) and restarts with its key and
+/// port: P still holds A's dead QUIC link, yet admits the new one as a data
+/// link, so records and the chain probe work at once.
+fn crash(root: &Path) -> Value {
+    let p = forced(root, "p", PUBLIC[0], Reachability::Public);
+    let key = Keypair::generate_ed25519();
+    let id = key.public().to_peer_id();
+    let listen = free_listener(PUBLIC[1]);
+    let to_p = tcp_and_quic(&p.listening())[1]
+        .clone()
+        .with(Protocol::P2p(p.id));
+    let mut child = Command::new(env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "peer_nat_crash_node", "--nocapture"])
+        .env("CRASH_ROOT", root)
+        .env(
+            "CRASH_KEY",
+            hex::encode(key.to_protobuf_encoding().unwrap()),
+        )
+        .env("CRASH_LISTEN", listen.to_string())
+        .env("CRASH_DIAL", to_p.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = until(Duration::from_secs(30), || {
+        root.join("crash-ready").exists()
+    });
+    let linked = until(Duration::from_secs(5), || p.connected().contains(&id));
+    stage(root, "A dies by SIGKILL and restarts on its key and port");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let stale_held = p.connected().contains(&id);
+    let a = forced_at(offline(root, "a2"), listen, Reachability::Public, key);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let probed = a.network.dial(to_p, &AtomicBool::new(false), deadline);
+    let data = until(Duration::from_secs(5), || p.network.has_direct(id));
+    json!({
+        "ready":ready,"linked":linked,"stale_held":stale_held,
+        "probed":probed.is_ok(),"data":data,
+    })
+}
+
+#[test]
+#[ignore = "a node process the crash case kills with SIGKILL"]
+fn peer_nat_crash_node() {
+    let var = |name: &str| env::var(name).unwrap();
+    let root = PathBuf::from(var("CRASH_ROOT"));
+    let key = Keypair::from_protobuf_encoding(&hex::decode(var("CRASH_KEY")).unwrap()).unwrap();
+    let listen: Multiaddr = var("CRASH_LISTEN").parse().unwrap();
+    let a = forced_at(offline(&root, "a1"), listen, Reachability::Public, key);
+    a.dial(var("CRASH_DIAL").parse().unwrap());
+    fs::write(root.join("crash-ready"), b"").unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
 #[test]
 #[ignore = "owned namespaced subprocess host, invoked only by the NAT cases"]
 fn peer_nat_host() {
@@ -539,6 +609,7 @@ fn peer_nat_host() {
         "punch_counts" => punch_counts(&root),
         "restart" => restart(&root),
         "shutdown" => shutdown(&root),
+        "crash" => crash(&root),
         _ => panic!("unknown owned scenario"),
     };
     report(&root, &scenario, checks);
@@ -638,6 +709,14 @@ fn both_ends_of_a_hole_punch_count_it() {
 fn a_restarted_node_reserves_beside_its_stale_reservation() {
     let checks = run(HOST, "restart");
     assert_eq!(checks["held"], true, "{checks}");
+}
+
+#[test]
+fn a_node_killed_and_restarted_gets_a_data_link_beside_its_dead_one() {
+    let checks = run(HOST, "crash");
+    for check in ["ready", "linked", "stale_held", "probed", "data"] {
+        assert_eq!(checks[check], true, "{check}: {checks}");
+    }
 }
 
 #[test]

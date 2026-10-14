@@ -5,13 +5,20 @@
 //! failures are never reported. `Punches` counts a punch from the first DCUtR
 //! dial to a peer until any direct connection to that peer opens (success),
 //! DCUtR reports an error, or `WAIT` passes (failure).
+//!
+//! Both ends must punch the same transport. Each sends the other its address
+//! candidates and the other dials them in order, one at a time, so every
+//! observed candidate is offered on both transports (one port serves TCP and
+//! QUIC, and a port-preserving NAT maps both alike), QUIC first: two ends that
+//! learned their addresses over different transports still dial QUIC together.
 use libp2p::{
     Multiaddr, PeerId,
     core::{Endpoint, transport::PortUse},
     dcutr,
+    multiaddr::Protocol,
     swarm::{
-        ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
-        THandlerOutEvent, ToSwarm,
+        ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, NewExternalAddrCandidate,
+        THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
     },
 };
 use std::{
@@ -67,6 +74,36 @@ impl Punches {
     }
 }
 
+/// `address` on both transports, in the order DCUtR must learn them: its
+/// candidates are most recent first, so QUIC goes in last. Anything but an IP
+/// literal on TCP or QUIC is offered as is.
+fn both_transports(address: &Multiaddr) -> Vec<Multiaddr> {
+    let parts: Vec<Protocol<'_>> = address
+        .iter()
+        .filter(|part| !matches!(part, Protocol::P2p(_)))
+        .collect();
+    let (host, port) = match parts.as_slice() {
+        [
+            host @ (Protocol::Ip4(_) | Protocol::Ip6(_)),
+            Protocol::Tcp(port),
+        ]
+        | [
+            host @ (Protocol::Ip4(_) | Protocol::Ip6(_)),
+            Protocol::Udp(port),
+            Protocol::QuicV1,
+        ] => (host.clone(), *port),
+        _ => return vec![address.clone()],
+    };
+    let tcp = Multiaddr::empty()
+        .with(host.clone())
+        .with(Protocol::Tcp(port));
+    let quic = Multiaddr::empty()
+        .with(host)
+        .with(Protocol::Udp(port))
+        .with(Protocol::QuicV1);
+    vec![tcp, quic]
+}
+
 impl NetworkBehaviour for Punches {
     type ConnectionHandler = THandler<dcutr::Behaviour>;
     type ToSwarm = dcutr::Event;
@@ -116,6 +153,14 @@ impl NetworkBehaviour for Punches {
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
+        if let FromSwarm::NewExternalAddrCandidate(candidate) = &event {
+            for addr in &both_transports(candidate.addr) {
+                let offered = NewExternalAddrCandidate { addr };
+                self.inner
+                    .on_swarm_event(FromSwarm::NewExternalAddrCandidate(offered));
+            }
+            return;
+        }
         if let FromSwarm::ConnectionEstablished(established) = &event
             && !established.endpoint.is_relayed()
         {
@@ -156,9 +201,23 @@ impl NetworkBehaviour for Punches {
 
 #[cfg(test)]
 mod tests {
-    use super::Punches;
-    use libp2p::PeerId;
+    use super::{Punches, both_transports};
+    use libp2p::{Multiaddr, PeerId};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_candidate_is_offered_on_both_transports_quic_last_for_quic_first_dials() {
+        let peer = PeerId::random();
+        let tcp: Multiaddr = "/ip4/11.0.3.10/tcp/28332".parse().unwrap();
+        let quic: Multiaddr = "/ip4/11.0.3.10/udp/28332/quic-v1".parse().unwrap();
+        let pair = vec![tcp.clone(), quic.clone()];
+        assert_eq!(both_transports(&tcp), pair);
+        assert_eq!(both_transports(&quic), pair);
+        let named = quic.clone().with(libp2p::multiaddr::Protocol::P2p(peer));
+        assert_eq!(both_transports(&named), pair);
+        let other: Multiaddr = "/dns4/seed.example/tcp/1".parse().unwrap();
+        assert_eq!(both_transports(&other), vec![other.clone()]);
+    }
 
     #[test]
     fn each_punch_counts_once_from_its_first_dial_to_a_direct_link_or_expiry() {
