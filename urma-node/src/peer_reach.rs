@@ -403,6 +403,20 @@ impl Reach {
         }
     }
 
+    /// Closes the connections to `peer` that sync or a stalled request
+    /// released, unless one carries a relay reservation, ours on it or its on
+    /// us: that link outlives idle data (a private node is reachable only
+    /// through it).
+    pub(crate) fn release(swarm: &mut Swarm<Behaviour>, peer: PeerId, nat: &Nat) {
+        if nat.relays().contains(&peer) || nat.reserved_by_others().contains(&peer) {
+            tracing::debug!(%peer, "idle peer kept: it carries a relay reservation");
+            return;
+        }
+        if swarm.disconnect_peer_id(peer).is_err() {
+            tracing::debug!(%peer, "released peer was already disconnected");
+        }
+    }
+
     /// A connection admitted past the data budget as a reservation holder
     /// must reserve, or ride a circuit, within the grace period.
     fn retire_holders(&self, swarm: &mut Swarm<Behaviour>, remotes: &Remotes, nat: &Nat) {

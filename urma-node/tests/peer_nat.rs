@@ -12,7 +12,9 @@ mod discovery_host;
 #[allow(dead_code)]
 #[path = "common/nat_peer.rs"]
 mod nat_peer;
-use discovery_host::{Node, PUBLIC, bare, host, node, offline, report, run, stage, until};
+use discovery_host::{
+    Node, PUBLIC, bare, discover, host, node, offline, report, run, stage, until,
+};
 use libp2p::{Multiaddr, PeerId, identity::Keypair, multiaddr::Protocol};
 use nat_peer::NatPeer;
 use serde_json::{Value, json};
@@ -26,7 +28,12 @@ use std::{
 use urma_node::{
     peer::{DnsMode, PeerLink, PeerNetwork, ReachMode, Reachability},
     peer_protocol::{Kind, Reply},
+    peer_sync::{OverlayInfo, PeerSync},
+    peerbook::{Origin, PeerBook},
+    service::Service,
 };
+
+const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 const HOST: &str = "peer_nat_host";
 const PROBE: Duration = Duration::from_secs(30);
@@ -210,6 +217,46 @@ fn holders(root: &Path) -> Value {
     })
 }
 
+/// B runs as the daemon does (service with inventory sync and discovery) with
+/// only P as its seed. Once B reserves on P, the reservation must hold across
+/// sync steps: releasing an idle sync peer must not drop the relay connection.
+fn daemon(root: &Path) -> Value {
+    let p = forced(root, "p", PUBLIC[0], Reachability::Public);
+    let b = forced(root, "b", PUBLIC[1], Reachability::Private);
+    let mut book = PeerBook::empty(b.genesis());
+    book.add(p.listening(), Origin::Seed).unwrap();
+    let (discovery, _) = discover(root, "b", &b, book);
+    let info = OverlayInfo {
+        peer_id: b.id.to_string(),
+        listen: Arc::new(Vec::new),
+        announce: Vec::new(),
+        peer_book: 1,
+        connected: Arc::new(|| 0),
+    };
+    let sync = PeerSync {
+        peers: b.network.sync_peers(Vec::new()),
+        info,
+    };
+    let service = Service::bind("127.0.0.1:0".parse().unwrap(), TOKEN.into(), b.engine.clone())
+        .unwrap()
+        .with_peer_sync(sync)
+        .unwrap()
+        .with_discovery(discovery)
+        .unwrap();
+    let handle = service.shutdown_handle();
+    let worker = thread::spawn(move || service.run(true));
+    stage(root, "the daemon reaches P and reserves on it");
+    let reserved = until(Duration::from_secs(30), || b.network.relays() == vec![p.id]);
+    stage(root, "the reservation holds across sync steps");
+    let held = (0..60).all(|_| {
+        thread::sleep(Duration::from_millis(500));
+        b.network.relays() == vec![p.id] && b.connected().contains(&p.id)
+    });
+    handle.request();
+    assert!(worker.join().unwrap().is_ok());
+    json!({"reserved":reserved,"held":held})
+}
+
 /// P relays for B; returns B's circuit address through P.
 fn reserved(root: &Path, p: &Node, b: &Node) -> Multiaddr {
     stage(root, "a private node reserves on the public peer it dialed");
@@ -302,9 +349,17 @@ fn peer_nat_host() {
         "punch" => punch(&root),
         "dialback" => dialback(&root),
         "holders" => holders(&root),
+        "daemon" => daemon(&root),
         _ => panic!("unknown owned scenario"),
     };
     report(&root, &scenario, checks);
+}
+
+#[test]
+fn a_daemon_keeps_its_reservation_across_sync_steps() {
+    let checks = run(HOST, "daemon");
+    assert_eq!(checks["reserved"], true, "{checks}");
+    assert_eq!(checks["held"], true, "{checks}");
 }
 
 #[test]

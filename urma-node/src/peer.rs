@@ -421,7 +421,7 @@ async fn run(
                 for value in pending.values_mut() {
                     if Instant::now() >= value.deadline {
                         value.answer.fail(Error::Busy("peer acquisition deadline".into()));
-                        let _ = swarm.disconnect_peer_id(value.peer);
+                        Reach::release(&mut swarm, value.peer, &shared.nat);
                     }
                 }
                 dials.expire();
@@ -432,7 +432,7 @@ async fn run(
                     Some(Command::Fetch(fetch)) => fetch,
                     // A Fetch queued for this peer since the rejection keeps its connection.
                     Some(Command::Disconnect(peer)) => {
-                        if !pending.values().any(|p| p.peer == peer) { let _ = swarm.disconnect_peer_id(peer); }
+                        if !pending.values().any(|p| p.peer == peer) { Reach::release(&mut swarm, peer, &shared.nat); }
                         continue;
                     }
                     Some(Command::Dial(dial)) => { dials.start(&mut swarm, dial); continue; }
