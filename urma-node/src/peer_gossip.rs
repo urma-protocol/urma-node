@@ -46,14 +46,15 @@ pub(crate) struct Shared {
 }
 
 /// Established connections of one peer by direction, how many of them ride a
-/// relay circuit and how many may carry data, and whether it has spoken this
-/// protocol version on our chain over any of them.
+/// relay circuit, how many may carry data (and of those, how many we dialed),
+/// and whether it has spoken this protocol version on our chain over any.
 #[derive(Default)]
 struct Links {
     inbound: u32,
     outbound: u32,
     relayed: u32,
     data: u32,
+    outbound_data: u32,
     on_chain: bool,
 }
 
@@ -79,6 +80,9 @@ impl Links {
         }
         if class == Class::Data {
             step(&mut self.data, opened);
+        }
+        if class == Class::Data && outbound {
+            step(&mut self.outbound_data, opened);
         }
     }
 }
@@ -214,11 +218,11 @@ impl Shared {
         guard(&self.connected).contains_key(&peer)
     }
 
-    /// Whether the peer is directly connected and holds a connection we dialed.
+    /// Whether the peer holds a data connection we dialed.
     pub(crate) fn is_outbound(&self, peer: PeerId) -> bool {
         guard(&self.connected)
             .get(&peer)
-            .is_some_and(|links| links.outbound > 0 && links.data > 0)
+            .is_some_and(|links| links.outbound_data > 0)
     }
 
     fn connected(&self) -> Vec<PeerId> {
@@ -233,7 +237,7 @@ impl Shared {
         let (outbound, inbound): (Vec<_>, Vec<_>) = connected
             .iter()
             .filter(|(_, links)| links.on_chain && links.data > 0)
-            .partition(|(_, links)| links.outbound > 0);
+            .partition(|(_, links)| links.outbound_data > 0);
         outbound
             .into_iter()
             .chain(inbound)

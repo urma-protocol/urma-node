@@ -209,6 +209,13 @@ mod tests {
         assert!(shared.is_connected(remote));
         assert!(shared.live().is_empty());
         assert!(!shared.is_outbound(remote));
+        shared.opened(remote, true, Class::Auxiliary);
+        shared.opened(remote, false, Class::Data);
+        assert_eq!(shared.live(), vec![remote]);
+        assert!(
+            !shared.is_outbound(remote),
+            "our dial is auxiliary, the data connection is theirs"
+        );
         shared.opened(remote, true, Class::Data);
         assert_eq!(shared.live(), vec![remote]);
         assert!(shared.is_outbound(remote));
