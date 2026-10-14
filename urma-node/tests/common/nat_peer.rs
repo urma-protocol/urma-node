@@ -46,6 +46,7 @@ type Reported<T> = mpsc::SyncSender<Result<T, String>>;
 enum Op {
     Dial(Multiaddr, Reported<PeerId>),
     Call(PeerId, Kind, Reported<Reply>),
+    Listen(Multiaddr),
 }
 
 pub struct NatPeer {
@@ -135,6 +136,9 @@ fn op(swarm: &mut Swarm<Raw>, waiting: &mut Waiting, op: Op) {
             };
             let id = swarm.behaviour_mut().records.send_request(&peer, request);
             waiting.calls.insert(id, answer);
+        }
+        Op::Listen(address) => {
+            swarm.listen_on(address).unwrap();
         }
     }
 }
@@ -284,6 +288,11 @@ impl NatPeer {
         let (answer, receiver) = mpsc::sync_channel(1);
         self.ops.try_send(Op::Dial(address, answer)).unwrap();
         receiver.recv_timeout(BOUND).unwrap()
+    }
+
+    /// Listens on `address`; a `/p2p-circuit` address reserves on its relay.
+    pub fn listen(&self, address: Multiaddr) {
+        self.ops.try_send(Op::Listen(address)).unwrap();
     }
 
     pub fn call(&self, peer: PeerId, kind: Kind) -> Result<Reply, String> {

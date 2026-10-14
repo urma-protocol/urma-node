@@ -34,6 +34,7 @@ pub(crate) struct Remote {
     pub(crate) address: Multiaddr,
     pub(crate) outbound: bool,
     pub(crate) class: Class,
+    since: Instant,
 }
 
 /// Live connections by id. The class is kept here because admission forgets
@@ -61,6 +62,7 @@ impl Remotes {
             address: endpoint.get_remote_address().clone(),
             outbound: endpoint.is_dialer(),
             class,
+            since: Instant::now(),
         };
         self.0.insert(id, remote);
         class
@@ -100,6 +102,16 @@ impl Remotes {
             Class::Relayed if direct => vec![id],
             Class::Relayed | Class::Auxiliary | Class::Holder => Vec::new(),
         }
+    }
+
+    /// Connections admitted past the data budget as reservation holders,
+    /// open for at least `grace`.
+    fn holders_after(&self, grace: Duration) -> Vec<(ConnectionId, PeerId)> {
+        self.0
+            .iter()
+            .filter(|(_, remote)| remote.class == Class::Holder && remote.since.elapsed() >= grace)
+            .map(|(id, remote)| (*id, remote.peer))
+            .collect()
     }
 
     fn relayed_of(&self, peer: PeerId) -> Vec<ConnectionId> {
@@ -188,11 +200,13 @@ pub(crate) struct Reach {
     quic: bool,
     reservations: HashMap<ListenerId, PeerId>,
     backoff: HashMap<PeerId, Instant>,
+    circuits: HashMap<PeerId, u32>,
 }
 
 impl Reach {
     const RESERVATIONS: usize = 2;
     const BACKOFF: Duration = Duration::from_secs(10 * 60);
+    const HOLDER_GRACE: Duration = Duration::from_secs(10);
 
     pub(crate) fn new(
         forced: ReachMode,
@@ -210,6 +224,7 @@ impl Reach {
             quic: false,
             reservations: HashMap::new(),
             backoff: HashMap::new(),
+            circuits: HashMap::new(),
         }
     }
 
@@ -248,7 +263,7 @@ impl Reach {
             SwarmEvent::Behaviour(BehaviourEvent::AutonatServer(event)) => {
                 tracing::debug!(?event, "AutoNAT probe served")
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => Self::relay_server(&event, nat),
+            SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => self.relay_server(&event, nat),
             SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
                 Self::relay_client(&event, nat)
             }
@@ -340,7 +355,7 @@ impl Reach {
         }
     }
 
-    pub(crate) fn relay_server(event: &relay::Event, nat: &Nat) {
+    fn relay_server(&mut self, event: &relay::Event, nat: &Nat) {
         match event {
             relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
                 nat.set_reserved_by(*src_peer_id, true)
@@ -349,7 +364,46 @@ impl Reach {
             | relay::Event::ReservationTimedOut { src_peer_id } => {
                 nat.set_reserved_by(*src_peer_id, false)
             }
+            relay::Event::CircuitReqAccepted {
+                src_peer_id,
+                dst_peer_id,
+            } => {
+                for peer in [src_peer_id, dst_peer_id] {
+                    *self.circuits.entry(*peer).or_default() += 1;
+                }
+            }
+            relay::Event::CircuitClosed {
+                src_peer_id,
+                dst_peer_id,
+                ..
+            } => {
+                for peer in [src_peer_id, dst_peer_id] {
+                    self.circuit_closed(*peer);
+                }
+            }
             _ => (),
+        }
+    }
+
+    fn circuit_closed(&mut self, peer: PeerId) {
+        let Some(count) = self.circuits.get_mut(&peer) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.circuits.remove(&peer);
+        }
+    }
+
+    /// A connection admitted past the data budget as a reservation holder
+    /// must reserve, or ride a circuit, within the grace period.
+    fn retire_holders(&self, swarm: &mut Swarm<Behaviour>, remotes: &Remotes, nat: &Nat) {
+        let holding = nat.reserved_by_others();
+        for (id, peer) in remotes.holders_after(Self::HOLDER_GRACE) {
+            if !holding.contains(&peer) && !self.circuits.contains_key(&peer) {
+                tracing::debug!(%peer, "reservation holder never reserved; closing");
+                swarm.close_connection(id);
+            }
         }
     }
 
@@ -451,6 +505,7 @@ impl Reach {
     /// While private, holds up to two reservations on public peers we dialed
     /// (seeds first), skipping relays that recently failed; otherwise none.
     pub(crate) fn maintain(&mut self, swarm: &mut Swarm<Behaviour>, remotes: &Remotes, nat: &Nat) {
+        self.retire_holders(swarm, remotes, nat);
         if nat.reachability() != Reachability::Private {
             for (id, _) in self.reservations.drain() {
                 swarm.remove_listener(id);

@@ -183,6 +183,33 @@ fn dialback(root: &Path) -> Value {
     })
 }
 
+/// P's eight inbound data slots are taken, so two more peers arrive as
+/// reservation holders: the one that reserves stays, the other is closed once
+/// the grace period passes.
+fn holders(root: &Path) -> Value {
+    let p = forced(root, "p", PUBLIC[0], Reachability::Public);
+    let fillers: Vec<NatPeer> = (0..8).map(|_| NatPeer::start(None, false)).collect();
+    for filler in &fillers {
+        assert_eq!(filler.dial(p.listening()), Ok(p.id));
+    }
+    stage(root, "two peers past the data budget, one reserving");
+    let idle = NatPeer::start(None, false);
+    let reserving = NatPeer::start(None, false);
+    assert_eq!(idle.dial(p.listening()), Ok(p.id));
+    assert_eq!(reserving.dial(p.listening()), Ok(p.id));
+    reserving.listen(p.listening().with(Protocol::P2pCircuit));
+    let reserved = until(Duration::from_secs(5), || {
+        p.network.reserved_by_others() == vec![reserving.id]
+    });
+    let closed = until(Duration::from_secs(15), || idle.connections(p.id) == 0);
+    json!({
+        "reserved":reserved,
+        "idle_closed":closed,
+        "reserving_kept":reserving.connections(p.id) == 1,
+        "fillers_kept":fillers.iter().all(|filler| filler.connections(p.id) == 1),
+    })
+}
+
 /// P relays for B; returns B's circuit address through P.
 fn reserved(root: &Path, p: &Node, b: &Node) -> Multiaddr {
     stage(root, "a private node reserves on the public peer it dialed");
@@ -274,9 +301,19 @@ fn peer_nat_host() {
         "relay" => relay(&root),
         "punch" => punch(&root),
         "dialback" => dialback(&root),
+        "holders" => holders(&root),
         _ => panic!("unknown owned scenario"),
     };
     report(&root, &scenario, checks);
+}
+
+#[test]
+fn a_reservation_holder_that_never_reserves_is_closed() {
+    let checks = run(HOST, "holders");
+    assert_eq!(checks["reserved"], true, "{checks}");
+    assert_eq!(checks["idle_closed"], true, "{checks}");
+    assert_eq!(checks["reserving_kept"], true, "{checks}");
+    assert_eq!(checks["fillers_kept"], true, "{checks}");
 }
 
 #[test]
