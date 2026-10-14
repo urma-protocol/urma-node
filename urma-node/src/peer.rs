@@ -2,24 +2,27 @@
 //! transport identity; packages still need independent Engine admission.
 //! There are no built-in seeds, wallet keys or implicit listeners. Names in
 //! explicitly dialed `/dns*` addresses resolve through the system resolver.
-use crate::peer_transport::swarm;
 pub(crate) use crate::peer_transport::{Behaviour, BehaviourEvent};
 use crate::{
     DialLimit, Error,
     engine::Engine,
     model::RecordPackage,
-    peer_gossip::{Dial, Dials, Shared, is_loopback, validate_announce, validate_peers},
+    peer_gossip::{Dial, Dials, Shared, validate_peers},
     peer_inventory::{lookup, validate_inventory},
-    peer_limits::LimitDenied,
+    peer_limits::{Classes, LimitDenied},
     peer_live::Link,
     peer_parent::{Parent, validate_parent},
     peer_protocol::{GossipPeer, InventoryPage, Kind, Reply, Request, Response, VERSION},
     peer_rate::{Bucket, Count, peer_rate},
+    peer_reach::{Reach, Remotes, direct_shape, validate_announce},
+    peer_transport::{Wiring, swarm},
     peerbook::PeerAddress,
 };
 pub use crate::{
     peer_live::{PeerSource, SyncPeers},
+    peer_nat::{PeerLink, Reachability},
     peer_parent::OverlayCommitSource,
+    peer_reach::ReachMode,
     peer_transport::{Dns, DnsMode},
 };
 use bitcoin::{BlockHash, Txid};
@@ -30,7 +33,7 @@ use libp2p::{
     identity::Keypair,
     multiaddr::Protocol,
     request_response::{self, Message, OutboundRequestId, ResponseChannel},
-    swarm::{ConnectionId, DialError, SwarmEvent},
+    swarm::{DialError, SwarmEvent},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -153,16 +156,22 @@ impl PeerNetwork {
         listen: Option<Multiaddr>,
         announce: Vec<Multiaddr>,
     ) -> Result<Self, Error> {
-        Self::start_with_dns(engine, identity, (listen, announce), DnsMode::System)
+        Self::start_with(
+            engine,
+            identity,
+            (listen, announce),
+            (DnsMode::System, ReachMode::AutoNat),
+        )
     }
 
-    /// As `start`, with the name resolution mode explicit; `DnsMode::Refuse`
-    /// stands in for an unreadable system resolver configuration.
-    pub fn start_with_dns(
+    /// As `start`, with name resolution and reachability explicit:
+    /// `DnsMode::Refuse` stands in for an unreadable resolver configuration and
+    /// `ReachMode::Forced` for a reachability AutoNAT would conclude.
+    pub fn start_with(
         engine: Arc<Engine>,
         identity: Keypair,
         (listen, announce): (Option<Multiaddr>, Vec<Multiaddr>),
-        dns: DnsMode,
+        (dns, reach): (DnsMode, ReachMode),
     ) -> Result<Self, Error> {
         if let Some(address) = &listen {
             validate_listener(address)?;
@@ -185,6 +194,7 @@ impl PeerNetwork {
             startup,
             shared: shared.clone(),
             announce,
+            reach,
         };
         let worker = std::thread::Builder::new()
             .name("urma-peer".into())
@@ -337,24 +347,7 @@ struct Control {
     startup: Startup,
     shared: Arc<Shared>,
     announce: Vec<Multiaddr>,
-}
-
-/// Remote address per live connection, so gossip can tell loopback requesters.
-#[derive(Default)]
-struct Remotes(HashMap<ConnectionId, (Multiaddr, bool)>);
-
-impl Remotes {
-    fn loopback(&self, connection: ConnectionId) -> bool {
-        self.0
-            .get(&connection)
-            .is_some_and(|(address, _)| is_loopback(address))
-    }
-
-    fn outbound(&self, connection: ConnectionId) -> bool {
-        self.0
-            .get(&connection)
-            .is_some_and(|(_, outbound)| *outbound)
-    }
+    reach: ReachMode,
 }
 
 async fn run(
@@ -370,9 +363,22 @@ async fn run(
         startup,
         shared,
         announce,
+        reach,
     } = control;
     let genesis = engine.status()?.chain_genesis;
-    let (mut swarm, dns) = swarm(identity, &dns)?;
+    let wiring = Wiring {
+        classes: Classes::default(),
+        relay_open: Arc::new(AtomicBool::new(false)),
+    };
+    let local = identity.public().to_peer_id();
+    let mut reach = Reach::new(
+        reach,
+        !announce.is_empty(),
+        Arc::clone(&wiring.relay_open),
+        (local, listen.clone()),
+    );
+    reach.update(&shared.nat);
+    let (mut swarm, dns) = swarm(identity, &dns, &wiring)?;
     for address in announce {
         swarm.add_external_address(address);
     }
@@ -419,6 +425,7 @@ async fn run(
                     }
                 }
                 dials.expire();
+                reach.maintain(&mut swarm, &remotes, &shared.nat);
             }
             command = commands.recv() => {
                 let command = match command {
@@ -437,7 +444,7 @@ async fn run(
                     continue;
                 }
                 let request = Request { version: VERSION, chain_genesis: genesis, kind: command.kind };
-                let id = swarm.behaviour_mut().records.send_request_with_addresses(
+                let id = swarm.behaviour_mut().records.inner_mut().send_request_with_addresses(
                     &command.peer, request, command.addresses);
                 pending.insert(id, Pending { peer: command.peer, kind: command.kind, deadline: command.deadline, answer: command.answer });
             }
@@ -445,10 +452,12 @@ async fn run(
                 let Some(mut response) = response else { break Err(Error::Invalid("peer archive reader stopped".into())); };
                 if response.channel.is_open() {
                     if !bytes.take(u64::try_from(response.bytes.saturating_sub(256)).unwrap_or(u64::MAX)) { response.response.result = Reply::Busy; }
-                    let _ = swarm.behaviour_mut().records.send_response(response.channel, response.response);
+                    let _ = swarm.behaviour_mut().records.inner_mut().send_response(response.channel, response.response);
                 }
             }
-            event = swarm.select_next_some() => match event {
+            event = swarm.select_next_some() => {
+                let Some(event) = reach.absorb(&mut swarm, &remotes, &shared.nat, event) else { continue };
+                match event {
                 SwarmEvent::NewListenAddr { mut address, .. } => {
                     address.push(Protocol::P2p(*swarm.local_peer_id()));
                     shared.listening(address.clone(), true);
@@ -458,16 +467,16 @@ async fn run(
                 SwarmEvent::ListenerClosed { addresses, .. } => for address in addresses { shared.listening(address.with(Protocol::P2p(*swarm.local_peer_id())), false) },
                 SwarmEvent::ListenerError { error, .. } if ready.is_some() => break Err(Error::Io(error)),
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
-                    remotes.0.insert(connection_id, (endpoint.get_remote_address().clone(), endpoint.is_dialer()));
+                    let class = remotes.admit((connection_id, peer_id), &endpoint, &wiring.classes);
+                    shared.opened(peer_id, endpoint.is_dialer(), class);
+                    for circuit in remotes.superseded(connection_id, peer_id, class) { swarm.close_connection(circuit); }
                     dials.established(connection_id, peer_id);
-                    shared.opened(peer_id, endpoint.is_dialer());
                     if num_established.get() == 1 {
                         connected.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, num_established, .. } => {
-                    remotes.0.remove(&connection_id);
-                    shared.closed(peer_id, endpoint.is_dialer());
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                    if let Some(remote) = remotes.remove(connection_id) { shared.closed(peer_id, remote.outbound, remote.class); }
                     if num_established == 0 {
                         connected.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -480,9 +489,11 @@ async fn run(
                     dials.failed(connection_id, &error);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { connection_id, peer_id, info })) => {
-                    // Inbound peers could steer our address; only dialed peers witness it.
-                    if remotes.outbound(connection_id) {
-                        if let Some(confirmed) = shared.observe(info.observed_addr, peer_id) { swarm.add_external_address(confirmed); }
+                    // Only peers we dialed directly witness our address, and a
+                    // witness only proposes it: AutoNAT confirms what is advertised.
+                    if remotes.outbound_direct(connection_id) {
+                        if direct_shape(&info.observed_addr) { swarm.behaviour_mut().candidates.offer(info.observed_addr.clone()); }
+                        shared.observe(info.observed_addr, peer_id);
                     }
                     shared.identified(peer_id, info.listen_addrs);
                 }
@@ -507,7 +518,7 @@ async fn run(
                                 { Some(Reply::Busy) }
                             else { None };
                         if let Some(result) = refusal {
-                            let _ = swarm.behaviour_mut().records.send_response(channel, Response { version: VERSION, chain_genesis: genesis, kind: request.kind, result });
+                            let _ = swarm.behaviour_mut().records.inner_mut().send_response(channel, Response { version: VERSION, chain_genesis: genesis, kind: request.kind, result });
                         } else {
                             match jobs.try_send(ServeJob { deadline: Instant::now() + REQUEST_TIMEOUT, request, channel }) {
                                 Ok(()) => { inbound.insert((peer, request_id)); }
@@ -530,6 +541,7 @@ async fn run(
                     | request_response::Event::ResponseSent { peer, request_id, .. } => { inbound.remove(&(peer, request_id)); }
                 },
                 _ => (),
+                }
             }
         }
     };
