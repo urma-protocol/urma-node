@@ -302,7 +302,8 @@ impl Reach {
     }
 
     /// `witness`, a peer we dialed directly, sees us at `observed`: an AutoNAT
-    /// candidate, never an advertised address on its own.
+    /// candidate, never an advertised address on its own, and evidence that a
+    /// confirmed address of the same transport no longer maps to us.
     pub(crate) fn observed(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -312,8 +313,14 @@ impl Reach {
         if !direct_shape(&observed) {
             return;
         }
-        self.externals
-            .witnessed(&observed, witness, &nat.external());
+        for stale in self
+            .externals
+            .witnessed(&observed, witness, &nat.external())
+        {
+            tracing::info!(%stale, now = %observed, "external address mapping changed");
+            swarm.remove_external_address(&stale);
+            self.external(stale, false, nat);
+        }
         swarm.behaviour_mut().candidates.offer(observed);
     }
 
