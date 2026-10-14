@@ -50,4 +50,5 @@ test ! -e "$adapter"
 status=$(urma-node service status)
 echo "$status"
 echo "$status" | grep -q "\"registered\": *false"
+urma-node service uninstall
 echo "$kind lifecycle ok"
