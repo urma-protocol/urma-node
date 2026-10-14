@@ -488,6 +488,15 @@ fn quic_addresses_are_dialed_first_and_a_failed_one_yields_to_tcp() {
         vec![identified, addr("/ip4/11.0.2.1/tcp/4001")],
         "an identified QUIC address enters ahead of TCP"
     );
+    let seed = peer(3);
+    for address in ["/ip4/11.0.3.1/tcp/4001", "/ip4/11.0.3.1/udp/4001/quic-v1"] {
+        book.add(named(&addr(address), seed), Origin::Seed).unwrap();
+    }
+    assert_eq!(
+        book.seeds(&[], None),
+        vec![named(&addr("/ip4/11.0.3.1/udp/4001/quic-v1"), seed)],
+        "configured seeds of one peer, TCP first, are dialed over QUIC"
+    );
 }
 
 #[test]
