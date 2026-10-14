@@ -26,6 +26,7 @@ mod peer_parent;
 pub mod peer_protocol;
 mod peer_rate;
 mod peer_reach;
+mod peer_rewaken;
 pub mod peer_sync;
 mod peer_transport;
 pub mod peerbook;

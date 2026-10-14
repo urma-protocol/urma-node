@@ -468,8 +468,9 @@ async fn run(
                 SwarmEvent::ListenerError { error, .. } if ready.is_some() => break Err(Error::Io(error)),
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
                     let class = remotes.admit((connection_id, peer_id), &endpoint, &wiring.classes);
-                    dials.established(connection_id, peer_id);
                     shared.opened(peer_id, endpoint.is_dialer(), class);
+                    for circuit in remotes.superseded(connection_id, peer_id, class) { swarm.close_connection(circuit); }
+                    dials.established(connection_id, peer_id);
                     if num_established.get() == 1 {
                         connected.fetch_add(1, Ordering::Relaxed);
                     }

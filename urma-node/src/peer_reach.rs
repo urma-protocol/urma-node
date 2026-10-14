@@ -81,6 +81,20 @@ impl Remotes {
             .is_some_and(|remote| remote.outbound && remote.class != Class::Relayed)
     }
 
+    /// A relay circuit has no use once the peer holds a direct data link
+    /// (§3.4): the circuits to retire after `id` was admitted as `class`.
+    pub(crate) fn superseded(&self, id: ConnectionId, peer: PeerId, class: Class) -> Vec<ConnectionId> {
+        let direct = self
+            .0
+            .values()
+            .any(|remote| remote.peer == peer && remote.class == Class::Data);
+        match class {
+            Class::Data => self.relayed_of(peer),
+            Class::Relayed if direct => vec![id],
+            Class::Relayed | Class::Auxiliary | Class::Holder => Vec::new(),
+        }
+    }
+
     fn relayed_of(&self, peer: PeerId) -> Vec<ConnectionId> {
         self.0
             .iter()

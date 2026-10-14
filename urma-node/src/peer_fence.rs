@@ -11,12 +11,15 @@ use libp2p::{
     core::{Endpoint, transport::PortUse},
     multiaddr::Protocol,
     swarm::{
-        ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
-        THandlerOutEvent, ToSwarm, dummy,
+        ConnectionDenied, ConnectionId, FromSwarm,
+        NetworkBehaviour, THandler, THandlerInEvent,
+        THandlerOutEvent, ToSwarm,
+        behaviour::{ConnectionClosed, ConnectionEstablished},
+        dummy,
     },
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     task::{Context, Poll},
 };
@@ -32,6 +35,7 @@ pub(crate) struct Fenced<B> {
     fence: Fence,
     classes: Classes,
     outside: HashSet<ConnectionId>,
+    inside: HashMap<PeerId, HashSet<ConnectionId>>,
 }
 
 impl<B> Fenced<B> {
@@ -42,6 +46,7 @@ impl<B> Fenced<B> {
             fence: Fence::DataOnly,
             classes,
             outside: HashSet::new(),
+            inside: HashMap::new(),
         }
     }
 
@@ -52,11 +57,25 @@ impl<B> Fenced<B> {
             fence: Fence::NoCandidates,
             classes: Classes::default(),
             outside: HashSet::new(),
+            inside: HashMap::new(),
         }
     }
 
     pub(crate) fn inner_mut(&mut self) -> &mut B {
         &mut self.inner
+    }
+
+    /// Drops a seen connection; returns how many of the peer's remain seen.
+    fn forget(&mut self, peer: PeerId, id: ConnectionId) -> usize {
+        let Some(seen) = self.inside.get_mut(&peer) else {
+            return 0;
+        };
+        seen.remove(&id);
+        let remaining = seen.len();
+        if remaining == 0 {
+            self.inside.remove(&peer);
+        }
+        remaining
     }
 
     fn shut_out(&mut self, id: ConnectionId) -> bool {
@@ -123,25 +142,45 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Fenced<B> {
             .map(Either::Left)
     }
 
-    /// A shut-out connection never exists for `inner`; failures still reach
-    /// it, since its own dials may end in one.
+    /// A shut-out connection never exists for `inner`, so the per-peer
+    /// counts it receives cover only the connections it sees; failures still
+    /// reach it, since its own dials may end in one.
     fn on_swarm_event(&mut self, event: FromSwarm) {
-        let hidden = match &event {
-            FromSwarm::ConnectionEstablished(event) => self.outside.contains(&event.connection_id),
-            FromSwarm::AddressChange(event) => self.outside.contains(&event.connection_id),
-            FromSwarm::ConnectionClosed(event) => self.outside.remove(&event.connection_id),
-            FromSwarm::DialFailure(event) => {
-                self.outside.remove(&event.connection_id);
-                false
+        match event {
+            FromSwarm::ConnectionEstablished(event) => {
+                if self.outside.contains(&event.connection_id) {
+                    return;
+                }
+                let seen = self.inside.entry(event.peer_id).or_default();
+                let other_established = seen.len();
+                seen.insert(event.connection_id);
+                self.inner
+                    .on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                        other_established,
+                        ..event
+                    }));
             }
-            FromSwarm::ListenFailure(event) => {
-                self.outside.remove(&event.connection_id);
-                false
+            FromSwarm::ConnectionClosed(event) => {
+                if self.outside.remove(&event.connection_id) {
+                    return;
+                }
+                let remaining_established = self.forget(event.peer_id, event.connection_id);
+                self.inner
+                    .on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+                        remaining_established,
+                        ..event
+                    }));
             }
-            _ => false,
-        };
-        if !hidden {
-            self.inner.on_swarm_event(event);
+            FromSwarm::AddressChange(ref change) if self.outside.contains(&change.connection_id) => {}
+            FromSwarm::DialFailure(ref failure) => {
+                self.outside.remove(&failure.connection_id);
+                self.inner.on_swarm_event(event);
+            }
+            FromSwarm::ListenFailure(ref failure) => {
+                self.outside.remove(&failure.connection_id);
+                self.inner.on_swarm_event(event);
+            }
+            other => self.inner.on_swarm_event(other),
         }
     }
 
