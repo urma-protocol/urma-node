@@ -272,29 +272,30 @@ impl Discovery {
     }
 
     /// Dial `address`, or a `/dnsaddr` seed's records QUIC first (`Names`),
-    /// one at a time until one answers, each bounded by `OPERATION_TIME`.
-    /// Records naming this node are skipped; the last failure stands for the
-    /// seed. A relayed peer is neither reached nor failed: Busy leaves the
-    /// book as is.
+    /// one at a time until one answers. The lookup and every attempt share
+    /// one `OPERATION_TIME`: a seed costs one operation of the round however
+    /// its records behave. Records naming this node are skipped; the last
+    /// failure stands for the seed. A relayed peer is neither reached nor
+    /// failed: Busy leaves the book as is.
     fn reach(
         &self,
         address: &Multiaddr,
         local: &Protocol,
         stop: &AtomicBool,
     ) -> Result<Result<PeerId, Error>, Error> {
+        let deadline = Instant::now() + Self::OPERATION_TIME;
         let attempts = match self.names.expand(address) {
             Ok(attempts) => attempts,
             Err(unresolved) => return Ok(Err(unresolved)),
         };
         let mut outcome = Err(Error::LocalPeer);
         for attempt in attempts {
-            if stop.load(Ordering::Acquire) {
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
                 break;
             }
             if attempt.iter().any(|part| part == *local) {
                 continue;
             }
-            let deadline = Instant::now() + Self::OPERATION_TIME;
             outcome = match self.network.dial_any(attempt, stop, deadline) {
                 Ok(Dialed::Direct(peer)) => return Ok(Ok(peer)),
                 Ok(Dialed::Relayed(peer)) => {

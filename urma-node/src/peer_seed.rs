@@ -2,7 +2,11 @@
 //! which dials TXT records in whatever order the resolver returns them. The
 //! records are dialed QUIC first (§3.1): behind a TCP proxy (Fly) only a QUIC
 //! connection shows the seed our real mapping, so AutoNAT has a candidate.
-use crate::{Error, peer_address::quic_first};
+use crate::{
+    Error,
+    peer_address::{AddressKind, parse, quic_first},
+    peer_gossip::is_public,
+};
 use hickory_resolver::TokioResolver;
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use std::time::Duration;
@@ -21,16 +25,16 @@ impl Names {
     pub const RECORDS: usize = 4;
     const LOOKUP_TIME: Duration = Duration::from_secs(5);
 
-    /// What to dial for `address`, in order: a `/dnsaddr` seed's records
-    /// (those ending in its `/p2p`, when it names one) QUIC first; any other
-    /// address as is.
+    /// What to dial for `address`, in order: a `/dnsaddr` seed's dialable
+    /// records (those ending in its `/p2p`, when it names one) QUIC first;
+    /// any other address as is.
     pub(crate) fn expand(&self, address: &Multiaddr) -> Result<Vec<Multiaddr>, Error> {
         let Some(Protocol::Dnsaddr(name)) = address.iter().next() else {
             return Ok(vec![address.clone()]);
         };
         let suffix: Multiaddr = address.iter().skip(1).collect();
         let mut records = self.lookup(&name)?;
-        records.retain(|record| record.ends_with(&suffix));
+        records.retain(|record| record.ends_with(&suffix) && dialable(record));
         let mut records = quic_first(records);
         records.truncate(Self::RECORDS);
         match records.is_empty() {
@@ -49,6 +53,18 @@ impl Names {
                 .collect()),
         }
     }
+}
+
+/// A TXT record is answered by whoever controls the name: only a direct
+/// address on a public IPv4 host is dialed. Loopback, private, IPv6, named,
+/// circuit and nested `/dnsaddr` records are dropped.
+fn dialable(record: &Multiaddr) -> bool {
+    let Ok(shape) = parse(record) else {
+        return false;
+    };
+    shape.kind == AddressKind::Direct
+        && matches!(shape.bare.iter().next(), Some(Protocol::Ip4(_)))
+        && is_public(&shape.bare)
 }
 
 /// One TXT lookup of `_dnsaddr.<name>` through the system configuration, on
@@ -130,6 +146,35 @@ mod tests {
         assert!(names.expand(&address("/dnsaddr/other.test")).is_err());
         let literal = address("/ip4/11.0.0.1/tcp/1");
         assert_eq!(names.expand(&literal).unwrap(), vec![literal]);
+    }
+
+    #[test]
+    fn only_public_ipv4_direct_records_are_dialed() {
+        let (peer, relay) = (PeerId::random(), PeerId::random());
+        let kept = address(&format!("/ip4/11.0.0.1/udp/28332/quic-v1/p2p/{peer}"));
+        let dropped = [
+            format!("/ip4/127.0.0.1/tcp/28332/p2p/{peer}"),
+            format!("/ip4/10.0.0.1/tcp/28332/p2p/{peer}"),
+            format!("/ip4/192.168.1.1/udp/28332/quic-v1/p2p/{peer}"),
+            format!("/ip4/100.64.0.1/tcp/28332/p2p/{peer}"),
+            format!("/ip6/2001:4860::1/tcp/28332/p2p/{peer}"),
+            format!("/dns4/seed.example/tcp/28332/p2p/{peer}"),
+            format!("/dnsaddr/other.test/p2p/{peer}"),
+            format!("/ip4/12.0.0.1/tcp/28332/p2p/{relay}/p2p-circuit/p2p/{peer}"),
+            format!("/ip4/11.0.0.1/tcp/0/p2p/{peer}"),
+        ];
+        let mut records: Vec<Multiaddr> = dropped.iter().map(|text| address(text)).collect();
+        records.push(kept.clone());
+        let names = Names::Fixed(vec![("seed.test".into(), records)]);
+        assert_eq!(
+            names.expand(&address("/dnsaddr/seed.test")).unwrap(),
+            vec![kept]
+        );
+        let hostile = Names::Fixed(vec![("seed.test".into(), vec![address(&dropped[0])])]);
+        assert!(
+            hostile.expand(&address("/dnsaddr/seed.test")).is_err(),
+            "a seed with no dialable record is a failed lookup"
+        );
     }
 
     #[test]
