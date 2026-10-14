@@ -5,6 +5,7 @@
 
 use crate::{
     Error,
+    peer_address::{is_circuit, parse, relay},
     peer_gossip::{is_public, validate_gossip_address},
     peer_protocol::GossipPeer,
 };
@@ -12,54 +13,15 @@ use bitcoin::BlockHash;
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::{fs, io::ErrorKind, net::IpAddr, path::Path};
+use std::{cmp::Reverse, fs, io::ErrorKind, net::IpAddr, path::Path};
 use urma_node_client::model::BookEntry as ListedEntry;
 
-/// A syntactically validated routing hint with an explicit matching identity.
-/// Validation establishes neither reachability nor trust in the named peer.
-#[derive(Clone, Debug)]
-pub struct PeerAddress {
-    peer: PeerId,
-    address: Multiaddr,
-}
-
-impl PeerAddress {
-    /// Accept exactly IP4/IP6, nonzero TCP, and a terminal matching `/p2p`.
-    /// Loopback and private addresses are allowed; unspecified, multicast and
-    /// IPv4 broadcast destinations are refused. No resolution or dial occurs.
-    pub fn new(peer: PeerId, address: Multiaddr) -> Result<Self, Error> {
-        let mut protocols = address.iter();
-        let valid_ip = match protocols.next() {
-            Some(Protocol::Ip4(ip)) => usable(IpAddr::V4(ip)),
-            Some(Protocol::Ip6(ip)) => usable(IpAddr::V6(ip)),
-            _ => false,
-        };
-        if !valid_ip
-            || !matches!(protocols.next(), Some(Protocol::Tcp(port)) if port != 0)
-            || !matches!(protocols.next(), Some(Protocol::P2p(id)) if id == peer)
-            || protocols.next().is_some()
-        {
-            return Err(Error::Invalid(
-                "peer address requires a usable IP, nonzero TCP port and terminal matching peer ID"
-                    .into(),
-            ));
-        }
-        Ok(Self { peer, address })
-    }
-
-    pub fn peer_id(&self) -> PeerId {
-        self.peer
-    }
-
-    pub fn address(&self) -> &Multiaddr {
-        &self.address
-    }
-}
-
+pub use crate::peer_address::PeerAddress;
 pub use urma_node_client::model::BookOrigin as Origin;
 
 /// One peer (or one not yet identified seed address). Addresses are stored
 /// without a terminal `/p2p`; the identity lives in `peer_id` once learned.
+/// Circuit addresses are learned only from peers and always name the entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BookEntry {
     pub peer_id: Option<PeerId>,
@@ -68,6 +30,13 @@ pub struct BookEntry {
     pub last_success: Option<u64>,
     pub failures: u32,
     pub banned_until: Option<u64>,
+}
+
+impl BookEntry {
+    /// Reachable only through relays: every address is a circuit.
+    pub fn circuit_only(&self) -> bool {
+        self.addrs.iter().all(is_circuit)
+    }
 }
 
 /// Counts reported in overlay status. `reached` entries succeeded and have
@@ -144,6 +113,8 @@ enum Host {
 
 impl PeerBook {
     pub const CAPACITY: usize = 1024;
+    /// Entries reachable only through relays, out of `CAPACITY`.
+    pub const CIRCUIT_CAPACITY: usize = 256;
     pub const ADDRESSES: usize = 4;
     /// Gossip entries per IPv4 /24 or IPv6 /48.
     pub const GROUP_LIMIT: usize = 2;
@@ -200,7 +171,26 @@ impl PeerBook {
             }
             book.entries.push(entry);
         }
+        book.trim_circuits();
         Ok(book)
+    }
+
+    /// Drop the worst circuit-only entries (most failures, then oldest
+    /// success) beyond the circuit share.
+    fn trim_circuits(&mut self) {
+        while self.circuit_entries() > Self::CIRCUIT_CAPACITY {
+            let Some(worst) = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.circuit_only())
+                .max_by_key(|(_, entry)| (entry.failures, Reverse(entry.last_success)))
+                .map(|(index, _)| index)
+            else {
+                return;
+            };
+            self.entries.remove(worst);
+        }
     }
 
     /// Atomically replace a bounded snapshot sorted by identity then address.
@@ -225,9 +215,10 @@ impl PeerBook {
 
     /// Add one address. A terminal `/p2p` names the peer; without it the
     /// entry stays unidentified until a dial succeeds. Gossip only accepts
-    /// public literal IPs under the group cap; manual and seed accept any
-    /// usable address including loopback and names. Returns whether memory
-    /// changed; capacity is made by evicting the worst gossip entry only.
+    /// public literal IPs under the group cap, and is the only origin of
+    /// circuit addresses; manual and seed accept any usable direct address
+    /// including loopback and names. Returns whether memory changed; capacity
+    /// is made by evicting the worst gossip entry only.
     pub fn add(&mut self, address: Multiaddr, origin: Origin) -> Result<bool, Error> {
         let learned = match origin {
             Origin::Gossip => Learned::Gossip,
@@ -246,10 +237,16 @@ impl PeerBook {
         learned: Learned,
     ) -> Result<bool, Error> {
         let (address, peer) = split(address)?;
+        let circuit = is_circuit(&address);
+        if circuit && (origin != Origin::Gossip || peer.is_none()) {
+            return Err(Error::Invalid(
+                "circuit addresses come only from gossip and name their peer".into(),
+            ));
+        }
         if origin == Origin::Gossip {
             self.admit_gossip(&address)?;
         }
-        if let Some(index) = self.position_of_address(&address) {
+        if let Some(index) = self.position_of_address(&address, peer) {
             if learned != Learned::Operator {
                 return Ok(false);
             }
@@ -274,7 +271,7 @@ impl PeerBook {
             entry.origin = entry.origin.max(origin);
             return Ok(true);
         }
-        self.make_room(origin)?;
+        self.make_room(origin, circuit)?;
         self.entries.push(BookEntry {
             peer_id: peer,
             addrs: vec![address],
@@ -317,15 +314,7 @@ impl PeerBook {
             if id == local || omitting.contains(&id.to_string()) {
                 continue;
             }
-            let mut addresses = Vec::new();
-            for address in peer.addrs.iter().take(Self::ADDRESSES) {
-                let Ok((address, named)) = split(address.clone()) else {
-                    continue;
-                };
-                if named.is_none_or(|named| named == id) && !addresses.contains(&address) {
-                    addresses.push(address);
-                }
-            }
+            let addresses = own_addresses(peer, local);
             if self.position_of_peer(id).is_none() {
                 changed += self.insert_learned_peer(id, addresses);
                 continue;
@@ -348,11 +337,13 @@ impl PeerBook {
     fn insert_learned_peer(&mut self, id: PeerId, addresses: Vec<Multiaddr>) -> usize {
         let mut admitted = Vec::new();
         for address in addresses {
-            if self.position_of_address(&address).is_none() && self.admit_gossip(&address).is_ok() {
+            let known = self.position_of_address(&address, Some(id)).is_some();
+            if !known && self.admit_gossip(&address).is_ok() {
                 admitted.push(address);
             }
         }
-        if admitted.is_empty() || self.make_room(Origin::Gossip).is_err() {
+        let circuit = admitted.iter().all(is_circuit);
+        if admitted.is_empty() || self.make_room(Origin::Gossip, circuit).is_err() {
             return 0;
         }
         let count = admitted.len();
@@ -372,10 +363,10 @@ impl PeerBook {
     /// entry that turns out to be this node is dropped: the book never holds
     /// ourselves.
     pub fn succeeded(&mut self, address: &Multiaddr, peer: PeerId, local: PeerId, now: u64) {
-        let Ok((address, _)) = split(address.clone()) else {
+        let Ok((address, named)) = split(address.clone()) else {
             return;
         };
-        let Some(index) = self.position_of_address(&address) else {
+        let Some(index) = self.position_of_address(&address, named) else {
             return;
         };
         if peer == local {
@@ -397,13 +388,17 @@ impl PeerBook {
 
     /// A dial through `address` failed: back off 60 s × 2^(failures−1), so the
     /// first failure waits 60 s, capped at one day (ten minutes for seeds).
+    /// The address moves to the back, so the next dial tries another one.
     pub fn failed(&mut self, address: &Multiaddr, now: u64) {
-        let Ok((address, _)) = split(address.clone()) else {
+        let Ok((address, named)) = split(address.clone()) else {
             return;
         };
-        let Some(index) = self.position_of_address(&address) else {
+        let Some(index) = self.position_of_address(&address, named) else {
             return;
         };
+        let addrs = &mut self.entries[index].addrs;
+        addrs.retain(|known| *known != address);
+        addrs.push(address);
         self.fail_entry(index, now);
     }
 
@@ -432,9 +427,10 @@ impl PeerBook {
     }
 
     /// Up to `count` dial addresses for non-seed entries that are not banned,
-    /// connected or omitting. Never-tried entries (picked at random) alternate
-    /// with tried ones (oldest backoff expiry first), so fresh gossip cannot
-    /// starve peers that were reached before.
+    /// connected or omitting. Entries with a direct address come before
+    /// circuit-only ones. Within each, never-tried entries (picked at random)
+    /// alternate with tried ones (oldest backoff expiry first), so fresh
+    /// gossip cannot starve peers that were reached before.
     pub fn candidates(
         &self,
         now: u64,
@@ -449,23 +445,13 @@ impl PeerBook {
                     !connected.contains(&peer) && !omitting.contains(&peer.to_string())
                 })
         };
-        let (mut fresh, mut tried): (Vec<&BookEntry>, Vec<&BookEntry>) = self
+        let (circuit, direct): (Vec<&BookEntry>, Vec<&BookEntry>) = self
             .entries
             .iter()
             .filter(eligible)
-            .partition(|entry| entry.last_success.is_none() && entry.failures == 0);
-        fresh.shuffle(&mut rand::thread_rng());
-        tried.sort_by_key(|entry| (entry.banned_until, entry.failures));
-        let mut fresh = fresh.into_iter();
-        let mut tried = tried.into_iter();
-        let mut picked = Vec::new();
-        while picked.len() < count {
-            let (next_fresh, next_tried) = (fresh.next(), tried.next());
-            if next_fresh.is_none() && next_tried.is_none() {
-                break;
-            }
-            picked.extend(next_fresh.into_iter().chain(next_tried));
-        }
+            .partition(|entry| entry.circuit_only());
+        let mut picked = alternate(direct);
+        picked.extend(alternate(circuit));
         picked.truncate(count);
         picked.into_iter().filter_map(dial_address).collect()
     }
@@ -493,8 +479,9 @@ impl PeerBook {
         seeds
     }
 
-    /// Identified IP/TCP addresses for record, commit and inventory sources,
-    /// one per peer, excluding peers this archive found omitting records.
+    /// Identified direct IP addresses for record, commit and inventory
+    /// sources, one per peer, excluding peers this archive found omitting
+    /// records. Circuit addresses never become sync sources.
     pub fn sync_addresses(&self, omitting: &[String]) -> Vec<PeerAddress> {
         self.entries
             .iter()
@@ -510,8 +497,9 @@ impl PeerBook {
             .collect()
     }
 
-    /// Verified, identified peers with public literal-IP addresses, most
-    /// recently successful first, for answering a Peers request.
+    /// Verified, identified peers with public literal-IP addresses (circuits
+    /// through public relays included), most recently successful first, for
+    /// answering a Peers request.
     pub fn gossip(&self, limit: usize, omitting: &[String]) -> Vec<GossipPeer> {
         let mut verified: Vec<(&BookEntry, PeerId, u64)> = self
             .entries
@@ -568,10 +556,13 @@ impl PeerBook {
         self.entries.len() != before
     }
 
-    fn position_of_address(&self, address: &Multiaddr) -> Option<usize> {
+    /// A circuit is stored without its target, so every peer behind one relay
+    /// shares the bare address: it matches only the entry of `peer`.
+    fn position_of_address(&self, address: &Multiaddr, peer: Option<PeerId>) -> Option<usize> {
+        let circuit = is_circuit(address);
         self.entries
             .iter()
-            .position(|entry| entry.addrs.contains(address))
+            .position(|entry| entry.addrs.contains(address) && (!circuit || entry.peer_id == peer))
     }
 
     fn position_of_peer(&self, peer: PeerId) -> Option<usize> {
@@ -580,17 +571,26 @@ impl PeerBook {
             .position(|entry| entry.peer_id == Some(peer))
     }
 
+    fn circuit_entries(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.circuit_only())
+            .count()
+    }
+
     fn overlaps(&self, candidate: &BookEntry) -> bool {
         candidate
             .peer_id
             .is_some_and(|peer| self.position_of_peer(peer).is_some())
-            || candidate
-                .addrs
-                .iter()
-                .any(|address| self.position_of_address(address).is_some())
+            || candidate.addrs.iter().any(|address| {
+                self.position_of_address(address, candidate.peer_id)
+                    .is_some()
+            })
     }
 
-    /// Gossip may only name public literal IPs, two entries per network group.
+    /// Gossip may only name public literal IPs, two direct entries per
+    /// network group. Circuits share their relay's group, so they are bounded
+    /// by the circuit-only capacity instead.
     fn admit_gossip(&self, address: &Multiaddr) -> Result<(), Error> {
         let Some(Host::Ip(ip)) = host(address) else {
             return Err(Error::Invalid(
@@ -601,22 +601,29 @@ impl PeerBook {
         if !is_public(address) {
             return Err(Error::Invalid("gossip named a non-public address".into()));
         }
+        if is_circuit(address) {
+            return Ok(());
+        }
         let neighbours = self
             .entries
             .iter()
             .filter(|entry| entry.origin == Origin::Gossip)
             .filter(|entry| entry.addrs.iter().any(|known| same_group(known, ip)))
             .count();
-        if neighbours >= Self::GROUP_LIMIT && self.position_of_address(address).is_none() {
+        if neighbours >= Self::GROUP_LIMIT && self.position_of_address(address, None).is_none() {
             return Err(Error::Busy("gossip network group is full".into()));
         }
         Ok(())
     }
 
-    /// At capacity, evict the gossip entry with most failures, then the oldest
-    /// success (never-successful first). Manual and seed are never evicted.
-    fn make_room(&mut self, origin: Origin) -> Result<(), Error> {
-        if self.entries.len() < Self::CAPACITY {
+    /// Make room for a new entry (`circuit`: reachable only through relays).
+    /// When the circuit-only share is full, evict among circuit-only gossip;
+    /// otherwise at capacity among all gossip: most failures first, then the
+    /// oldest success (never-successful first). Manual and seed are never
+    /// evicted, and a new gossip entry never evicts a healthy one.
+    fn make_room(&mut self, origin: Origin, circuit: bool) -> Result<(), Error> {
+        let crowded = circuit && self.circuit_entries() >= Self::CIRCUIT_CAPACITY;
+        if !crowded && self.entries.len() < Self::CAPACITY {
             return Ok(());
         }
         let worst = self
@@ -624,6 +631,7 @@ impl PeerBook {
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.origin == Origin::Gossip)
+            .filter(|(_, entry)| !crowded || entry.circuit_only())
             .max_by_key(|(_, entry)| {
                 (
                     entry.failures,
@@ -645,36 +653,49 @@ impl PeerBook {
     }
 }
 
-/// Validate a dialable address and split off a terminal `/p2p`. Accepted:
-/// IP4/IP6/DNS/DNS4/DNS6 + nonzero TCP, or DNSADDR alone; then optional `/p2p`.
-fn split(address: Multiaddr) -> Result<(Multiaddr, Option<PeerId>), Error> {
-    let invalid = || Error::Invalid("peer book address shape is not dialable".into());
-    let mut bare = Multiaddr::empty();
-    let mut protocols = address.iter();
-    let first = protocols.next().ok_or_else(invalid)?;
-    let named_only = matches!(first, Protocol::Dnsaddr(_));
-    match &first {
-        Protocol::Ip4(ip) if usable(IpAddr::V4(*ip)) => (),
-        Protocol::Ip6(ip) if usable(IpAddr::V6(*ip)) => (),
-        Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => (),
-        _ => return Err(invalid()),
-    }
-    bare.push(first);
-    if !named_only {
-        match protocols.next() {
-            Some(Protocol::Tcp(port)) if port != 0 => bare.push(Protocol::Tcp(port)),
-            _ => return Err(invalid()),
+/// A gossiped peer's distinct addresses naming it (or nothing), skipping
+/// circuits through itself or through this node.
+fn own_addresses(peer: &GossipPeer, local: PeerId) -> Vec<Multiaddr> {
+    let id = peer.peer_id;
+    let mut addresses = Vec::new();
+    for address in peer.addrs.iter().take(PeerBook::ADDRESSES) {
+        if relay(address).is_some_and(|relay| relay == id || relay == local) {
+            continue;
+        }
+        let Ok((address, named)) = split(address.clone()) else {
+            continue;
+        };
+        if named.is_none_or(|named| named == id) && !addresses.contains(&address) {
+            addresses.push(address);
         }
     }
-    let peer = match protocols.next() {
-        None => None,
-        Some(Protocol::P2p(peer)) => Some(peer),
-        Some(_) => return Err(invalid()),
-    };
-    if protocols.next().is_some() {
-        return Err(invalid());
+    addresses
+}
+
+/// Never-tried entries in random order alternating with tried ones, oldest
+/// backoff expiry first.
+fn alternate(entries: Vec<&BookEntry>) -> Vec<&BookEntry> {
+    let (mut fresh, mut tried): (Vec<&BookEntry>, Vec<&BookEntry>) = entries
+        .into_iter()
+        .partition(|entry| entry.last_success.is_none() && entry.failures == 0);
+    fresh.shuffle(&mut rand::thread_rng());
+    tried.sort_by_key(|entry| (entry.banned_until, entry.failures));
+    let mut fresh = fresh.into_iter();
+    let mut tried = tried.into_iter();
+    let mut picked = Vec::new();
+    loop {
+        let (next_fresh, next_tried) = (fresh.next(), tried.next());
+        if next_fresh.is_none() && next_tried.is_none() {
+            return picked;
+        }
+        picked.extend(next_fresh.into_iter().chain(next_tried));
     }
-    Ok((bare, peer))
+}
+
+/// Validate a dialable address and split off a terminal `/p2p`.
+fn split(address: Multiaddr) -> Result<(Multiaddr, Option<PeerId>), Error> {
+    let shape = parse(&address)?;
+    Ok((shape.bare, shape.peer))
 }
 
 fn host(address: &Multiaddr) -> Option<Host> {
@@ -685,13 +706,6 @@ fn host(address: &Multiaddr) -> Option<Host> {
             Some(Host::Name)
         }
         _ => None,
-    }
-}
-
-fn usable(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
-        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
     }
 }
 
@@ -714,8 +728,14 @@ fn same_group(address: &Multiaddr, ip: IpAddr) -> bool {
     }
 }
 
+/// The first direct address, else the first circuit, with the identity.
 fn dial_address(entry: &BookEntry) -> Option<Multiaddr> {
-    let address = entry.addrs.first()?.clone();
+    let address = entry
+        .addrs
+        .iter()
+        .find(|address| !is_circuit(address))
+        .or(entry.addrs.first())?
+        .clone();
     Some(match entry.peer_id {
         Some(peer) => address.with(Protocol::P2p(peer)),
         None => address,
@@ -755,6 +775,11 @@ fn restore(saved: SavedEntry) -> Result<BookEntry, Error> {
         }
         if saved.origin == Origin::Gossip && !public(&bare) {
             return Err(Error::Invalid("saved gossip address is not public".into()));
+        }
+        if is_circuit(&bare) && (saved.origin != Origin::Gossip || peer_id.is_none()) {
+            return Err(Error::Invalid(
+                "saved circuit address needs a gossip entry with its peer".into(),
+            ));
         }
         addrs.push(bare);
     }

@@ -698,6 +698,7 @@ impl Scheduler {
             status.last_error_at = last_error_at;
             status.backoff_until = peer.backoff_until(now)?;
             status.last_progress_at = peer.last_progress()?;
+            status.link = self.offered.link_of(peer.peer_id);
             peers.push(status);
         }
         let mut status = OverlayStatus::default();
@@ -712,6 +713,7 @@ impl Scheduler {
         status.admitted = self.admitted.load(Ordering::Relaxed);
         status.rejected = self.rejected.load(Ordering::Relaxed);
         status.peers = peers;
+        self.offered.nat_status(&mut status);
         Ok(status)
     }
 }

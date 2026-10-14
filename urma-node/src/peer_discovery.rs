@@ -8,6 +8,8 @@ use crate::{
     engine::Engine,
     model::{BookEntry, DiscoveryStatus},
     peer::PeerNetwork,
+    peer_address::Dialed,
+    peer_nat::PeerLink,
     peer_protocol::GossipPeer,
     peerbook::PeerBook,
     recorded::{RecordedError, read, unix_seconds as now},
@@ -15,6 +17,7 @@ use crate::{
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use rand::seq::SliceRandom;
 use std::{
+    mem,
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -32,6 +35,35 @@ pub struct Discovery {
     gossip_error: Mutex<Option<RecordedError>>,
     sync_backoff: Mutex<Vec<String>>,
     own_addresses: Mutex<Vec<Multiaddr>>,
+    relayed: Mutex<Vec<Relayed>>,
+}
+
+/// A circuit dial that reached its peer only through a relay. It is neither
+/// reached nor failed until DCUtR gives the peer a direct connection.
+struct Relayed {
+    address: Multiaddr,
+    peer: PeerId,
+    since: Instant,
+}
+
+/// What a waiting circuit dial needs this round.
+#[derive(Debug, PartialEq, Eq)]
+enum Settle {
+    /// A direct connection exists: run the chain probe over it.
+    Probe,
+    /// Still relayed within the circuit lifetime: DCUtR may yet succeed.
+    Wait,
+    /// The relayed contact ended, or outlived the circuit, without a direct
+    /// connection: hole punching failed, so the address backs off.
+    Fail,
+}
+
+fn settle(direct: bool, connected: bool, waited: Duration) -> Settle {
+    match (direct, connected && waited < Discovery::CIRCUIT_WAIT) {
+        (true, _) => Settle::Probe,
+        (false, true) => Settle::Wait,
+        (false, false) => Settle::Fail,
+    }
 }
 
 /// Network operations left in this round; stop ends the round early.
@@ -78,6 +110,10 @@ impl Discovery {
     pub const BOOTSTRAP_REACHED: u64 = 4;
     /// Wall-clock bound of one dial or address request.
     pub const OPERATION_TIME: Duration = Duration::from_secs(10);
+    /// How long a relayed-only contact may wait for DCUtR: one circuit.
+    pub const CIRCUIT_WAIT: Duration = Duration::from_secs(120);
+    /// Circuit dials waiting for a direct connection at once.
+    pub const RELAYED_MAX: usize = 16;
 
     /// `path` is where the book is saved after a round changes it.
     pub fn new(network: Arc<PeerNetwork>, book: Arc<Mutex<PeerBook>>, path: PathBuf) -> Self {
@@ -90,6 +126,7 @@ impl Discovery {
             gossip_error: Mutex::new(None),
             sync_backoff: Mutex::new(Vec::new()),
             own_addresses: Mutex::new(Vec::new()),
+            relayed: Mutex::new(Vec::new()),
         }
     }
 
@@ -127,6 +164,7 @@ impl Discovery {
         if self.seeds_due(round)? {
             changed |= self.dial_seeds(&avoid, &mut budget, round == 0)?;
         }
+        changed |= self.settle_relayed(&mut budget)?;
         changed |= self.dial_candidates(&avoid, &mut budget)?;
         if round % Self::GOSSIP_EVERY == Self::GOSSIP_EVERY - 1 {
             changed |= self.ask_for_peers(&omitting, &mut budget)?;
@@ -174,7 +212,7 @@ impl Discovery {
 
     /// Isolated nodes retry seeds every round, limited by each seed's backoff.
     fn seeds_due(&self, round: u64) -> Result<bool, Error> {
-        let connected = self.network.connected_peer_ids().len();
+        let connected = self.direct_peers().len();
         if connected >= Self::TARGET {
             return Ok(false);
         }
@@ -198,7 +236,17 @@ impl Discovery {
             false => match self.network.dns().admits(address) {
                 // Without a resolver the address is unreachable here, not bad.
                 Err(unresolvable) => return Ok(Err(unresolvable)),
-                Ok(()) => self.network.dial(address.clone(), stop, deadline),
+                Ok(()) => match self.network.dial_any(address.clone(), stop, deadline) {
+                    Ok(Dialed::Direct(peer)) => Ok(peer),
+                    // Neither reached nor failed: Busy leaves the book as is.
+                    Ok(Dialed::Relayed(peer)) => {
+                        self.await_direct(address.clone(), peer)?;
+                        Err(Error::Busy(format!(
+                            "{peer} reachable only through a relay; awaiting hole punching"
+                        )))
+                    }
+                    Err(failure) => Err(failure),
+                },
             },
         };
         if stop.load(Ordering::Acquire) {
@@ -261,10 +309,11 @@ impl Discovery {
     }
 
     fn dial_candidates(&self, omitting: &[String], budget: &mut Budget) -> Result<bool, Error> {
-        let connected = self.network.connected_peer_ids();
-        if connected.len() >= Self::TARGET {
+        if self.direct_peers().len() >= Self::TARGET {
             return Ok(false);
         }
+        // Relayed-only peers are excluded too: their circuit is already open.
+        let connected = self.network.connected_peer_ids();
         let mut candidates =
             self.lock()?
                 .candidates(now()?, &connected, omitting, Self::DIALS_PER_ROUND);
@@ -290,8 +339,7 @@ impl Discovery {
     /// before `gossip_error` is taken; the two are never held together.
     fn ask_for_peers(&self, omitting: &[String], budget: &mut Budget) -> Result<bool, Error> {
         let connected: Vec<PeerId> = self
-            .network
-            .connected_peer_ids()
+            .direct_peers()
             .into_iter()
             .filter(|peer| !omitting.contains(&peer.to_string()))
             .collect();
@@ -317,6 +365,95 @@ impl Discovery {
         };
         *self.gossip_error.lock().map_err(|_| poisoned())? = recorded;
         Ok(changed)
+    }
+
+    /// Peers holding a direct connection. Only these count toward the target
+    /// and carry records/5 (gossip, chain probe); a relayed-only peer doesn't.
+    fn direct_peers(&self) -> Vec<PeerId> {
+        self.network
+            .peer_links()
+            .into_iter()
+            .filter(|(_, link)| *link == PeerLink::Direct)
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
+    fn relayed(&self) -> Result<MutexGuard<'_, Vec<Relayed>>, Error> {
+        self.relayed.lock().map_err(|_| poisoned())
+    }
+
+    /// Remember a circuit dial until DCUtR settles it; a newer contact
+    /// replaces the peer's older one. The oldest of a full list makes room
+    /// and counts as a failed dial; the book lock is taken only after the
+    /// waiting list is released.
+    fn await_direct(&self, address: Multiaddr, peer: PeerId) -> Result<(), Error> {
+        let evicted = {
+            let mut relayed = self.relayed()?;
+            relayed.retain(|waiting| waiting.peer != peer);
+            let evicted = match relayed.len() == Self::RELAYED_MAX {
+                true => Some(relayed.remove(0)),
+                false => None,
+            };
+            relayed.push(Relayed {
+                address,
+                peer,
+                since: Instant::now(),
+            });
+            evicted
+        };
+        let Some(entry) = evicted else {
+            return Ok(());
+        };
+        self.lock()?.failed(&entry.address, now()?);
+        Ok(())
+    }
+
+    /// Settle circuit dials (contract §3.6): a peer that gained a direct
+    /// connection gets the chain probe over it and counts as reached; one
+    /// whose relayed contact ended or outlived the circuit backs off. The
+    /// waiting list and the book lock are never held together.
+    fn settle_relayed(&self, budget: &mut Budget) -> Result<bool, Error> {
+        let waiting = mem::take(&mut *self.relayed()?);
+        let connected = self.network.connected_peer_ids();
+        let mut keep = Vec::new();
+        let mut changed = false;
+        for entry in waiting {
+            let direct = self.network.has_direct(entry.peer);
+            let verdict = settle(
+                direct,
+                connected.contains(&entry.peer),
+                entry.since.elapsed(),
+            );
+            let settled = match verdict {
+                Settle::Wait => false,
+                Settle::Probe => budget.take() && self.probe_relayed(&entry, budget.stop)?,
+                Settle::Fail => {
+                    self.lock()?.failed(&entry.address, now()?);
+                    true
+                }
+            };
+            match settled {
+                true => changed = true,
+                false => keep.push(entry),
+            }
+        }
+        self.relayed()?.extend(keep);
+        Ok(changed)
+    }
+
+    /// The chain probe over a punched connection; false while the peer is
+    /// busy, so the contact waits for the next round.
+    fn probe_relayed(&self, entry: &Relayed, stop: &AtomicBool) -> Result<bool, Error> {
+        let deadline = Instant::now() + Self::OPERATION_TIME;
+        let outcome = self.network.probe(entry.peer, stop, deadline);
+        let at = now()?;
+        let local = self.network.peer_id();
+        match outcome {
+            Ok(peer) => self.lock()?.succeeded(&entry.address, peer, local, at),
+            Err(Error::Busy(_) | Error::PeerBusy) => return Ok(false),
+            Err(_failure) => self.lock()?.failed(&entry.address, at),
+        }
+        Ok(true)
     }
 
     pub fn status(&self) -> Result<DiscoveryStatus, Error> {
@@ -358,5 +495,26 @@ impl Discovery {
 
     pub fn book(&self) -> Result<Vec<BookEntry>, Error> {
         Ok(self.lock()?.listing())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Discovery, Settle, settle};
+    use std::time::Duration;
+
+    #[test]
+    fn a_punched_peer_is_probed_whatever_its_relay_does() {
+        let late = Discovery::CIRCUIT_WAIT + Duration::from_secs(1);
+        assert_eq!(settle(true, true, Duration::ZERO), Settle::Probe);
+        assert_eq!(settle(true, false, late), Settle::Probe);
+    }
+
+    #[test]
+    fn a_relayed_contact_waits_one_circuit_then_fails() {
+        let early = Discovery::CIRCUIT_WAIT - Duration::from_secs(1);
+        assert_eq!(settle(false, true, early), Settle::Wait);
+        assert_eq!(settle(false, true, Discovery::CIRCUIT_WAIT), Settle::Fail);
+        assert_eq!(settle(false, false, Duration::ZERO), Settle::Fail);
     }
 }

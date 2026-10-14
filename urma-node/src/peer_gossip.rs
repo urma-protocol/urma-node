@@ -6,6 +6,7 @@ use crate::{
     peer::{
         Answer, Behaviour, CALL_TIMEOUT, Command, PeerNetwork, Pending, bind_response, request,
     },
+    peer_address::{AddressKind, Dialed, is_circuit, parse, relay},
     peer_limits::{Class, LimitDenied},
     peer_nat::{HolePunch, Nat, PeerLink, Reachability},
     peer_protocol::{
@@ -19,6 +20,7 @@ use libp2p::{
     multiaddr::Protocol,
     swarm::{ConnectionId, DialError, dial_opts::DialOpts},
 };
+use rand::seq::SliceRandom;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     net::{Ipv4Addr, Ipv6Addr},
@@ -209,24 +211,25 @@ impl Shared {
         guard(&self.connected).contains_key(&peer)
     }
 
-    /// Whether the peer holds a connection we dialed.
+    /// Whether the peer is directly connected and holds a connection we dialed.
     pub(crate) fn is_outbound(&self, peer: PeerId) -> bool {
         guard(&self.connected)
             .get(&peer)
-            .is_some_and(|links| links.outbound > 0)
+            .is_some_and(|links| links.outbound > 0 && links.link() == PeerLink::Direct)
     }
 
     fn connected(&self) -> Vec<PeerId> {
         guard(&self.connected).keys().copied().collect()
     }
 
-    /// Connected peers that spoke this protocol version on our chain, those
-    /// we dialed before those that only dialed us.
+    /// Directly connected peers that spoke this protocol version on our
+    /// chain, those we dialed before those that only dialed us. A peer reached
+    /// only through a relay is left out: data never rides a circuit.
     pub(crate) fn live(&self) -> Vec<PeerId> {
         let connected = guard(&self.connected);
         let (outbound, inbound): (Vec<_>, Vec<_>) = connected
             .iter()
-            .filter(|(_, links)| links.on_chain)
+            .filter(|(_, links)| links.on_chain && links.link() == PeerLink::Direct)
             .partition(|(_, links)| links.outbound > 0);
         outbound
             .into_iter()
@@ -301,9 +304,10 @@ impl Shared {
         }
     }
 
-    /// Answer a Peers request from the snapshot. Only IP-literal addresses are
-    /// forwarded, private and loopback ones only to loopback requesters. Neither
-    /// the requester nor this node is listed; future `last_seen` is clamped.
+    /// Answer a Peers request: peers holding a reservation on this relay
+    /// alternate with the snapshot. Only IP-literal addresses are forwarded,
+    /// private and loopback ones only to loopback requesters. Neither the
+    /// requester nor this node is listed; future `last_seen` is clamped.
     pub(crate) fn serve(&self, requester: PeerId, loopback: bool, limit: u32) -> Reply {
         let Ok(limit) = usize::try_from(limit) else {
             return Reply::Refused;
@@ -311,34 +315,27 @@ impl Shared {
         if limit > usize::try_from(PEERS_MAX).unwrap_or(0) {
             return Reply::Refused;
         }
+        let now = unix_now();
+        let reserved = self.reserved(requester, now);
+        let held: Vec<PeerId> = reserved.iter().map(|peer| peer.peer_id).collect();
         let Ok(snapshot) = self.gossip.lock() else {
             return Reply::Busy;
         };
-        let now = unix_now();
-        let mut peers = Vec::new();
-        let listed = snapshot
+        let mut listed = snapshot
             .iter()
-            .filter(|entry| entry.peer_id != requester && entry.peer_id != self.local);
-        for entry in listed {
-            if peers.len() == limit {
+            .filter(|entry| entry.peer_id != requester && entry.peer_id != self.local)
+            .filter(|entry| !held.contains(&entry.peer_id))
+            .filter_map(|entry| servable(entry, loopback, now));
+        let mut reserved = reserved.into_iter();
+        let mut peers = Vec::new();
+        while peers.len() < limit {
+            let (held, known) = (reserved.next(), listed.next());
+            if held.is_none() && known.is_none() {
                 break;
             }
-            let addrs: Vec<Multiaddr> = entry
-                .addrs
-                .iter()
-                .filter(|address| validate_gossip_address(address).is_ok())
-                .filter(|address| loopback || is_public(address))
-                .take(PEER_ADDRESSES_MAX)
-                .cloned()
-                .collect();
-            if !addrs.is_empty() {
-                peers.push(GossipPeer {
-                    peer_id: entry.peer_id,
-                    addrs,
-                    last_seen: entry.last_seen.min(now),
-                });
-            }
+            peers.extend(held.into_iter().chain(known));
         }
+        peers.truncate(limit);
         loop {
             match serde_json::to_vec(&peers) {
                 Ok(bytes) if bytes.len() + Self::ENVELOPE <= PEERS_LIMIT => break,
@@ -350,6 +347,55 @@ impl Shared {
         }
         Reply::Peers(peers)
     }
+
+    /// Peers holding an active reservation on this node's relay, in random
+    /// order, each with its circuit addresses through this node's public IPv4
+    /// external addresses. Empty while this node has none.
+    fn reserved(&self, requester: PeerId, now: u64) -> Vec<GossipPeer> {
+        let hops: Vec<Multiaddr> = self
+            .nat
+            .external()
+            .into_iter()
+            .map(|external| {
+                external
+                    .with(Protocol::P2p(self.local))
+                    .with(Protocol::P2pCircuit)
+            })
+            .filter(|hop| parse(hop).is_ok())
+            .take(PEER_ADDRESSES_MAX)
+            .collect();
+        if hops.is_empty() {
+            return Vec::new();
+        }
+        let mut holders = self.nat.reserved_by_others();
+        holders.retain(|holder| *holder != requester && *holder != self.local);
+        holders.shuffle(&mut rand::thread_rng());
+        holders
+            .into_iter()
+            .map(|peer_id| GossipPeer {
+                peer_id,
+                addrs: hops.clone(),
+                last_seen: now,
+            })
+            .collect()
+    }
+}
+
+/// A snapshot entry with only the addresses this requester may receive.
+fn servable(entry: &GossipPeer, loopback: bool, now: u64) -> Option<GossipPeer> {
+    let addrs: Vec<Multiaddr> = entry
+        .addrs
+        .iter()
+        .filter(|address| validate_gossip_address(address).is_ok())
+        .filter(|address| loopback || is_public(address))
+        .take(PEER_ADDRESSES_MAX)
+        .cloned()
+        .collect();
+    (!addrs.is_empty()).then(|| GossipPeer {
+        peer_id: entry.peer_id,
+        addrs,
+        last_seen: entry.last_seen.min(now),
+    })
 }
 
 /// Globally routable IP, or a DNS name other than localhost. IPv4-mapped IPv6
@@ -411,45 +457,28 @@ pub(crate) fn is_loopback(address: &Multiaddr) -> bool {
     }
 }
 
-/// Gossip carries only `/ip4|ip6/<literal>/tcp/<port>[/p2p/<id>]`: names come
-/// from operators (seeds, manual entries), never from peers.
+/// Gossip carries only IP-literal addresses, direct or circuit, each with an
+/// optional `/p2p`: names come from operators (seeds, manual), never peers.
 pub fn validate_gossip_address(address: &Multiaddr) -> Result<Option<PeerId>, Error> {
-    match address.iter().next() {
-        Some(Protocol::Ip4(_) | Protocol::Ip6(_)) => validate_dial(address),
+    let shape = parse(address)?;
+    match shape.bare.iter().next() {
+        Some(Protocol::Ip4(_) | Protocol::Ip6(_)) => Ok(shape.peer),
         _ => Err(Error::Invalid(
-            "gossiped addresses must be IP literals with TCP".into(),
+            "gossiped addresses must be IP literals".into(),
         )),
     }
 }
 
-/// Operator-supplied dial targets: `/ip4|ip6|dns|dns4|dns6/<host>/tcp/<port>`
-/// or `/dnsaddr/<name>`, each with optional `/p2p`. Returns the named identity.
+/// Dial targets: any direct address shape, or a circuit that names its
+/// target. Returns the named identity.
 pub fn validate_dial(address: &Multiaddr) -> Result<Option<PeerId>, Error> {
-    let invalid = || Error::Invalid("peer dial requires host, TCP port and optional /p2p".into());
-    let mut parts = address.iter();
-    match parts.next() {
-        Some(Protocol::Dnsaddr(_)) => (),
-        Some(
-            Protocol::Ip4(_)
-            | Protocol::Ip6(_)
-            | Protocol::Dns(_)
-            | Protocol::Dns4(_)
-            | Protocol::Dns6(_),
-        ) => match parts.next() {
-            Some(Protocol::Tcp(port)) if port != 0 => (),
-            _ => return Err(invalid()),
-        },
-        _ => return Err(invalid()),
+    let shape = parse(address)?;
+    if shape.peer.is_none() && matches!(shape.kind, AddressKind::Circuit(_)) {
+        return Err(Error::Invalid(
+            "circuit dial must name its target peer".into(),
+        ));
     }
-    let peer = match parts.next() {
-        None => None,
-        Some(Protocol::P2p(peer)) => Some(peer),
-        Some(_) => return Err(invalid()),
-    };
-    if parts.next().is_some() {
-        return Err(invalid());
-    }
-    Ok(peer)
+    Ok(shape.peer)
 }
 
 /// Bind the reply to its request, then check every gossiped hint's shape.
@@ -491,7 +520,9 @@ fn check_gossip(entry: &GossipPeer) -> Result<(), Error> {
         ));
     }
     for address in &entry.addrs {
-        if validate_gossip_address(address)?.is_some_and(|named| named != peer) {
+        if validate_gossip_address(address)?.is_some_and(|named| named != peer)
+            || relay(address) == Some(peer)
+        {
             return Err(Error::Invalid(
                 "peer gossip address names another peer".into(),
             ));
@@ -661,23 +692,36 @@ impl PeerNetwork {
         self.shared.drain_identified()
     }
 
-    /// Dial an address (with or without `/p2p`), then probe the peer with a
-    /// zero-limit Peers request. Returns the authenticated identity; the
-    /// connection stays for later requests. A Busy probe is an error that keeps
-    /// the connection; any other failed probe closes it: the peer is on another
-    /// chain or does not speak this protocol.
+    /// `dial_any` for a peer that must be reached directly: a peer reached
+    /// only through a relay is a Busy error until DCUtR links it directly.
     pub fn dial(
         &self,
         address: Multiaddr,
         cancelled: &AtomicBool,
         deadline: Instant,
     ) -> Result<PeerId, Error> {
+        match self.dial_any(address, cancelled, deadline)? {
+            Dialed::Direct(peer) => Ok(peer),
+            Dialed::Relayed(peer) => Err(Error::Busy(format!("{peer} reachable only via relay"))),
+        }
+    }
+
+    /// Dial an address (with or without `/p2p`); a direct peer gets the chain
+    /// `probe`. A relayed-only peer is returned unprobed: records/5 never runs
+    /// on relayed links. The connection stays for later requests.
+    pub fn dial_any(
+        &self,
+        address: Multiaddr,
+        cancelled: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Dialed, Error> {
         validate_dial(&address)?;
         check_cancelled(cancelled)?;
         if self.stop.load(Ordering::Acquire) {
             return Err(Error::Busy("peer network stopped".into()));
         }
         let deadline = deadline.min(Instant::now() + CALL_TIMEOUT);
+        let circuit = is_circuit(&address);
         let (answer, receiver) = mpsc::sync_channel(1);
         self.commands
             .try_send(Command::Dial(Dial {
@@ -700,6 +744,21 @@ impl PeerNetwork {
                 }
             }
         };
+        if circuit && !self.has_direct(peer) {
+            return Ok(Dialed::Relayed(peer));
+        }
+        self.probe(peer, cancelled, deadline).map(Dialed::Direct)
+    }
+
+    /// The chain probe: a zero-limit Peers request over a direct link. Busy
+    /// keeps the connection; any other failure closes it (another chain, or
+    /// not this protocol).
+    pub fn probe(
+        &self,
+        peer: PeerId,
+        cancelled: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<PeerId, Error> {
         match self.peers_of(peer, 0, cancelled, deadline) {
             Ok(_) => Ok(peer),
             Err(busy @ (Error::Busy(_) | Error::PeerBusy)) => Err(busy),

@@ -4,11 +4,15 @@
 //! peer leaves the set with its last connection.
 use crate::{
     Error,
-    model::RecordPackage,
+    model::{
+        OverlayStatus, PeerLink as LinkStatus, Reachability as ReachabilityStatus, RecordPackage,
+    },
     peer::{Answer, CALL_TIMEOUT, Command, request},
     peer_gossip::Shared,
+    peer_nat::{PeerLink, Reachability},
     peer_protocol::Kind,
     peerbook::PeerAddress,
+    recorded::RecordedError,
     retrieval::RecordSource,
 };
 use bitcoin::Txid;
@@ -177,5 +181,32 @@ impl SyncPeers {
     /// How many record sources a retrieval call would get right now.
     pub fn record_count(&self) -> usize {
         self.sources(&[]).len().min(Self::RECORD_PEERS)
+    }
+
+    /// The peer's link right now; `None` while it has no connection.
+    pub(crate) fn link_of(&self, peer: PeerId) -> Option<LinkStatus> {
+        let links = self.link.shared.links();
+        let (_, link) = links.iter().find(|(known, _)| *known == peer)?;
+        Some(match link {
+            PeerLink::Direct => LinkStatus::Direct,
+            PeerLink::Relayed => LinkStatus::Relayed,
+        })
+    }
+
+    /// Reachability, this node's relays and hole punch counters.
+    pub(crate) fn nat_status(&self, status: &mut OverlayStatus) {
+        let nat = &self.link.shared.nat;
+        status.reachability = match nat.reachability() {
+            Reachability::Unknown => ReachabilityStatus::Unknown,
+            Reachability::Public => ReachabilityStatus::Public,
+            Reachability::Private => ReachabilityStatus::Private,
+        };
+        status.relays = nat.relays().iter().map(PeerId::to_string).collect();
+        let punch = nat.hole_punch();
+        let (last_error, last_error_at) = RecordedError::split(punch.last_error);
+        status.hole_punch.attempts = punch.attempts;
+        status.hole_punch.successes = punch.successes;
+        status.hole_punch.last_error = last_error;
+        status.hole_punch.last_error_at = last_error_at;
     }
 }

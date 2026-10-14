@@ -151,7 +151,10 @@ impl Nat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{peer_gossip::Shared, peer_limits::Class};
+    use crate::{
+        peer_gossip::Shared, peer_limits::Class, peer_protocol::Reply, peerbook::PeerBook,
+    };
+    use bitcoin::{BlockHash, hashes::Hash};
     use libp2p::identity::Keypair;
 
     fn peer() -> PeerId {
@@ -187,6 +190,53 @@ mod tests {
         assert_eq!(shared.links(), vec![(remote, PeerLink::Direct)]);
         shared.closed(remote, true, Class::Data);
         assert!(shared.links().is_empty());
+    }
+
+    #[test]
+    fn a_relayed_only_peer_is_neither_live_nor_outbound_until_it_has_a_direct_link() {
+        let shared = Shared::new(peer());
+        let remote = peer();
+        shared.opened(remote, true, Class::Relayed);
+        shared.on_chain(remote);
+        assert!(shared.is_connected(remote));
+        assert!(shared.live().is_empty());
+        assert!(!shared.is_outbound(remote));
+        shared.opened(remote, true, Class::Data);
+        assert_eq!(shared.live(), vec![remote]);
+        assert!(shared.is_outbound(remote));
+    }
+
+    #[test]
+    fn a_relay_serves_its_reservation_holders_as_circuits_a_book_stores() {
+        let relay = peer();
+        let shared = Shared::new(relay);
+        let (holder, requester) = (peer(), peer());
+        shared.nat.set_reserved_by(holder, true);
+        shared.nat.set_reserved_by(requester, true);
+        assert!(
+            matches!(shared.serve(requester, false, 8), Reply::Peers(peers) if peers.is_empty())
+        );
+        let external: Multiaddr = "/ip4/11.0.0.1/tcp/28332".parse().unwrap();
+        shared.nat.set_external(external.clone(), true);
+        let Reply::Peers(peers) = shared.serve(requester, false, 8) else {
+            panic!("peers request refused");
+        };
+        let hop = external
+            .with(Protocol::P2p(relay))
+            .with(Protocol::P2pCircuit);
+        assert_eq!(peers.len(), 1, "the requester is never listed");
+        assert_eq!(
+            (peers[0].peer_id, peers[0].addrs.clone()),
+            (holder, vec![hop.clone()])
+        );
+        let mut book = PeerBook::empty(BlockHash::from_byte_array([42; 32]));
+        assert_eq!(book.merge(&peers, requester, &[]), 1);
+        let entry = &book.entries()[0];
+        assert_eq!(
+            (entry.peer_id, entry.addrs.clone()),
+            (Some(holder), vec![hop])
+        );
+        assert!(entry.circuit_only());
     }
 
     #[test]

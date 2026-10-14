@@ -15,7 +15,7 @@ urma-chain = { version = "0.3.0" }
 urma-core = { version = "0.3.0" }
 urma-io = { version = "0.3.2" }
 urma-names = { version = "0.3.0" }
-urma-node-client = { version = "0.5.0" }
+urma-node-client = { version = "0.5.1" }
 urma-runtime = { version = "0.3.3" }
 urma-wire = { version = "0.3.0" }
 
