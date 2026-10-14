@@ -8,6 +8,7 @@ use crate::{
     },
     peer_address::{AddressKind, Dialed, is_circuit, parse, relay},
     peer_limits::{Class, LimitDenied},
+    peer_links::Links,
     peer_nat::{Nat, PeerLink, Reachability},
     peer_protocol::{
         GossipPeer, Kind, PEER_ADDRESSES_MAX, PEERS_LIMIT, PEERS_MAX, Reply, Response,
@@ -43,56 +44,6 @@ pub(crate) struct Shared {
     identified: Mutex<VecDeque<(PeerId, Vec<Multiaddr>)>>,
     listening: Mutex<Vec<Multiaddr>>,
     pub(crate) nat: Nat,
-}
-
-/// Established connections of one peer by direction, how many of them ride a
-/// relay circuit, how many may carry data (and of those, how many we dialed),
-/// and whether it has spoken this protocol version on our chain over any.
-#[derive(Default)]
-struct Links {
-    inbound: u32,
-    outbound: u32,
-    relayed: u32,
-    data: u32,
-    outbound_data: u32,
-    on_chain: bool,
-}
-
-impl Links {
-    /// Direct iff a data connection is open, relayed iff every connection
-    /// rides a circuit; auxiliary or holder connections alone give no link.
-    fn link(&self) -> Option<PeerLink> {
-        match (self.data > 0, self.relayed == self.inbound + self.outbound) {
-            (true, _) => Some(PeerLink::Direct),
-            (false, true) => Some(PeerLink::Relayed),
-            (false, false) => None,
-        }
-    }
-
-    fn count(&mut self, outbound: bool, class: Class, opened: bool) {
-        let direction = match outbound {
-            true => &mut self.outbound,
-            false => &mut self.inbound,
-        };
-        step(direction, opened);
-        if class == Class::Relayed {
-            step(&mut self.relayed, opened);
-        }
-        if class == Class::Data {
-            step(&mut self.data, opened);
-        }
-        if class == Class::Data && outbound {
-            step(&mut self.outbound_data, opened);
-        }
-    }
-}
-
-fn step(counter: &mut u32, opened: bool) {
-    match opened {
-        true => *counter += 1,
-        false if *counter > 0 => *counter -= 1,
-        false => (),
-    }
 }
 
 pub(crate) fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {

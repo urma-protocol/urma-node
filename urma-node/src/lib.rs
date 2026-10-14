@@ -21,6 +21,7 @@ mod peer_fence;
 pub mod peer_gossip;
 mod peer_inventory;
 mod peer_limits;
+mod peer_links;
 pub mod peer_live;
 pub mod peer_nat;
 mod peer_parent;
