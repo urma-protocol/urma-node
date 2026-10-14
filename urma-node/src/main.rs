@@ -74,7 +74,8 @@ struct ServeArguments {
     /// Opt into the URMA overlay using an explicitly created transport key.
     #[arg(long)]
     peer_key: Option<PathBuf>,
-    /// Optional URMA peer listener, separate from the local control API.
+    /// Optional URMA peer listener, separate from the local control API: TCP and
+    /// QUIC (UDP) on the same ip:port.
     #[arg(long, requires = "peer_key")]
     urma_listen: Option<SocketAddr>,
     /// Explicit IP/TCP/p2p routing hint; saved in this archive's peer book.
@@ -86,7 +87,8 @@ struct ServeArguments {
     /// Do not add this chain's built-in DNS seeds.
     #[arg(long, requires = "peer_key")]
     no_seeds: bool,
-    /// Public IP/TCP address peers should dial; advertised through identify.
+    /// Public IP/TCP or IP/UDP/QUIC address peers should dial (repeatable);
+    /// advertised through identify.
     #[arg(long, requires = "peer_key")]
     urma_announce: Vec<libp2p::Multiaddr>,
     /// Soft reclaimable cache target (not a SQLite/WAL or total archive quota).

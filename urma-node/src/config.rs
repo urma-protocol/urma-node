@@ -24,7 +24,7 @@ pub const SERVICE_LISTEN: SocketAddr =
 /// Network time slice per background object round, as `serve` defaults it.
 pub const SERVICE_OBJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// The URMA overlay listener of the system service.
+/// The URMA overlay listener of the system service: TCP and QUIC (UDP).
 pub const SERVICE_URMA_LISTEN: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 28332));
 
