@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+description="URMA Node"
+supervisor=supervise-daemon
+command="/usr/bin/urma-node"
+command_args="service run"
+command_user="urma-node:urma-node"
+output_log="/var/log/urma-node/urma-node.log"
+error_log="/var/log/urma-node/urma-node.log"
+respawn_delay=10
+
+depend() {
+	need net
+}

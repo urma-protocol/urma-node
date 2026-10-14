@@ -17,7 +17,7 @@ mod worker;
 use rand::RngCore;
 use serde_json::json;
 use std::{
-    fs::OpenOptions,
+    fs::File,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -27,6 +27,7 @@ use std::{
     },
     time::Duration,
 };
+use urma_io::Access;
 
 #[derive(Default, Clone)]
 struct CacheStatus {
@@ -711,25 +712,19 @@ fn respond(stream: &mut TcpStream, code: u16, body: serde_json::Value) -> Result
     Ok(())
 }
 
-/// New service token, never a wallet/signing/decryption key. Existing files
-/// are not overwritten. Platform-specific private ACL support is required.
+/// New private service token, never a wallet/signing/decryption key. Existing
+/// files are not overwritten.
 pub fn create_token(path: &Path) -> Result<(), Error> {
-    #[cfg(not(unix))]
-    return Err(Error::Invalid(
-        "private token ACL creation is not implemented for this platform".into(),
-    ));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(hex::encode(bytes).as_bytes())?;
-        file.sync_all()?;
-        Ok(())
-    }
+    let mut file = urma_io::create_file(path, Access::Private)?;
+    write_token(&mut file)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// 32 random bytes, hex encoded, into a file whose access the caller chose.
+pub fn write_token(file: &mut File) -> Result<(), Error> {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    file.write_all(hex::encode(bytes).as_bytes())?;
+    Ok(())
 }

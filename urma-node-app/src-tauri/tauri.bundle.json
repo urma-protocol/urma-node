@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "pnpm build && node scripts/sidecars.mjs"
+  },
+  "bundle": {
+    "targets": ["deb", "nsis"],
+    "externalBin": ["binaries/urma-node", "binaries/urma-node-control"],
+    "category": "Utility",
+    "shortDescription": "URMA archive node",
+    "longDescription": "URMA Node: the urma-node archive service, the urma-node-control CLI and a desktop status app.",
+    "linux": {
+      "deb": {
+        "section": "net",
+        "postInstallScript": "packaging/deb/postinst",
+        "preRemoveScript": "packaging/deb/prerm",
+        "postRemoveScript": "packaging/deb/postrm"
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "packaging/nsis/hooks.nsh"
+      }
+    }
+  }
+}

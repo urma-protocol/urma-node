@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "URMA Node",
-  "version": "0.0.0",
   "identifier": "org.rosint.urma.node",
   "build": {
     "beforeDevCommand": "pnpm dev",

@@ -2,39 +2,38 @@
 //! transport identity; packages still need independent Engine admission.
 //! There are no built-in seeds, wallet keys or implicit listeners. Names in
 //! explicitly dialed `/dns*` addresses resolve through the system resolver.
+use crate::peer_transport::swarm;
+pub(crate) use crate::peer_transport::{Behaviour, BehaviourEvent};
 use crate::{
     DialLimit, Error,
     engine::Engine,
     model::RecordPackage,
-    peer_codec::Codec,
     peer_gossip::{Dial, Dials, Shared, is_loopback, validate_announce, validate_peers},
     peer_inventory::{lookup, validate_inventory},
-    peer_limits::{LimitDenied, Limits},
+    peer_limits::LimitDenied,
     peer_live::Link,
     peer_parent::{Parent, validate_parent},
-    peer_protocol::{GossipPeer, InventoryPage, Kind, PROTOCOL, Reply, Request, Response, VERSION},
+    peer_protocol::{GossipPeer, InventoryPage, Kind, Reply, Request, Response, VERSION},
     peer_rate::{Bucket, Count, peer_rate},
     peerbook::PeerAddress,
 };
 pub use crate::{
     peer_live::{PeerSource, SyncPeers},
     peer_parent::OverlayCommitSource,
+    peer_transport::{Dns, DnsMode},
 };
 use bitcoin::{BlockHash, Txid};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    Multiaddr, PeerId,
     futures::StreamExt,
     identify,
     identity::Keypair,
     multiaddr::Protocol,
-    noise,
     request_response::{self, Message, OutboundRequestId, ResponseChannel},
-    swarm::{ConnectionId, DialError, NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
+    swarm::{ConnectionId, DialError, SwarmEvent},
 };
 use std::{
     collections::{HashMap, HashSet},
-    num::{NonZeroU8, NonZeroUsize},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -46,18 +45,9 @@ use std::{
 use tokio::sync::mpsc as async_mpsc;
 use urma_chain::observation::Chain;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING: usize = 8;
-const IDENTIFY_PROTOCOL: &str = "/urma/node/4";
-
-#[derive(NetworkBehaviour)]
-pub(crate) struct Behaviour {
-    // Admission must precede request-response connection side effects.
-    limits: Limits,
-    records: request_response::Behaviour<Codec>,
-    identify: identify::Behaviour,
-}
 
 /// Owns one network thread and one bounded archive-reader thread. Drop requests
 /// shutdown and joins both. An archive operation already running is not forcibly
@@ -65,6 +55,7 @@ pub(crate) struct Behaviour {
 pub struct PeerNetwork {
     peer: PeerId,
     listen: Option<Multiaddr>,
+    dns: Dns,
     pub(crate) commands: async_mpsc::Sender<Command>,
     pub(crate) stop: Arc<AtomicBool>,
     connected: Arc<AtomicU64>,
@@ -139,7 +130,7 @@ impl Answer {
     }
 }
 
-type Startup = mpsc::SyncSender<Result<Option<Multiaddr>, Error>>;
+type Startup = mpsc::SyncSender<Result<(Option<Multiaddr>, Dns), Error>>;
 struct ServeJob {
     deadline: Instant,
     request: Request,
@@ -161,6 +152,17 @@ impl PeerNetwork {
         identity: Keypair,
         listen: Option<Multiaddr>,
         announce: Vec<Multiaddr>,
+    ) -> Result<Self, Error> {
+        Self::start_with_dns(engine, identity, (listen, announce), DnsMode::System)
+    }
+
+    /// As `start`, with the name resolution mode explicit; `DnsMode::Refuse`
+    /// stands in for an unreadable system resolver configuration.
+    pub fn start_with_dns(
+        engine: Arc<Engine>,
+        identity: Keypair,
+        (listen, announce): (Option<Multiaddr>, Vec<Multiaddr>),
+        dns: DnsMode,
     ) -> Result<Self, Error> {
         if let Some(address) = &listen {
             validate_listener(address)?;
@@ -190,10 +192,10 @@ impl PeerNetwork {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(run(engine, identity, listen, control))
+                runtime.block_on(run(engine, identity, (listen, dns), control))
             })?;
-        let actual = match ready.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(address)) => address,
+        let (actual, dns) = match ready.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(started)) => started,
             result => {
                 stop.store(true, Ordering::Release);
                 let joined = worker.join();
@@ -209,6 +211,7 @@ impl PeerNetwork {
         Ok(Self {
             peer,
             listen: actual,
+            dns,
             commands,
             stop,
             connected,
@@ -226,6 +229,11 @@ impl PeerNetwork {
     }
     pub fn listen_address(&self) -> Option<Multiaddr> {
         self.listen.clone()
+    }
+
+    /// Whether named addresses can be dialed by this overlay.
+    pub fn dns(&self) -> &Dns {
+        &self.dns
     }
 
     /// Every address the listener is bound to now, with `/p2p`.
@@ -322,57 +330,6 @@ fn validate_listener(address: &Multiaddr) -> Result<(), Error> {
     Ok(())
 }
 
-fn swarm(identity: Keypair) -> Result<Swarm<Behaviour>, Error> {
-    let records = request_response::Behaviour::with_codec(
-        Codec,
-        [(
-            StreamProtocol::new(PROTOCOL),
-            request_response::ProtocolSupport::Full,
-        )],
-        request_response::Config::default()
-            .with_request_timeout(REQUEST_TIMEOUT)
-            .with_max_concurrent_streams(2),
-    );
-    let identify = identify::Behaviour::new(
-        identify::Config::new(IDENTIFY_PROTOCOL.into(), identity.public())
-            .with_agent_version(format!("urma-node/{}", env!("CARGO_PKG_VERSION"))),
-    );
-    let limits = Limits::default();
-    Ok(SwarmBuilder::with_existing_identity(identity)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
-            noise::Config::new,
-            || {
-                let mut config = yamux::Config::default();
-                // These setters select libp2p-yamux's bounded 0.12 backend.
-                config.set_max_num_streams(4);
-                config.set_max_buffer_size(256 * 1024);
-                config.set_receive_window_size(256 * 1024);
-                config
-            },
-        )
-        .map_err(|e| Error::Invalid(format!("peer transport: {e}")))?
-        .with_dns()
-        .map_err(|e| Error::Invalid(format!("peer DNS resolver: {e}")))?
-        .with_behaviour(|_| Behaviour {
-            limits,
-            records,
-            identify,
-        })
-        .map_err(|e| Error::Invalid(format!("peer behaviour: {e}")))?
-        .with_swarm_config(|config| {
-            config
-                .with_notify_handler_buffer_size(NonZeroUsize::new(2).unwrap())
-                .with_per_connection_event_buffer_size(2)
-                .with_max_negotiating_inbound_streams(2)
-                .with_dial_concurrency_factor(NonZeroU8::new(1).unwrap())
-                .with_idle_connection_timeout(Duration::from_secs(20))
-        })
-        .with_connection_timeout(Duration::from_secs(5))
-        .build())
-}
-
 struct Control {
     commands: async_mpsc::Receiver<Command>,
     stop: Arc<AtomicBool>,
@@ -403,7 +360,7 @@ impl Remotes {
 async fn run(
     engine: Arc<Engine>,
     identity: Keypair,
-    listen: Option<Multiaddr>,
+    (listen, dns): (Option<Multiaddr>, DnsMode),
     control: Control,
 ) -> Result<(), Error> {
     let Control {
@@ -415,7 +372,7 @@ async fn run(
         announce,
     } = control;
     let genesis = engine.status()?.chain_genesis;
-    let mut swarm = swarm(identity)?;
+    let (mut swarm, dns) = swarm(identity, &dns)?;
     for address in announce {
         swarm.add_external_address(address);
     }
@@ -433,7 +390,7 @@ async fn run(
         .name("urma-peer-read".into())
         .spawn(move || serve(&engine, genesis, &serving_stop, input, served))?;
     if !listening {
-        let _ = ready.take().unwrap().send(Ok(None));
+        let _ = ready.take().unwrap().send(Ok((None, dns.clone())));
     }
     let mut pending = HashMap::<OutboundRequestId, Pending>::new();
     let mut inbound = HashSet::new();
@@ -495,7 +452,7 @@ async fn run(
                 SwarmEvent::NewListenAddr { mut address, .. } => {
                     address.push(Protocol::P2p(*swarm.local_peer_id()));
                     shared.listening(address.clone(), true);
-                    if let Some(ready) = ready.take() { let _ = ready.send(Ok(Some(address))); }
+                    if let Some(ready) = ready.take() { let _ = ready.send(Ok((Some(address), dns.clone()))); }
                 }
                 SwarmEvent::ExpiredListenAddr { address, .. } => shared.listening(address.with(Protocol::P2p(*swarm.local_peer_id())), false),
                 SwarmEvent::ListenerClosed { addresses, .. } => for address in addresses { shared.listening(address.with(Protocol::P2p(*swarm.local_peer_id())), false) },

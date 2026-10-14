@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ]; then
+    rc=0
+    /usr/bin/urma-node service uninstall || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+        echo "urma-node: service uninstall failed ($rc)" >&2
+    fi
+fi
+
+exit 0

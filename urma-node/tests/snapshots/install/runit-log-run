@@ -1,0 +1,2 @@
+#!/bin/sh
+exec chpst -u urma-node:urma-node svlogd -tt /var/log/urma-node
