@@ -21,11 +21,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufRead, BufReader, Read, Write},
+    ops::Deref,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError,
         mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
     thread,
@@ -34,6 +35,7 @@ use std::{
 use urma_node::{
     engine::Engine,
     model::{ArchiveConfig, ArchiveStatus, Retention},
+    source::ChainSource,
 };
 
 const BLOCKS: u64 = 8;
@@ -45,6 +47,40 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 // so protocol lines are found by this tag anywhere in a line.
 const BEGIN: &str = "crash-step begin ";
 const DONE: &str = "crash-step done ";
+
+// The owner lock is a flock on an open file description. A sibling test's
+// host spawn copies this process's whole fd table, and the child drops its
+// O_CLOEXEC copies only late in exec: after the vfork parent has already
+// resumed from Command::spawn, and the flock itself only at the deferred
+// final fput. An in-process engine dropped while such a child exists keeps
+// its lock alive there, and a reopen of the same directory sees Busy. So no
+// host is spawned while this process holds an archive: an in-process engine
+// holds SPAWN for its whole life, and spawns take SPAWN.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+struct Held {
+    engine: Engine,
+    _no_spawn: MutexGuard<'static, ()>,
+}
+
+impl Deref for Held {
+    type Target = Engine;
+    fn deref(&self) -> &Engine {
+        &self.engine
+    }
+}
+
+fn open_engine(
+    directory: &Path,
+    config: ArchiveConfig,
+    source: Option<Arc<dyn ChainSource>>,
+) -> Result<Held, urma_node::Error> {
+    let no_spawn = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+    Ok(Held {
+        engine: Engine::open(directory, config, source)?,
+        _no_spawn: no_spawn,
+    })
+}
 
 fn tagged<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
     line.split_once(tag).map(|(_, label)| label)
@@ -253,7 +289,7 @@ fn assert_records(engine: &Engine, status: &ArchiveStatus, fixture: &Fixture) {
 
 // Offline reopen proves the kernel released the owner lock with the process.
 fn checkpoint(directory: &Path, fixture: &Fixture) -> Snapshot {
-    let engine = Engine::open(directory, archive_config(fixture), None)
+    let engine = open_engine(directory, archive_config(fixture), None)
         .expect("offline reopen after process exit");
     let status = engine.status().unwrap();
     assert_records(&engine, &status, fixture);
@@ -288,7 +324,7 @@ fn reference(fixture: &Fixture) -> Reference {
     let path = directory.path();
     let chain = source(fixture);
     let step = |operation: &dyn Fn(&Engine) -> usize| {
-        let engine = Engine::open(path, archive_config(fixture), Some(chain.clone())).unwrap();
+        let engine = open_engine(path, archive_config(fixture), Some(chain.clone())).unwrap();
         let changed = operation(&engine);
         drop(engine);
         (changed, checkpoint(path, fixture))
@@ -317,7 +353,7 @@ fn reference(fixture: &Fixture) -> Reference {
         steps.push((format!("resolve {k}"), [scanned, after.clone()]));
         before = after;
     }
-    let engine = Engine::open(path, archive_config(fixture), None).unwrap();
+    let engine = open_engine(path, archive_config(fixture), None).unwrap();
     let status = engine.status().unwrap();
     drop(engine);
     assert_eq!(status.unresolved_dependencies, 0);
@@ -415,7 +451,8 @@ impl Host {
             pid: 0,
             logs: logs.to_owned(),
         };
-        let child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--ignored", "--exact", "crash_durability_host"])
             .args(["--nocapture", "--test-threads=1"])
             .env_clear()
@@ -424,9 +461,11 @@ impl Host {
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(File::create(logs.join("stderr")).unwrap())
-            .spawn()
-            .unwrap();
+            .stderr(File::create(logs.join("stderr")).unwrap());
+        let child = {
+            let _forking = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+            command.spawn().unwrap()
+        };
         let child = host.child.insert(child);
         host.pid = i32::try_from(child.id()).unwrap();
         host.stdin = child.stdin.take();
