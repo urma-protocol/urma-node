@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NAT traversal simulation in network namespaces. Root on Linux, needs
 # iproute2, iptables and jq:
-#   sudo nat-test.sh BIN_DIR FIXTURE_DIR cone|symmetric|cone-proxy
+#   sudo nat-test.sh BIN_DIR FIXTURE_DIR cone|symmetric|cone-proxy|cone-restart|cone-kill
 # BIN_DIR holds urma-node and urma-node-control; FIXTURE_DIR is written by
 #   URMA_FIXTURE_DIR=DIR cargo test -p urma-node --test nat_fixture -- --ignored
 # and copied, never changed. Only B holds records. Optional environment
@@ -23,15 +23,19 @@
 # peer reaches P from one private address (172.16.0.1) while UDP keeps its
 # real source, and A and B are seeded TCP first, then QUIC, as the dnsaddr
 # TXT lists them. Expected to pass like cone.
+# cone-restart: cone, then A stops on SIGINT and restarts with the same key
+# and archive; within 60 s it reserves on P again and a new punch links it
+# directly to B.
+# cone-kill: cone-restart with SIGKILL, so A closes nothing on the way out.
 set -euo pipefail
 
-usage="usage: $0 BIN_DIR FIXTURE_DIR cone|symmetric|cone-proxy"
+usage="usage: $0 BIN_DIR FIXTURE_DIR cone|symmetric|cone-proxy|cone-restart|cone-kill"
 [ $# -eq 3 ] || { echo "$usage" >&2; exit 2; }
 bin=$(cd "$1" && pwd)
 fixture=$(cd "$2" && pwd)
 mode=$3
 case $mode in
-cone | cone-proxy) masquerade=(-j MASQUERADE) ;;
+cone | cone-proxy | cone-restart | cone-kill) masquerade=(-j MASQUERADE) ;;
 symmetric) masquerade=(-j MASQUERADE --random-fully) ;;
 *) echo "$usage" >&2; exit 2 ;;
 esac
@@ -40,11 +44,14 @@ esac
 exec 9>/run/urmanat.lock
 flock -n 9 || { echo "waiting for another nat-test run" >&2; flock 9; }
 
+stop_signal=INT
+[ "$mode" = cone-kill ] && stop_signal=KILL
+
 P_IP=11.0.1.10
 NODES=(p a b)
 NAMESPACES=(inet p nat-a nat-b a b)
 work=$(mktemp -d)
-declare -A pid=() id=() seen=()
+declare -A pid=() id=() seen=() again=()
 exec 7>&1 8>&2
 
 at() { ip netns exec "urmanat-$1" "${@:2}"; }
@@ -57,7 +64,7 @@ control() {
 status() { control "$1" status; }
 
 diagnose() {
-    echo "--- diagnostics ($mode), events seen: ${!seen[*]}"
+    echo "--- diagnostics ($mode), events seen: ${!seen[*]}, after restart: ${!again[*]}"
     for node in "${NODES[@]}"; do
         echo "--- $node ${id[$node]:-} status (pid ${pid[$node]:-none})"
         kill -0 "${pid[$node]:-}" 2>/dev/null || echo "$node is not running"
@@ -180,11 +187,11 @@ sealed() {
 # already selected and nothing leaves the topology.
 serve() {
     local node=$1
-    at "$node" env ${NAT_LOG:+RUST_LOG="$NAT_LOG"} "$bin/urma-node" --data "$work/$node/data" --config "$work/$node/config.json" \
+    ip netns exec "urmanat-$node" env --default-signal=INT ${NAT_LOG:+RUST_LOG="$NAT_LOG"} "$bin/urma-node" --data "$work/$node/data" --config "$work/$node/config.json" \
         serve --listen 127.0.0.1:28331 --token-file "$work/$node/service.token" \
         --p2p --no-commit-public --chain-peer 127.0.0.1:9 \
         --peer-key "$work/$node/peer.key" --urma-listen 0.0.0.0:28332 --no-seeds "${@:2}" \
-        >"$work/$node.log" 2>&1 &
+        >>"$work/$node.log" 2>&1 &
     pid[$node]=$!
     wait_for 30 "$node overlay up" up "$node"
     id[$node]=$(status "$node" | jq -r .overlay.peer_id)
@@ -279,11 +286,51 @@ either() { "$1" a || "$1" b; }
 # A direct A-B link may be released once sync idles: latch every event
 # the moment one poll sees it.
 cone_events() {
+    local node
     linked a b direct && seen[a-b]=1
     linked b a direct && seen[b-a]=1
-    either punched && seen[punched]=1
+    punched a && seen[a-punched]=1
+    punched b && seen[b-punched]=1
     synced && seen[synced]=1
-    [ "${#seen[@]}" -eq 4 ]
+    # Both sides count the punch that made the link direct, not a later one.
+    if [ -n "${seen[a-b]:-}" ] && [ -n "${seen[b-a]:-}" ]; then
+        linked_at=${linked_at:-$SECONDS}
+        for node in a b; do
+            if [ -z "${seen[$node-punched]:-}" ] && [ $((SECONDS - linked_at)) -gt 10 ]; then
+                echo "$node did not count the punch that linked A and B" >&8
+                exit 1
+            fi
+        done
+    fi
+    [ "${#seen[@]}" -eq 5 ]
+}
+
+successes() { status "$1" | jq '.overlay.hole_punch.successes'; }
+
+# A restarted: its counters start over, B's must grow past `b_before`.
+restart_events() {
+    reserved a && again[reserved]=1
+    linked a b direct && again[a-b]=1
+    linked b a direct && again[b-a]=1
+    punched a && again[a-punched]=1
+    [ "$(successes b)" -gt "$b_before" ] && again[b-punched]=1
+    [ "${#again[@]}" -eq 5 ]
+}
+
+# Stop A (SIGINT, or SIGKILL in cone-kill), start it again on the same key and archive.
+restart_a() {
+    b_before=$(successes b)
+    kill -"$stop_signal" "${pid[a]}"
+    for _ in $(seq 30); do
+        kill -0 "${pid[a]}" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "${pid[a]}" 2>/dev/null; then
+        echo "A still running 15 s after SIG$stop_signal" >&2
+        exit 1
+    fi
+    echo "ok: A stopped on SIG$stop_signal"
+    serve a "${seeds[@]}"
 }
 
 # B's entry in NODE's book: no failure and no ban (clean), or one of them.
@@ -346,10 +393,14 @@ wait_for 180 "A learns B's circuit address through P" circuit a b p
 wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p direct'
 
 case $mode in
-cone | cone-proxy)
-    wait_for 240 "direct A-B link, hole punch success, A synced B's inventory" cone_events
+cone | cone-proxy | cone-restart | cone-kill)
+    wait_for 240 "direct A-B link, hole punch success on A and B, A synced B's inventory" cone_events
     book_b a clean || { echo "A blames B in its book after the sync" >&2; exit 1; }
     echo "ok: B's entry in A's book is clean"
+    if [ "$mode" = cone-restart ] || [ "$mode" = cone-kill ]; then
+        restart_a
+        wait_for 60 "restarted A reserves on P and punches a new direct link to B" restart_events
+    fi
     ;;
 symmetric)
     wait_for 180 "hole punch failure recorded" either punch_failed
