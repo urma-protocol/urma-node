@@ -58,7 +58,11 @@ pub struct NatPeer {
 fn raw_swarm(key: Keypair, punch: bool) -> Swarm<Raw> {
     SwarmBuilder::with_existing_identity(key)
         .with_tokio()
-        .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)
+        .with_tcp(
+            tcp::Config::default().nodelay(true),
+            noise::Config::new,
+            yamux::Config::default,
+        )
         .unwrap()
         .with_quic()
         .with_relay_client(noise::Config::new, yamux::Config::default)
@@ -97,7 +101,10 @@ fn serve(swarm: &mut Swarm<Raw>, request: Request, channel: ResponseChannel<Resp
         kind: request.kind,
         result: Reply::Peers(Vec::new()),
     };
-    let _ = swarm.behaviour_mut().records.send_response(channel, response);
+    let _ = swarm
+        .behaviour_mut()
+        .records
+        .send_response(channel, response);
 }
 
 fn op(swarm: &mut Swarm<Raw>, waiting: &mut Waiting, op: Op) {
@@ -134,7 +141,11 @@ fn event(swarm: &mut Swarm<Raw>, waiting: &mut Waiting, event: SwarmEvent<RawEve
             num_established,
             ..
         } => {
-            waiting.counts.lock().unwrap().insert(peer_id, num_established.get());
+            waiting
+                .counts
+                .lock()
+                .unwrap()
+                .insert(peer_id, num_established.get());
             if let Some(answer) = waiting.dials.remove(&connection_id) {
                 let _ = answer.try_send(Ok(peer_id));
             }
@@ -144,7 +155,11 @@ fn event(swarm: &mut Swarm<Raw>, waiting: &mut Waiting, event: SwarmEvent<RawEve
             num_established,
             ..
         } => {
-            waiting.counts.lock().unwrap().insert(peer_id, num_established);
+            waiting
+                .counts
+                .lock()
+                .unwrap()
+                .insert(peer_id, num_established);
         }
         SwarmEvent::Behaviour(RawEvent::Records(request_response::Event::Message {
             message: Message::Request {
@@ -162,10 +177,11 @@ fn event(swarm: &mut Swarm<Raw>, waiting: &mut Waiting, event: SwarmEvent<RawEve
             }
         }
         SwarmEvent::Behaviour(RawEvent::Records(request_response::Event::Message {
-            message: Message::Response {
-                request_id,
-                response,
-            },
+            message:
+                Message::Response {
+                    request_id,
+                    response,
+                },
             ..
         })) => answer(waiting, request_id, Ok(response)),
         SwarmEvent::Behaviour(RawEvent::Records(request_response::Event::OutboundFailure {

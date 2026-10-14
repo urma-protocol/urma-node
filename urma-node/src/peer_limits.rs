@@ -177,7 +177,12 @@ impl Limits {
         held
     }
 
-    fn classify(&self, id: ConnectionId, peer: PeerId, arrival: Arrival) -> Result<Class, DialLimit> {
+    fn classify(
+        &self,
+        id: ConnectionId,
+        peer: PeerId,
+        arrival: Arrival,
+    ) -> Result<Class, DialLimit> {
         let held = self.held(id, peer, arrival.direction);
         if arrival.link == PeerLink::Relayed {
             return match (held.peer_relayed, held.relayed >= RELAYED_MAX) {
@@ -188,7 +193,10 @@ impl Limits {
         }
         if held.peer_direct {
             let auxiliary = arrival.direction == Direction::Inbound || arrival.fresh_port;
-            return match (auxiliary && !held.peer_auxiliary, held.auxiliary >= AUXILIARY_MAX) {
+            return match (
+                auxiliary && !held.peer_auxiliary,
+                held.auxiliary >= AUXILIARY_MAX,
+            ) {
                 (false, _) => Err(DialLimit::Duplicate),
                 (true, true) => Err(DialLimit::Established),
                 (true, false) => Ok(Class::Auxiliary),
@@ -293,9 +301,11 @@ impl NetworkBehaviour for Limits {
                 let Some(class) = self.classes.of(event.connection_id) else {
                     return;
                 };
-                self.established
-                    .entry(event.connection_id)
-                    .or_insert((event.peer_id, direction, class));
+                self.established.entry(event.connection_id).or_insert((
+                    event.peer_id,
+                    direction,
+                    class,
+                ));
             }
             FromSwarm::ConnectionClosed(event) => self.forget(event.connection_id),
             FromSwarm::DialFailure(event) => self.forget(event.connection_id),
@@ -390,7 +400,9 @@ mod tests {
 
     fn circuit() -> Multiaddr {
         let relay = PeerId::random();
-        format!("/ip4/1.2.3.4/tcp/1/p2p/{relay}/p2p-circuit").parse().unwrap()
+        format!("/ip4/1.2.3.4/tcp/1/p2p/{relay}/p2p-circuit")
+            .parse()
+            .unwrap()
     }
 
     fn established(limits: &mut Limits, id: ConnectionId, peer: PeerId, direction: Direction) {
@@ -547,7 +559,13 @@ mod tests {
         assert!(fresh.is_err(), "the auxiliary slot is taken");
         close(&mut limits, id(2), peer, Direction::Inbound);
         limits
-            .handle_established_outbound_connection(id(3), peer, &address(), Endpoint::Dialer, PortUse::New)
+            .handle_established_outbound_connection(
+                id(3),
+                peer,
+                &address(),
+                Endpoint::Dialer,
+                PortUse::New,
+            )
             .unwrap();
         assert_eq!(class(&limits, id(3)), Class::Auxiliary);
         let relayed = |limits: &mut Limits, id| {

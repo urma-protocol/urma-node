@@ -11,8 +11,7 @@ use libp2p::{
     core::{Endpoint, transport::PortUse},
     multiaddr::Protocol,
     swarm::{
-        ConnectionDenied, ConnectionId, FromSwarm,
-        NetworkBehaviour, THandler, THandlerInEvent,
+        ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
         THandlerOutEvent, ToSwarm,
         behaviour::{ConnectionClosed, ConnectionEstablished},
         dummy,
@@ -97,7 +96,8 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Fenced<B> {
         local: &Multiaddr,
         remote: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        self.inner.handle_pending_inbound_connection(id, local, remote)
+        self.inner
+            .handle_pending_inbound_connection(id, local, remote)
     }
 
     fn handle_established_inbound_connection(
@@ -154,11 +154,12 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Fenced<B> {
                 let seen = self.inside.entry(event.peer_id).or_default();
                 let other_established = seen.len();
                 seen.insert(event.connection_id);
-                self.inner
-                    .on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                self.inner.on_swarm_event(FromSwarm::ConnectionEstablished(
+                    ConnectionEstablished {
                         other_established,
                         ..event
-                    }));
+                    },
+                ));
             }
             FromSwarm::ConnectionClosed(event) => {
                 if self.outside.remove(&event.connection_id) {
@@ -171,7 +172,8 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Fenced<B> {
                         ..event
                     }));
             }
-            FromSwarm::AddressChange(ref change) if self.outside.contains(&change.connection_id) => {}
+            FromSwarm::AddressChange(ref change)
+                if self.outside.contains(&change.connection_id) => {}
             FromSwarm::DialFailure(ref failure) => {
                 self.outside.remove(&failure.connection_id);
                 self.inner.on_swarm_event(event);
@@ -196,7 +198,10 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Fenced<B> {
         }
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         loop {
             match self.inner.poll(cx) {
                 Poll::Ready(ToSwarm::NewExternalAddrCandidate(_))

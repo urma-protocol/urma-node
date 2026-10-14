@@ -39,7 +39,11 @@ fn forced(root: &Path, name: &str, ip: &str, reachability: Reachability) -> Node
     let engine = offline(root, name);
     let key = Keypair::generate_ed25519();
     let id = key.public().to_peer_id();
-    let port = TcpListener::bind((ip, 0)).unwrap().local_addr().unwrap().port();
+    let port = TcpListener::bind((ip, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let listen: Multiaddr = format!("/ip4/{ip}/tcp/{port}").parse().unwrap();
     let announce = match reachability {
         Reachability::Public => vec![listen.clone()],
@@ -79,7 +83,10 @@ fn quic_port(address: &Multiaddr) -> Option<u16> {
 
 fn link(node: &Node, peer: PeerId) -> Option<PeerLink> {
     let links = node.network.peer_links();
-    links.into_iter().find(|(id, _)| *id == peer).map(|(_, link)| link)
+    links
+        .into_iter()
+        .find(|(id, _)| *id == peer)
+        .map(|(_, link)| link)
 }
 
 fn quic(root: &Path) -> Value {
@@ -88,14 +95,21 @@ fn quic(root: &Path) -> Value {
     stage(root, "QUIC listens on the TCP listener's port");
     let mut address = None;
     until(Duration::from_secs(5), || {
-        address = n.network.listen_addresses().into_iter().find(|a| quic_port(a).is_some());
+        address = n
+            .network
+            .listen_addresses()
+            .into_iter()
+            .find(|a| quic_port(a).is_some());
         address.is_some()
     });
     let address = address.expect("QUIC listener");
     stage(root, "a QUIC client is served records");
     let client = NatPeer::start(None, false);
     assert_eq!(client.dial(address.clone()), Ok(n.id));
-    let served = matches!(client.call(n.id, Kind::Peers { limit: 0 }), Ok(Reply::Peers(_)));
+    let served = matches!(
+        client.call(n.id, Kind::Peers { limit: 0 }),
+        Ok(Reply::Peers(_))
+    );
     json!({"same_port":quic_port(&address) == port,"served":served,"link":link(&n, client.id).map(|l| l.as_str())})
 }
 
@@ -104,12 +118,19 @@ fn autonat(root: &Path) -> Value {
     let public = node(root, "a", Some(PUBLIC[0]));
     stage(root, "a dialable node is confirmed public");
     assert_eq!(public.dial(server.listening()), server.id);
-    let confirmed = until(PROBE, || public.network.reachability() == Reachability::Public);
+    let confirmed = until(PROBE, || {
+        public.network.reachability() == Reachability::Public
+    });
     let external = public.network.external_addresses();
-    stage(root, "a node without a listener is private and advertises nothing");
+    stage(
+        root,
+        "a node without a listener is private and advertises nothing",
+    );
     let hidden = node(root, "c", None);
     assert_eq!(hidden.dial(server.listening()), server.id);
-    let private = until(PROBE, || hidden.network.reachability() == Reachability::Private);
+    let private = until(PROBE, || {
+        hidden.network.reachability() == Reachability::Private
+    });
     json!({
         "public":confirmed,
         "external":external == vec![bare(&public.listening())],
@@ -148,13 +169,20 @@ fn relay(root: &Path) -> Value {
     stage(root, "records are refused on a relayed connection");
     let a = NatPeer::start(None, false);
     assert_eq!(a.dial(circuit), Ok(b.id));
-    let relayed = until(Duration::from_secs(5), || link(&b, a.id) == Some(PeerLink::Relayed));
+    let relayed = until(Duration::from_secs(5), || {
+        link(&b, a.id) == Some(PeerLink::Relayed)
+    });
     let refused = a.call(b.id, Kind::Peers { limit: 0 }).is_err();
     let direct = b.network.has_direct(a.id);
-    stage(root, "a direct link beside the circuit carries records and retires it");
+    stage(
+        root,
+        "a direct link beside the circuit carries records and retires it",
+    );
     assert_eq!(a.dial(b.listening()), Ok(b.id));
     let deadline = Instant::now() + Duration::from_secs(10);
-    let asked = b.network.peers_of(a.id, 0, &AtomicBool::new(false), deadline);
+    let asked = b
+        .network
+        .peers_of(a.id, 0, &AtomicBool::new(false), deadline);
     let retired = until(Duration::from_secs(5), || a.connections(b.id) == 1);
     let served = matches!(a.call(b.id, Kind::Peers { limit: 0 }), Ok(Reply::Peers(_)));
     json!({
@@ -171,8 +199,14 @@ fn punch(root: &Path) -> Value {
     let p = forced(root, "p", PUBLIC[1], Reachability::Public);
     let b = forced(root, "b", PUBLIC[0], Reachability::Private);
     let circuit = reserved(root, &p, &b);
-    stage(root, "A learns its address from P, then reaches B through P");
-    let a = NatPeer::start(Some(format!("/ip4/{}/tcp/0", PUBLIC[0]).parse().unwrap()), true);
+    stage(
+        root,
+        "A learns its address from P, then reaches B through P",
+    );
+    let a = NatPeer::start(
+        Some(format!("/ip4/{}/tcp/0", PUBLIC[0]).parse().unwrap()),
+        true,
+    );
     assert_eq!(a.dial(p.listening()), Ok(p.id));
     thread::sleep(Duration::from_secs(3));
     assert_eq!(a.dial(circuit), Ok(b.id));
@@ -224,7 +258,10 @@ fn a_reservation_outlives_idle_data_and_relayed_links_refuse_records() {
     assert_eq!(checks["relayed"], true);
     assert_eq!(checks["refused"], true);
     assert_eq!(checks["direct"], false);
-    assert_eq!(checks["asked"], true, "a request beside a circuit is never refused");
+    assert_eq!(
+        checks["asked"], true,
+        "a request beside a circuit is never refused"
+    );
     assert_eq!(checks["retired"], true);
     assert_eq!(checks["served"], true);
     assert_eq!(checks["link"], "direct");

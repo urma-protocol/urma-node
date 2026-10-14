@@ -101,7 +101,10 @@ impl<B: NetworkBehaviour> NetworkBehaviour for Rewaken<B> {
         self.0.on_connection_handler_event(peer, id, event);
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         self.0.poll(cx)
     }
 }
@@ -125,8 +128,9 @@ impl<H: ConnectionHandler> ConnectionHandler for Waking<H> {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>>
-    {
+    ) -> Poll<
+        ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>,
+    > {
         if let Poll::Ready(event) = self.inner.poll(cx) {
             return Poll::Ready(event);
         }

@@ -11,7 +11,6 @@ use crate::{
     peer_protocol::{
         GossipPeer, Kind, PEER_ADDRESSES_MAX, PEERS_LIMIT, PEERS_MAX, Reply, Response,
     },
-    peer_reach::direct_shape,
     source::check_cancelled,
 };
 use bitcoin::BlockHash;
@@ -421,28 +420,6 @@ pub fn validate_gossip_address(address: &Multiaddr) -> Result<Option<PeerId>, Er
             "gossiped addresses must be IP literals with TCP".into(),
         )),
     }
-}
-
-/// An operator announce address: a public IP literal with TCP or UDP/QUIC v1,
-/// ending at most in this node's own /p2p. Returned without /p2p, as identify
-/// advertises it.
-pub fn validate_announce(address: &Multiaddr, local: PeerId) -> Result<Multiaddr, Error> {
-    let mut bare = address.clone();
-    if let Some(Protocol::P2p(named)) = address.iter().last() {
-        if named != local {
-            return Err(Error::Invalid("announce address names another peer".into()));
-        }
-        bare.pop();
-    }
-    if !is_public(&bare) {
-        return Err(Error::Invalid("announce address must be public".into()));
-    }
-    if !direct_shape(&bare) {
-        return Err(Error::Invalid(
-            "announce address must be an IP literal with TCP or UDP/QUIC v1".into(),
-        ));
-    }
-    Ok(bare)
 }
 
 /// Operator-supplied dial targets: `/ip4|ip6|dns|dns4|dns6/<host>/tcp/<port>`

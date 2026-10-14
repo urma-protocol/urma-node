@@ -3,6 +3,7 @@
 //! reservation manager, relay server bookkeeping, hole punch outcomes, and the
 //! QUIC listener on the TCP listener's port.
 use crate::{
+    Error,
     peer_gossip::{is_loopback, is_public},
     peer_limits::{Class, Classes},
     peer_nat::{Nat, PeerLink, Reachability},
@@ -83,7 +84,12 @@ impl Remotes {
 
     /// A relay circuit has no use once the peer holds a direct data link
     /// (§3.4): the circuits to retire after `id` was admitted as `class`.
-    pub(crate) fn superseded(&self, id: ConnectionId, peer: PeerId, class: Class) -> Vec<ConnectionId> {
+    pub(crate) fn superseded(
+        &self,
+        id: ConnectionId,
+        peer: PeerId,
+        class: Class,
+    ) -> Vec<ConnectionId> {
         let direct = self
             .0
             .values()
@@ -141,6 +147,28 @@ pub(crate) fn direct_shape(address: &Multiaddr) -> bool {
     ip && transport && is_public(address)
 }
 
+/// An operator announce address: a public IP literal with TCP or UDP/QUIC v1,
+/// ending at most in this node's own /p2p. Returned without /p2p, as identify
+/// advertises it.
+pub(crate) fn validate_announce(address: &Multiaddr, local: PeerId) -> Result<Multiaddr, Error> {
+    let mut bare = address.clone();
+    if let Some(Protocol::P2p(named)) = address.iter().last() {
+        if named != local {
+            return Err(Error::Invalid("announce address names another peer".into()));
+        }
+        bare.pop();
+    }
+    if !is_public(&bare) {
+        return Err(Error::Invalid("announce address must be public".into()));
+    }
+    if !direct_shape(&bare) {
+        return Err(Error::Invalid(
+            "announce address must be an IP literal with TCP or UDP/QUIC v1".into(),
+        ));
+    }
+    Ok(bare)
+}
+
 /// How the node decides its reachability: from AutoNAT probes, or fixed (a
 /// test stand-in for what AutoNAT would conclude).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,7 +215,10 @@ impl Reach {
     /// Public with an announced or AutoNAT-confirmed direct address, private
     /// once a probe failed without one, unknown before that; forced in tests.
     pub(crate) fn update(&self, nat: &Nat) {
-        let observed = match (self.announced || !nat.external().is_empty(), self.probe_failed) {
+        let observed = match (
+            self.announced || !nat.external().is_empty(),
+            self.probe_failed,
+        ) {
             (true, _) => Reachability::Public,
             (false, true) => Reachability::Private,
             (false, false) => Reachability::Unknown,
@@ -223,8 +254,10 @@ impl Reach {
             }
             SwarmEvent::ExternalAddrConfirmed { address } => self.external(address, true, nat),
             SwarmEvent::ExternalAddrExpired { address } => self.external(address, false, nat),
-            SwarmEvent::NewListenAddr { ref address, .. } if self.listen_addr(swarm, address, nat) => {}
-            SwarmEvent::ExpiredListenAddr { ref address, .. } if self.listen_expired(address, nat) => {}
+            SwarmEvent::NewListenAddr { ref address, .. }
+                if self.listen_addr(swarm, address, nat) => {}
+            SwarmEvent::ExpiredListenAddr { ref address, .. }
+                if self.listen_expired(address, nat) => {}
             SwarmEvent::ListenerClosed {
                 listener_id,
                 ref addresses,

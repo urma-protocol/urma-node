@@ -175,7 +175,10 @@ mod tests {
         assert!(!shared.has_direct(remote));
         assert_eq!(shared.links(), vec![(remote, PeerLink::Relayed)]);
         shared.opened(remote, false, Class::Auxiliary);
-        assert!(!shared.has_direct(remote), "only a data connection carries data");
+        assert!(
+            !shared.has_direct(remote),
+            "only a data connection carries data"
+        );
         assert_eq!(shared.links(), vec![(remote, PeerLink::Direct)]);
         shared.closed(remote, false, Class::Auxiliary);
         shared.opened(remote, true, Class::Data);
