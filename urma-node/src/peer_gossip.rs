@@ -725,6 +725,7 @@ impl PeerNetwork {
             return Err(Error::Busy("peer network stopped".into()));
         }
         let deadline = deadline.min(Instant::now() + CALL_TIMEOUT);
+        let circuit = is_circuit(&address);
         let (answer, receiver) = mpsc::sync_channel(1);
         self.commands
             .try_send(Command::Dial(Dial {
@@ -747,7 +748,7 @@ impl PeerNetwork {
                 }
             }
         };
-        if !self.has_direct(peer) {
+        if circuit && !self.has_direct(peer) {
             return Ok(Dialed::Relayed(peer));
         }
         self.probe(peer, cancelled, deadline).map(Dialed::Direct)
