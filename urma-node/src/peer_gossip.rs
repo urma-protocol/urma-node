@@ -58,10 +58,13 @@ struct Links {
 }
 
 impl Links {
-    fn link(&self) -> PeerLink {
-        match self.inbound + self.outbound > self.relayed {
-            true => PeerLink::Direct,
-            false => PeerLink::Relayed,
+    /// Direct iff a data connection is open, relayed iff every connection
+    /// rides a circuit; auxiliary or holder connections alone give no link.
+    fn link(&self) -> Option<PeerLink> {
+        match (self.data > 0, self.relayed == self.inbound + self.outbound) {
+            (true, _) => Some(PeerLink::Direct),
+            (false, true) => Some(PeerLink::Relayed),
+            (false, false) => None,
         }
     }
 
@@ -215,7 +218,7 @@ impl Shared {
     pub(crate) fn is_outbound(&self, peer: PeerId) -> bool {
         guard(&self.connected)
             .get(&peer)
-            .is_some_and(|links| links.outbound > 0 && links.link() == PeerLink::Direct)
+            .is_some_and(|links| links.outbound > 0 && links.data > 0)
     }
 
     fn connected(&self) -> Vec<PeerId> {
@@ -229,7 +232,7 @@ impl Shared {
         let connected = guard(&self.connected);
         let (outbound, inbound): (Vec<_>, Vec<_>) = connected
             .iter()
-            .filter(|(_, links)| links.on_chain && links.link() == PeerLink::Direct)
+            .filter(|(_, links)| links.on_chain && links.data > 0)
             .partition(|(_, links)| links.outbound > 0);
         outbound
             .into_iter()
@@ -246,12 +249,11 @@ impl Shared {
             .is_some_and(|links| links.data > 0)
     }
 
-    /// Every connected peer with its link (direct when any connection is,
-    /// relayed when all ride a circuit), sorted by peer.
+    /// Connected peers that have a link (`Links::link`), sorted by peer.
     pub(crate) fn links(&self) -> Vec<(PeerId, PeerLink)> {
         guard(&self.connected)
             .iter()
-            .map(|(peer, links)| (*peer, links.link()))
+            .filter_map(|(peer, links)| Some((*peer, links.link()?)))
             .collect()
     }
 

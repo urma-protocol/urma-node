@@ -182,8 +182,16 @@ mod tests {
             !shared.has_direct(remote),
             "only a data connection carries data"
         );
-        assert_eq!(shared.links(), vec![(remote, PeerLink::Direct)]);
+        assert!(
+            shared.links().is_empty(),
+            "an auxiliary connection is no link"
+        );
         shared.closed(remote, false, Class::Auxiliary);
+        shared.closed(remote, false, Class::Relayed);
+        shared.opened(remote, false, Class::Holder);
+        assert!(shared.links().is_empty(), "nor is a reservation holder");
+        shared.closed(remote, false, Class::Holder);
+        shared.opened(remote, false, Class::Relayed);
         shared.opened(remote, true, Class::Data);
         assert!(shared.has_direct(remote));
         shared.closed(remote, false, Class::Relayed);
