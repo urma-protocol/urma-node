@@ -14,6 +14,7 @@ pub mod install;
 pub mod model;
 pub mod names;
 pub mod peer;
+pub mod peer_address;
 pub mod peer_codec;
 pub mod peer_discovery;
 pub mod peer_gossip;

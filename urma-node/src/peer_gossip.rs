@@ -187,24 +187,25 @@ impl Shared {
         guard(&self.connected).contains_key(&peer)
     }
 
-    /// Whether the peer holds a connection we dialed.
+    /// Whether the peer is directly connected and holds a connection we dialed.
     pub(crate) fn is_outbound(&self, peer: PeerId) -> bool {
         guard(&self.connected)
             .get(&peer)
-            .is_some_and(|links| links.outbound > 0)
+            .is_some_and(|links| links.outbound > 0 && links.link() == PeerLink::Direct)
     }
 
     fn connected(&self) -> Vec<PeerId> {
         guard(&self.connected).keys().copied().collect()
     }
 
-    /// Connected peers that spoke this protocol version on our chain, those
-    /// we dialed before those that only dialed us.
+    /// Directly connected peers that spoke this protocol version on our
+    /// chain, those we dialed before those that only dialed us. A peer reached
+    /// only through a relay is left out: data never rides a circuit.
     pub(crate) fn live(&self) -> Vec<PeerId> {
         let connected = guard(&self.connected);
         let (outbound, inbound): (Vec<_>, Vec<_>) = connected
             .iter()
-            .filter(|(_, links)| links.on_chain)
+            .filter(|(_, links)| links.on_chain && links.link() == PeerLink::Direct)
             .partition(|(_, links)| links.outbound > 0);
         outbound
             .into_iter()
