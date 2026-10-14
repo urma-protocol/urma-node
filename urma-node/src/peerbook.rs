@@ -2,10 +2,9 @@
 //! learned from peers. Every entry is an untrusted hint, never chain evidence
 //! or a statement of record availability. Nothing here resolves names, dials
 //! or starts networking; the caller owns the directory, its lock and saves.
-
 use crate::{
     Error,
-    peer_address::{is_circuit, parse, relay},
+    peer_address::{is_circuit, parse, place_quic_first, quic_first, relay},
     peer_gossip::{is_public, validate_gossip_address},
     peer_protocol::GossipPeer,
 };
@@ -22,6 +21,7 @@ pub use urma_node_client::model::BookOrigin as Origin;
 /// One peer (or one not yet identified seed address). Addresses are stored
 /// without a terminal `/p2p`; the identity lives in `peer_id` once learned.
 /// Circuit addresses are learned only from peers and always name the entry.
+/// QUIC addresses enter ahead of TCP, so the first dial of a peer is QUIC.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BookEntry {
     pub peer_id: Option<PeerId>,
@@ -267,7 +267,7 @@ impl PeerBook {
             if entry.addrs.len() == Self::ADDRESSES {
                 return Err(Error::Busy("peer already has four addresses".into()));
             }
-            entry.addrs.push(address);
+            place_quic_first(&mut entry.addrs, address);
             entry.origin = entry.origin.max(origin);
             return Ok(true);
         }
@@ -349,7 +349,7 @@ impl PeerBook {
         let count = admitted.len();
         self.entries.push(BookEntry {
             peer_id: Some(id),
-            addrs: admitted,
+            addrs: quic_first(admitted),
             origin: Origin::Gossip,
             last_success: None,
             failures: 0,

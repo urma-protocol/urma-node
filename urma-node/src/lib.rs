@@ -31,6 +31,7 @@ mod peer_rate;
 mod peer_reach;
 mod peer_release;
 mod peer_rewaken;
+pub mod peer_seed;
 pub mod peer_sync;
 mod peer_transport;
 pub mod peerbook;

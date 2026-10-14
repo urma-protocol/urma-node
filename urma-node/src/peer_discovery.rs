@@ -10,6 +10,7 @@ use crate::{
     peer::PeerNetwork,
     peer_address::Dialed,
     peer_protocol::GossipPeer,
+    peer_seed::Names,
     peerbook::PeerBook,
     recorded::{RecordedError, read, unix_seconds as now},
 };
@@ -35,6 +36,7 @@ pub struct Discovery {
     sync_backoff: Mutex<Vec<String>>,
     own_addresses: Mutex<Vec<Multiaddr>>,
     relayed: Mutex<Vec<Relayed>>,
+    names: Names,
 }
 
 /// A circuit dial that reached its peer only through a relay. It is neither
@@ -132,7 +134,14 @@ impl Discovery {
             sync_backoff: Mutex::new(Vec::new()),
             own_addresses: Mutex::new(Vec::new()),
             relayed: Mutex::new(Vec::new()),
+            names: Names::System,
         }
+    }
+
+    /// Resolve `/dnsaddr` seeds through `names` instead of the system resolver.
+    pub fn with_names(mut self, names: Names) -> Self {
+        self.names = names;
+        self
     }
 
     /// Peers inventory sync is holding off (evicted, idle or blamed): neither
@@ -234,24 +243,13 @@ impl Discovery {
     /// remembered and never dialed again by this process; the book keeps it,
     /// since the same name is a real peer for every other node.
     fn dial(&self, address: &Multiaddr, stop: &AtomicBool) -> Result<Result<PeerId, Error>, Error> {
-        let deadline = Instant::now() + Self::OPERATION_TIME;
         let local = Protocol::P2p(self.network.peer_id());
         let outcome = match address.iter().any(|part| part == local) {
             true => Err(Error::LocalPeer),
             false => match self.network.dns().admits(address) {
                 // Without a resolver the address is unreachable here, not bad.
                 Err(unresolvable) => return Ok(Err(unresolvable)),
-                Ok(()) => match self.network.dial_any(address.clone(), stop, deadline) {
-                    Ok(Dialed::Direct(peer)) => Ok(peer),
-                    // Neither reached nor failed: Busy leaves the book as is.
-                    Ok(Dialed::Relayed(peer)) => {
-                        self.await_direct(address.clone(), peer)?;
-                        Err(Error::Busy(format!(
-                            "{peer} reachable only through a relay; awaiting hole punching"
-                        )))
-                    }
-                    Err(failure) => Err(failure),
-                },
+                Ok(()) => self.reach(address, &local, stop)?,
             },
         };
         if stop.load(Ordering::Acquire) {
@@ -269,6 +267,44 @@ impl Discovery {
             // Our own capacity or a busy peer says nothing about the address.
             Err(Error::DialDenied(_) | Error::Busy(_) | Error::PeerBusy) => (),
             Err(_failure) => book.failed(address, at),
+        }
+        Ok(outcome)
+    }
+
+    /// Dial `address`, or a `/dnsaddr` seed's records QUIC first (`Names`),
+    /// one at a time until one answers, each bounded by `OPERATION_TIME`.
+    /// Records naming this node are skipped; the last failure stands for the
+    /// seed. A relayed peer is neither reached nor failed: Busy leaves the
+    /// book as is.
+    fn reach(
+        &self,
+        address: &Multiaddr,
+        local: &Protocol,
+        stop: &AtomicBool,
+    ) -> Result<Result<PeerId, Error>, Error> {
+        let attempts = match self.names.expand(address) {
+            Ok(attempts) => attempts,
+            Err(unresolved) => return Ok(Err(unresolved)),
+        };
+        let mut outcome = Err(Error::LocalPeer);
+        for attempt in attempts {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            if attempt.iter().any(|part| part == *local) {
+                continue;
+            }
+            let deadline = Instant::now() + Self::OPERATION_TIME;
+            outcome = match self.network.dial_any(attempt, stop, deadline) {
+                Ok(Dialed::Direct(peer)) => return Ok(Ok(peer)),
+                Ok(Dialed::Relayed(peer)) => {
+                    self.await_direct(address.clone(), peer)?;
+                    return Ok(Err(Error::Busy(format!(
+                        "{peer} reachable only through a relay; awaiting hole punching"
+                    ))));
+                }
+                Err(failure) => Err(failure),
+            };
         }
         Ok(outcome)
     }

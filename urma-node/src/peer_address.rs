@@ -65,6 +65,29 @@ pub fn is_circuit(address: &Multiaddr) -> bool {
     address.iter().any(|part| part == Protocol::P2pCircuit)
 }
 
+/// Whether the address dials over QUIC; shape is not checked.
+pub fn is_quic(address: &Multiaddr) -> bool {
+    address.iter().any(|part| part == Protocol::QuicV1)
+}
+
+/// QUIC addresses first, each group in its given order: dialing prefers QUIC
+/// when the peer offers it (§3.1). Through a TCP proxy (Fly) only a QUIC
+/// connection shows the peer our real mapping.
+pub(crate) fn quic_first(mut addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
+    addrs.sort_by_key(|address| !is_quic(address));
+    addrs
+}
+
+/// Add `address` to a peer's list: QUIC ahead of the rest, anything else at
+/// the back. Existing order (a failed address rotated back) is kept.
+pub(crate) fn place_quic_first(addrs: &mut Vec<Multiaddr>, address: Multiaddr) {
+    let at = match is_quic(&address) {
+        true => 0,
+        false => addrs.len(),
+    };
+    addrs.insert(at, address);
+}
+
 /// The relay of a valid circuit address.
 pub fn relay(address: &Multiaddr) -> Option<PeerId> {
     match parse(address).ok()?.kind {

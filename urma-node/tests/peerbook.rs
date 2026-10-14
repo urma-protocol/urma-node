@@ -1,6 +1,6 @@
 //! Local owned files only: no sockets, name resolution or peer startup.
 use bitcoin::{BlockHash, hashes::Hash};
-use libp2p::{Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use serde_json::{Value, json};
 use std::{fs, path::Path};
 use urma_node::{
@@ -452,6 +452,42 @@ fn merge_stores_every_admissible_address_of_a_new_peer_in_one_entry() {
     );
     assert_eq!(book.entries().len(), 2);
     assert_eq!(book.merge(&claim, local_id, &[]), 0);
+}
+
+#[test]
+fn quic_addresses_are_dialed_first_and_a_failed_one_yields_to_tcp() {
+    let mut book = empty();
+    let (id, other, local_id) = (peer(1), peer(2), peer(99));
+    let tcp = addr("/ip4/11.0.1.1/tcp/4001");
+    let quic = addr("/ip4/11.0.1.1/udp/4001/quic-v1");
+    let named = |address: &Multiaddr, id: PeerId| address.clone().with(Protocol::P2p(id));
+    let claim = |id: PeerId, addrs: Vec<Multiaddr>| {
+        [GossipPeer {
+            peer_id: id,
+            addrs,
+            last_seen: 1,
+        }]
+    };
+    assert_eq!(
+        book.merge(&claim(id, vec![tcp.clone(), quic.clone()]), local_id, &[]),
+        2
+    );
+    assert_eq!(book.candidates(0, &[], &[], 1), vec![named(&quic, id)]);
+    book.failed(&named(&quic, id), 0);
+    assert_eq!(
+        book.candidates(60, &[], &[], 1),
+        vec![named(&tcp, id)],
+        "a failed QUIC address moves back, so TCP is dialed next"
+    );
+    book.add(public(2, other), Origin::Gossip).unwrap();
+    let identified = addr("/ip4/11.0.2.1/udp/4001/quic-v1");
+    let report = claim(other, vec![identified.clone()]);
+    assert_eq!(book.merge_identified(&report, local_id, &[]), 1);
+    assert_eq!(
+        entry(&book, other).addrs,
+        vec![identified, addr("/ip4/11.0.2.1/tcp/4001")],
+        "an identified QUIC address enters ahead of TCP"
+    );
 }
 
 #[test]

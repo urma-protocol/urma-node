@@ -6210,6 +6210,7 @@ dependencies = [
  "ctrlc",
  "either",
  "hex",
+ "hickory-resolver",
  "libc",
  "libp2p",
  "rand 0.8.8",

@@ -32,6 +32,7 @@ ctrlc = { version = "3", features = ["termination"] }
 rand = "0.8"
 libp2p = { version = "=0.56.0", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "request-response", "macros", "ed25519", "dns", "identify", "quic", "autonat", "relay", "dcutr"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config", "tokio"] }
 async-trait = "0.1"
 sha1 = "0.10"
 tracing = "0.1"
