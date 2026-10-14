@@ -167,6 +167,13 @@ circuit() {
             and any(.addrs[]; contains($relay)))' >/dev/null
 }
 
+reachability() { [ "$(status "$1" | jq -r .overlay.reachability)" = "$2" ]; }
+
+# NODE holds a relay reservation on P.
+reserved() {
+    status "$1" | jq -e --arg relay "${id[p]}" 'any(.overlay.relays[]?; . == $relay)' >/dev/null
+}
+
 punch_failed() {
     status "$1" | jq -e '.overlay.hole_punch.last_error != null' >/dev/null
 }
@@ -201,6 +208,9 @@ serve b --urma-seed "$seed"
 wait_for 120 "A reaches P" listed a p
 wait_for 120 "B reaches P" listed b p
 wait_for 60 "P lists A and B" eval 'listed p a && listed p b'
+wait_for 120 "P public, A and B private" \
+    eval 'reachability p public && reachability a private && reachability b private'
+wait_for 120 "A and B reserve on P" eval 'reserved a && reserved b'
 wait_for 180 "A learns B's circuit address through P" circuit a b p
 wait_for 60 "A-P and B-P links are direct" eval 'linked a p direct && linked b p direct'
 
