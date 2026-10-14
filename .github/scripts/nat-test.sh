@@ -67,14 +67,21 @@ cleanup() {
         pgrep -f "^$bin/urma-node .*$work" >/dev/null || break
         sleep 0.5
     done
-    for ns in "${NAMESPACES[@]}"; do
-        ip netns pids "urmanat-$ns" 2>/dev/null | xargs -r kill -KILL || true
-        ip netns del "urmanat-$ns" 2>/dev/null || true
-    done
+    teardown
     rm -rf "$work"
     exit "$rc"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Also clears what a killed earlier run left behind.
+teardown() {
+    for ns in "${NAMESPACES[@]}"; do
+        ip netns pids "urmanat-$ns" 2>/dev/null | xargs -r kill -KILL || true
+        ip netns del "urmanat-$ns" 2>/dev/null || true
+    done
+}
 
 # link NS_A IF_A ADDR_A NS_B IF_B ADDR_B
 link() {
@@ -95,8 +102,8 @@ nat() {
 }
 
 topology() {
+    teardown
     for ns in "${NAMESPACES[@]}"; do
-        ip netns del "urmanat-$ns" 2>/dev/null || true
         ip netns add "urmanat-$ns"
         at "$ns" ip link set lo up
     done
@@ -139,9 +146,12 @@ up() { status "$1" | jq -e .overlay.peer_id >/dev/null; }
 
 # wait_for SECONDS WHAT COMMAND...
 wait_for() {
-    local deadline=$((SECONDS + $1)) what=$2
+    local deadline=$((SECONDS + $1)) what=$2 n
     shift 2
     until "$@" >/dev/null 2>&1; do
+        for n in "${!pid[@]}"; do
+            kill -0 "${pid[$n]}" 2>/dev/null || { echo "$n exited: $what" >&2; return 1; }
+        done
         if [ "$SECONDS" -ge "$deadline" ]; then
             echo "timed out: $what" >&2
             return 1
@@ -157,6 +167,12 @@ peer() {
 }
 
 listed() { peer "$1" "$2" | jq -e . >/dev/null; }
+
+# NODE's book records a successful dial of PEER.
+reached() {
+    control "$1" overlay-book |
+        jq -e --arg id "${id[$2]}" 'any(.[]; .peer_id == $id and .last_success != null)' >/dev/null
+}
 
 linked() { [ "$(peer "$1" "$2" | jq -r .link)" = "$3" ]; }
 
@@ -205,8 +221,8 @@ seed=/ip4/$P_IP/tcp/28332/p2p/${id[p]}
 serve a --urma-seed "$seed"
 serve b --urma-seed "$seed"
 
-wait_for 120 "A reaches P" listed a p
-wait_for 120 "B reaches P" listed b p
+wait_for 120 "A reaches P" reached a p
+wait_for 120 "B reaches P" reached b p
 wait_for 60 "P lists A and B" eval 'listed p a && listed p b'
 wait_for 120 "P public, A and B private" \
     eval 'reachability p public && reachability a private && reachability b private'
