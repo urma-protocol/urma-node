@@ -151,7 +151,7 @@ impl Nat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer_gossip::Shared;
+    use crate::{peer_gossip::Shared, peer_limits::Class};
     use libp2p::identity::Keypair;
 
     fn peer() -> PeerId {
@@ -171,14 +171,18 @@ mod tests {
         );
         let shared = Shared::new(peer());
         let remote = peer();
-        shared.opened(remote, false, PeerLink::Relayed);
+        shared.opened(remote, false, Class::Relayed);
         assert!(!shared.has_direct(remote));
         assert_eq!(shared.links(), vec![(remote, PeerLink::Relayed)]);
-        shared.opened(remote, true, PeerLink::Direct);
-        assert!(shared.has_direct(remote));
-        shared.closed(remote, false, PeerLink::Relayed);
+        shared.opened(remote, false, Class::Auxiliary);
+        assert!(!shared.has_direct(remote), "only a data connection carries data");
         assert_eq!(shared.links(), vec![(remote, PeerLink::Direct)]);
-        shared.closed(remote, true, PeerLink::Direct);
+        shared.closed(remote, false, Class::Auxiliary);
+        shared.opened(remote, true, Class::Data);
+        assert!(shared.has_direct(remote));
+        shared.closed(remote, false, Class::Relayed);
+        assert_eq!(shared.links(), vec![(remote, PeerLink::Direct)]);
+        shared.closed(remote, true, Class::Data);
         assert!(shared.links().is_empty());
     }
 

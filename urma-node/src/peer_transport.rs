@@ -166,7 +166,7 @@ fn behaviour(
 fn multiplexer() -> yamux::Config {
     let mut config = yamux::Config::default();
     // These setters select libp2p-yamux's bounded 0.12 backend.
-    config.set_max_num_streams(usize::from(NonZeroU8::new(8).unwrap().get()));
+    config.set_max_num_streams(8);
     config.set_max_buffer_size(256 * 1024);
     config.set_receive_window_size(Behaviour::WINDOW);
     config

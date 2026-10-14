@@ -44,15 +44,6 @@ pub(crate) enum Class {
     Relayed,
 }
 
-impl Class {
-    pub(crate) fn link(self) -> PeerLink {
-        match self {
-            Self::Relayed => PeerLink::Relayed,
-            Self::Data | Self::Auxiliary | Self::Holder => PeerLink::Direct,
-        }
-    }
-}
-
 /// The class of every admitted connection, shared with the behaviours that
 /// fence protocols by it and with the network loop.
 #[derive(Clone, Default)]
@@ -387,10 +378,19 @@ mod tests {
                 peer,
                 &address(),
                 Endpoint::Dialer,
-                PortUse::New,
+                PortUse::Reuse,
             ),
         }
         .map(|_| ())
+    }
+
+    fn class(limits: &Limits, id: ConnectionId) -> Class {
+        limits.classes.of(id).unwrap()
+    }
+
+    fn circuit() -> Multiaddr {
+        let relay = PeerId::random();
+        format!("/ip4/1.2.3.4/tcp/1/p2p/{relay}/p2p-circuit").parse().unwrap()
     }
 
     fn established(limits: &mut Limits, id: ConnectionId, peer: PeerId, direction: Direction) {
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_has_one_connection_across_both_directions() {
+    fn a_peer_has_one_data_connection_across_both_directions() {
         for direction in [Direction::Inbound, Direction::Outbound] {
             let mut limits = Limits::default();
             let peer = PeerId::random();
@@ -514,16 +514,72 @@ mod tests {
             begin(&mut limits, id(1), direction).unwrap();
             admit(&mut limits, id(1), peer, direction).unwrap();
             established(&mut limits, id(1), peer, direction);
-            for denied_direction in [direction, opposite] {
-                begin(&mut limits, id(2), denied_direction).unwrap();
-                assert!(admit(&mut limits, id(2), peer, denied_direction).is_err());
-            }
+            assert_eq!(class(&limits, id(1)), Class::Data);
+            begin(&mut limits, id(2), Direction::Outbound).unwrap();
+            assert!(admit(&mut limits, id(2), peer, Direction::Outbound).is_err());
             assert!(limits.pending_in.is_empty());
             assert!(limits.pending_out.is_empty());
             close(&mut limits, id(1), peer, direction);
             begin(&mut limits, id(3), opposite).unwrap();
             admit(&mut limits, id(3), peer, opposite).unwrap();
+            assert_eq!(class(&limits, id(3)), Class::Data);
         }
+    }
+
+    #[test]
+    fn a_direct_peer_gets_one_auxiliary_and_one_relayed_connection_besides_data() {
+        let mut limits = Limits::default();
+        let peer = PeerId::random();
+        admit(&mut limits, id(1), peer, Direction::Outbound).unwrap();
+        established(&mut limits, id(1), peer, Direction::Outbound);
+        // An AutoNAT dial-back or a crossing punch dial: inbound, or a fresh port.
+        admit(&mut limits, id(2), peer, Direction::Inbound).unwrap();
+        established(&mut limits, id(2), peer, Direction::Inbound);
+        assert_eq!(class(&limits, id(2)), Class::Auxiliary);
+        assert!(admit(&mut limits, id(3), peer, Direction::Inbound).is_err());
+        let fresh = limits.handle_established_outbound_connection(
+            id(3),
+            peer,
+            &address(),
+            Endpoint::Dialer,
+            PortUse::New,
+        );
+        assert!(fresh.is_err(), "the auxiliary slot is taken");
+        close(&mut limits, id(2), peer, Direction::Inbound);
+        limits
+            .handle_established_outbound_connection(id(3), peer, &address(), Endpoint::Dialer, PortUse::New)
+            .unwrap();
+        assert_eq!(class(&limits, id(3)), Class::Auxiliary);
+        let relayed = |limits: &mut Limits, id| {
+            limits.handle_established_inbound_connection(id, peer, &circuit(), &address())
+        };
+        relayed(&mut limits, id(4)).unwrap();
+        established(&mut limits, id(4), peer, Direction::Inbound);
+        assert_eq!(class(&limits, id(4)), Class::Relayed);
+        assert!(relayed(&mut limits, id(5)).is_err());
+        assert_eq!(limits.established.len(), 2, "id(3) awaits establishment");
+    }
+
+    #[test]
+    fn reservation_holders_pass_the_data_budget_only_while_the_relay_is_open() {
+        let relay_open = Arc::new(AtomicBool::new(false));
+        let mut limits = Limits::new(Classes::default(), Arc::clone(&relay_open));
+        for value in 0..ESTABLISHED_PER_DIRECTION {
+            let peer = PeerId::random();
+            admit(&mut limits, id(value), peer, Direction::Inbound).unwrap();
+            established(&mut limits, id(value), peer, Direction::Inbound);
+        }
+        assert!(admit(&mut limits, id(50), PeerId::random(), Direction::Inbound).is_err());
+        relay_open.store(true, Ordering::Release);
+        admit(&mut limits, id(50), PeerId::random(), Direction::Inbound).unwrap();
+        assert_eq!(class(&limits, id(50)), Class::Holder);
+        for value in 0..ESTABLISHED_PER_DIRECTION {
+            let peer = PeerId::random();
+            admit(&mut limits, id(20 + value), peer, Direction::Outbound).unwrap();
+            established(&mut limits, id(20 + value), peer, Direction::Outbound);
+        }
+        let outbound = admit(&mut limits, id(51), PeerId::random(), Direction::Outbound);
+        assert!(outbound.is_err(), "we never dial past the data budget");
     }
 
     #[test]

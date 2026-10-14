@@ -12,7 +12,7 @@ use std::{
 use urma_node::{
     engine::Engine,
     model::Retention,
-    peer::{Dns, DnsMode, PeerNetwork},
+    peer::{Dns, DnsMode, PeerNetwork, ReachMode},
     peer_discovery::Discovery,
     peerbook::{Origin, PeerBook},
 };
@@ -29,11 +29,11 @@ fn listener() -> Option<Multiaddr> {
 }
 
 fn refused(engine: &Arc<Engine>) -> PeerNetwork {
-    PeerNetwork::start_with_dns(
+    PeerNetwork::start_with(
         Arc::clone(engine),
         Keypair::generate_ed25519(),
         (listener(), Vec::new()),
-        DnsMode::Refuse(INJECTED.into()),
+        (DnsMode::Refuse(INJECTED.into()), ReachMode::AutoNat),
     )
     .unwrap()
 }
