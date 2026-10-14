@@ -12,6 +12,8 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +35,11 @@ impl Adapter {
     const RUNIT_DIR: &'static str = "/etc/sv/urma-node";
     const RUNIT_RUN: &'static str = "/etc/sv/urma-node/run";
     const RUNIT_LOG_RUN: &'static str = "/etc/sv/urma-node/log/run";
+    const RUNIT_LOG_SERVICE: &'static str = "/etc/sv/urma-node/log";
     const RUNIT_SUPERVISED: &'static str = "/etc/sv/urma-node/supervise/ok";
+    const SUPERVISED_STATES: [&'static str; 3] = ["run:", "down:", "finish:"];
+    const RUNSV_POLLS: u32 = 40;
+    const RUNSV_POLL: Duration = Duration::from_millis(250);
     const RUNIT_SERVICE_DIRS: [&'static str; 3] = [
         "/var/service",
         "/etc/runit/runsvdir/default",
@@ -227,17 +233,40 @@ impl<R: Runner> System<R> {
                 fs::remove_file(self.at(Path::new(Adapter::OPENRC_SCRIPT)))?;
             }
             Init::Runit => {
-                if self.at(Path::new(Adapter::RUNIT_SUPERVISED)).exists() {
-                    self.exec("sv", &["down", Adapter::RUNIT_DIR])?;
+                let supervised = self.at(Path::new(Adapter::RUNIT_SUPERVISED)).exists();
+                if supervised {
+                    self.exec("sv", &["-w", "30", "down", Adapter::RUNIT_DIR])?;
                 }
                 for link in self.runit_links() {
                     fs::remove_file(link)?;
+                }
+                if supervised {
+                    self.query("sv", &["exit", Adapter::RUNIT_LOG_SERVICE])?;
+                    self.query("sv", &["exit", Adapter::RUNIT_DIR])?;
+                    self.await_runsv_exit()?;
                 }
                 fs::remove_dir_all(self.at(Path::new(Adapter::RUNIT_DIR)))?;
             }
             Init::Windows => return Err(foreign()),
         }
         Ok(())
+    }
+
+    fn await_runsv_exit(&mut self) -> Result<(), Error> {
+        for _ in 0..Adapter::RUNSV_POLLS {
+            let status = self.query("sv", &["status", Adapter::RUNIT_DIR])?;
+            let supervised = Adapter::SUPERVISED_STATES
+                .iter()
+                .any(|state| status.stdout.starts_with(state));
+            if !supervised {
+                return Ok(());
+            }
+            thread::sleep(Adapter::RUNSV_POLL);
+        }
+        Err(Error::Failed(format!(
+            "runsv for {} did not exit; remove it once runsvdir has dropped the service",
+            Adapter::RUNIT_DIR
+        )))
     }
 
     fn runit_links(&self) -> Vec<PathBuf> {

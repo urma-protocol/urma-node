@@ -46,7 +46,7 @@ impl fmt::Display for Error {
         match self {
             Self::NoInit => Self::no_init(f),
             Self::Failed(message) => f.write_str(message),
-            Self::Io(error) => write!(f, "service install I/O: {error}"),
+            Self::Io(error) => write!(f, "service I/O: {error}"),
             Self::Json(error) => write!(f, "service status encoding: {error}"),
             Self::Command {
                 program,

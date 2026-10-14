@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, OpenOptions, Permissions},
     io::Write,
     net::{SocketAddr, TcpListener},
@@ -19,7 +19,7 @@ struct Fake {
     uid: u32,
     gid: u32,
     calls: Vec<String>,
-    answers: HashMap<String, Outcome>,
+    answers: HashMap<String, VecDeque<Outcome>>,
 }
 
 fn ok(stdout: &str) -> Outcome {
@@ -62,6 +62,13 @@ impl Fake {
     }
 }
 
+impl Fake {
+    fn answer(&mut self, call: &str, stdouts: &[&str]) {
+        let queue = stdouts.iter().map(|stdout| ok(stdout)).collect();
+        self.answers.insert(call.to_owned(), queue);
+    }
+}
+
 impl Runner for Fake {
     fn run(&mut self, program: &str, args: &[&str]) -> Result<Outcome, Error> {
         assert!(
@@ -83,8 +90,11 @@ impl Runner for Fake {
             ("adduser", Some(user)) => self.add_member(user)?,
             _ => {}
         }
-        match self.answers.get(&call) {
-            Some(answer) => Ok(answer.clone()),
+        match self.answers.get_mut(&call) {
+            Some(queue) if queue.len() > 1 => {
+                Ok(queue.pop_front().ok_or_else(|| Error::Failed(call))?)
+            }
+            Some(queue) => Ok(queue.front().cloned().ok_or_else(|| Error::Failed(call))?),
             None => Ok(ok("")),
         }
     }
@@ -485,7 +495,7 @@ fn status_reports_json() -> Result<(), Error> {
         ("/usr/bin/systemctl is-active urma-node.service", "active\n"),
     ];
     for (call, stdout) in answers {
-        system.runner.answers.insert(call.to_owned(), ok(stdout));
+        system.runner.answer(call, &[stdout]);
     }
     assert_eq!(
         status(&mut system)?,
@@ -597,10 +607,10 @@ fn runit_links_into_the_first_active_service_dir() -> Result<(), Error> {
         "runsvdir starts a linked service by itself"
     );
     assert_eq!(lab.mode("var/log/urma-node")?, 0o750);
-    system.runner.answers.insert(
-        "/usr/bin/sv status /etc/sv/urma-node".to_owned(),
-        ok("run: /etc/sv/urma-node: (pid 7) 3s\n"),
-    );
+    let sv_status = "/usr/bin/sv status /etc/sv/urma-node";
+    system
+        .runner
+        .answer(sv_status, &["run: /etc/sv/urma-node: (pid 7) 3s\n"]);
     point_control_at(&lab, closed_port()?)?;
     assert_eq!(
         status(&mut system)?,
@@ -614,9 +624,30 @@ fn runit_links_into_the_first_active_service_dir() -> Result<(), Error> {
     );
     fs::create_dir_all(lab.path("etc/sv/urma-node/supervise"))?;
     fs::write(lab.path("etc/sv/urma-node/supervise/ok"), "")?;
+    fs::create_dir_all(lab.path("etc/sv/urma-node/log/supervise"))?;
+    fs::write(lab.path("etc/sv/urma-node/supervise/status"), "")?;
+    system.runner.answer(
+        sv_status,
+        &[
+            "run: /etc/sv/urma-node: (pid 7) 3s, want down\n",
+            "down: /etc/sv/urma-node: 1s; run: log: (pid 6) 9s\n",
+            "fail: /etc/sv/urma-node: runsv not running\n",
+        ],
+    );
     system.runner.calls.clear();
     system.execute(Action::Uninstall { purge: false }, &mut Vec::new())?;
-    assert_eq!(system.runner.calls, ["/usr/bin/sv down /etc/sv/urma-node"]);
+    assert_eq!(
+        system.runner.calls,
+        [
+            "/usr/bin/sv -w 30 down /etc/sv/urma-node",
+            "/usr/bin/sv exit /etc/sv/urma-node/log",
+            "/usr/bin/sv exit /etc/sv/urma-node",
+            sv_status,
+            sv_status,
+            sv_status,
+        ],
+        "the service dir goes only after its runsv has exited"
+    );
     assert!(!link.is_symlink());
     assert!(!lab.path("etc/sv/urma-node").exists());
     assert!(lab.path("var/lib/urma-node").is_dir());
