@@ -4,6 +4,7 @@
 //! QUIC listener on the TCP listener's port.
 use crate::{
     Error,
+    peer_external::{Externals, Verdict},
     peer_gossip::{is_loopback, is_public},
     peer_limits::{Class, Classes},
     peer_nat::{Nat, PeerLink, Reachability},
@@ -179,7 +180,7 @@ pub enum ReachMode {
 
 pub(crate) struct Reach {
     forced: ReachMode,
-    announced: bool,
+    externals: Externals,
     probe_failed: bool,
     relay_open: Arc<AtomicBool>,
     local: PeerId,
@@ -195,13 +196,13 @@ impl Reach {
 
     pub(crate) fn new(
         forced: ReachMode,
-        announced: bool,
+        announce: Vec<Multiaddr>,
         relay_open: Arc<AtomicBool>,
         (local, listen): (PeerId, Option<Multiaddr>),
     ) -> Self {
         Self {
             forced,
-            announced,
+            externals: Externals::new(local, announce),
             probe_failed: false,
             relay_open,
             local,
@@ -216,7 +217,7 @@ impl Reach {
     /// once a probe failed without one, unknown before that; forced in tests.
     pub(crate) fn update(&self, nat: &Nat) {
         let observed = match (
-            self.announced || !nat.external().is_empty(),
+            self.externals.announced() || !nat.external().is_empty(),
             self.probe_failed,
         ) {
             (true, _) => Reachability::Public,
@@ -241,7 +242,9 @@ impl Reach {
         event: SwarmEvent<BehaviourEvent>,
     ) -> Option<SwarmEvent<BehaviourEvent>> {
         match event {
-            SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => self.autonat(&event, nat),
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
+                self.autonat(swarm, &event, nat)
+            }
             SwarmEvent::Behaviour(BehaviourEvent::AutonatServer(event)) => {
                 tracing::debug!(?event, "AutoNAT probe served")
             }
@@ -274,16 +277,57 @@ impl Reach {
         None
     }
 
-    pub(crate) fn autonat(&mut self, event: &autonat::v2::client::Event, nat: &Nat) {
-        if event.result.is_err() {
+    /// A failure counts toward private whoever reports it; a success is
+    /// advertised only as `Externals` judges it.
+    fn autonat(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        event: &autonat::v2::client::Event,
+        nat: &Nat,
+    ) {
+        if let Err(error) = &event.result {
+            tracing::debug!(%error, address = %event.tested_addr, "AutoNAT probe failed");
             self.probe_failed = true;
+            self.update(nat);
+            return;
         }
-        self.update(nat);
+        match self.externals.verdict(&event.tested_addr, event.server) {
+            Verdict::Confirm(address) => self.advertise(swarm, address, nat),
+            Verdict::Retry(address) => swarm.behaviour_mut().candidates.offer(address),
+            Verdict::Ignore => {
+                tracing::debug!(address = %event.tested_addr, server = %event.server,
+                    "AutoNAT confirmation not counted")
+            }
+        }
     }
 
-    /// Circuit addresses the relay client confirms stay out of the direct set.
+    /// `witness`, a peer we dialed directly, sees us at `observed`: an AutoNAT
+    /// candidate, never an advertised address on its own.
+    pub(crate) fn observed(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        (observed, witness): (Multiaddr, PeerId),
+        nat: &Nat,
+    ) {
+        if !direct_shape(&observed) {
+            return;
+        }
+        self.externals
+            .witnessed(&observed, witness, &nat.external());
+        swarm.behaviour_mut().candidates.offer(observed);
+    }
+
+    /// Advertises `address` as ours. The swarm reports no event for its own
+    /// additions, so the NAT state is updated here.
+    pub(crate) fn advertise(&self, swarm: &mut Swarm<Behaviour>, address: Multiaddr, nat: &Nat) {
+        swarm.add_external_address(address.clone());
+        self.external(address, true, nat);
+    }
+
+    /// Circuit addresses the relay client confirms stay out of the direct set,
+    /// and with announced addresses nothing else is advertised.
     pub(crate) fn external(&self, address: Multiaddr, confirmed: bool, nat: &Nat) {
-        if PeerLink::of(&address) == PeerLink::Direct {
+        if PeerLink::of(&address) == PeerLink::Direct && self.externals.admits(&address) {
             nat.set_external(address, confirmed);
             self.update(nat);
         }
@@ -340,6 +384,9 @@ impl Reach {
             return true;
         }
         self.open_quic(swarm, address);
+        if let Some(candidate) = self.externals.bound(address) {
+            swarm.behaviour_mut().candidates.offer(candidate);
+        }
         false
     }
 

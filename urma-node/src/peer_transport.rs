@@ -38,7 +38,7 @@ pub(crate) struct Behaviour {
     pub(crate) records: Fenced<request_response::Behaviour<Codec>>,
     pub(crate) identify: Fenced<identify::Behaviour>,
     pub(crate) candidates: Candidates,
-    pub(crate) autonat: autonat::v2::client::Behaviour,
+    pub(crate) autonat: Fenced<autonat::v2::client::Behaviour>,
     pub(crate) autonat_server: Fenced<autonat::v2::server::Behaviour>,
     pub(crate) relay: Rewaken<relay::Behaviour>,
     pub(crate) relay_client: relay::client::Behaviour,
@@ -156,7 +156,7 @@ fn behaviour(
         records: Fenced::data_only(records, wiring.classes.clone()),
         identify: Fenced::without_candidates(identify),
         candidates: Candidates::default(),
-        autonat: autonat::v2::client::Behaviour::default(),
+        autonat: Fenced::without_confirmations(autonat::v2::client::Behaviour::default()),
         autonat_server: Fenced::public_dial_backs(autonat::v2::server::Behaviour::default()),
         relay: Rewaken(relay::Behaviour::new(
             local,

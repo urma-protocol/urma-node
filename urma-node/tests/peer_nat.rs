@@ -299,7 +299,7 @@ fn quic_listens_on_the_tcp_port_and_serves_records() {
 #[test]
 fn autonat_confirms_dialable_addresses_and_never_advertises_observations() {
     let checks = run(HOST, "autonat");
-    assert_eq!(checks["public"], true);
+    assert_eq!(checks["public"], true, "{checks}");
     assert_eq!(checks["external"], true);
     assert_eq!(checks["private"], true);
     assert_eq!(checks["hidden_external"], 0);

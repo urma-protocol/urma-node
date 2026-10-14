@@ -17,6 +17,7 @@ pub mod peer;
 pub mod peer_address;
 pub mod peer_codec;
 pub mod peer_discovery;
+mod peer_external;
 mod peer_fence;
 pub mod peer_gossip;
 mod peer_inventory;

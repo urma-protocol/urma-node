@@ -14,7 +14,7 @@ use crate::{
     peer_parent::{Parent, validate_parent},
     peer_protocol::{GossipPeer, InventoryPage, Kind, Reply, Request, Response, VERSION},
     peer_rate::{Bucket, Count, peer_rate},
-    peer_reach::{Reach, Remotes, direct_shape, validate_announce},
+    peer_reach::{Reach, Remotes, validate_announce},
     peer_transport::{Wiring, swarm},
     peerbook::PeerAddress,
 };
@@ -373,14 +373,14 @@ async fn run(
     let local = identity.public().to_peer_id();
     let mut reach = Reach::new(
         reach,
-        !announce.is_empty(),
+        announce.clone(),
         Arc::clone(&wiring.relay_open),
         (local, listen.clone()),
     );
     reach.update(&shared.nat);
     let (mut swarm, dns) = swarm(identity, &dns, &wiring)?;
     for address in announce {
-        swarm.add_external_address(address);
+        reach.advertise(&mut swarm, address, &shared.nat);
     }
     let mut ready = Some(startup);
     let listening = listen.is_some();
@@ -492,7 +492,7 @@ async fn run(
                     // Only peers we dialed directly witness our address, and a
                     // witness only proposes it: AutoNAT confirms what is advertised.
                     if remotes.outbound_direct(connection_id) {
-                        if direct_shape(&info.observed_addr) { swarm.behaviour_mut().candidates.offer(info.observed_addr.clone()); }
+                        reach.observed(&mut swarm, (info.observed_addr.clone(), peer_id), &shared.nat);
                         shared.observe(info.observed_addr, peer_id);
                     }
                     shared.identified(peer_id, info.listen_addrs);
