@@ -54,7 +54,7 @@ sudo apt-get remove -y urma-node
 absent systemctl is-active urma-node
 test ! -e "$unit"
 absent systemctl cat urma-node
-test -d /var/lib/urma-node/data
+sudo test -d /var/lib/urma-node/data
 getent passwd urma-node
 
 sudo apt-get purge -y urma-node

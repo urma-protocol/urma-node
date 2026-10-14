@@ -67,6 +67,7 @@ jobs:
             sleep 2
           done
           docker exec init rc-status
+          docker exec init sh /scripts/openrc-net.sh
           docker exec init sh /scripts/init-test.sh openrc /etc/init.d/urma-node
 
   runit:

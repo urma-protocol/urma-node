@@ -53,3 +53,4 @@ sc.exe query urma-node
 if ($LASTEXITCODE -ne 1060) { throw "service still registered ($LASTEXITCODE)" }
 if (-not (Test-Path (Join-Path $env:ProgramData 'URMA Node\data'))) { throw 'data removed by uninstall' }
 Write-Output 'nsis lifecycle ok'
+exit 0

@@ -4,6 +4,26 @@ set -eu
 
 kind=$1
 adapter=$2
+
+diagnose() {
+    echo "--- diagnostics"
+    urma-node service status || true
+    case $kind in
+    runit)
+        sv status /etc/sv/urma-node || true
+        ls -la /var/service/ /etc/sv/urma-node /etc/sv/urma-node/log || true
+        tail -n 50 /var/log/urma-node/current || true
+        ;;
+    openrc)
+        rc-service urma-node status || true
+        tail -n 50 /var/log/urma-node/urma-node.log || true
+        ;;
+    esac
+    ls -la /var/log/urma-node /var/lib/urma-node /etc/urma-node || true
+    ps -ef || true
+}
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then diagnose; fi; exit "$rc"' EXIT
+
 install -m755 /bins/urma-node /bins/urma-node-control /usr/bin/
 
 urma-node service install
