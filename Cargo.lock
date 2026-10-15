@@ -1401,7 +1401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4355,7 +4355,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4682,7 +4682,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5673,7 +5673,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6172,9 +6172,9 @@ dependencies = [
 
 [[package]]
 name = "urma-io"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4963cbb5db908b5e7459fd4b49bdde7083d13b74abf2e1d8fc61cd37ee5c8122"
+checksum = "b6a3b699217b75102f0f559fdba4e9261e3f5b7e688d56b1335bdf13dfc05ca2"
 dependencies = [
  "libc",
  "sha2",
@@ -6202,7 +6202,7 @@ dependencies = [
 
 [[package]]
 name = "urma-node"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -6235,7 +6235,7 @@ dependencies = [
 
 [[package]]
 name = "urma-node-app"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "bitcoin",
  "serde",
@@ -6278,9 +6278,9 @@ dependencies = [
 
 [[package]]
 name = "urma-runtime"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e37ed8698d5917987aa543127a0177f0a9a123d7173b690728e0719ef94966a5"
+checksum = "ede5bc63790a163dca9262b8490d271f8bd263266df8ef9f3d57dd4f3597aa2d"
 dependencies = [
  "bitcoin",
  "bitcoincore-rpc",
@@ -6644,7 +6644,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
